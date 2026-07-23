@@ -1,0 +1,20 @@
+[package]
+name = "curl-downloader"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97.1"
+
+[dependencies]
+eframe = { version = "=0.35.0", default-features = false, features = ["accesskit", "default_fonts", "wgpu"] }
+rfd = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+url = "2.5"
+zeroize = "1.8"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

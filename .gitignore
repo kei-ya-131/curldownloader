@@ -1,1 +1,5 @@
 /.worktrees/
+/target/
+/.cache/
+/dist/
+/.superpowers/
