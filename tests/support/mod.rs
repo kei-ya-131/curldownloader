@@ -60,6 +60,7 @@ impl TestProxy {
                 while !thread_stop.load(Ordering::Acquire) {
                     match listener.accept() {
                         Ok((stream, _)) => {
+                            let _ = stream.set_nonblocking(false);
                             let kind = kind.clone();
                             let requests = Arc::clone(&thread_requests);
                             let atypes = Arc::clone(&thread_atypes);
@@ -240,10 +241,7 @@ fn serve_socks5_proxy(
     if !read_exact(&mut stream, &mut port) {
         return;
     }
-    if stream
-        .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 80])
-        .is_err()
-    {
+    if stream.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).is_err() {
         return;
     }
     let Some(request) = read_until_headers(&mut stream) else {
