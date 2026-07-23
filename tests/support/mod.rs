@@ -449,6 +449,7 @@ pub struct EngineHarness {
     state_path: PathBuf,
     download_dir: PathBuf,
     latest: Arc<Mutex<Vec<TaskSnapshot>>>,
+    batch_proxy_result: Arc<Mutex<Option<(usize, usize)>>>,
     keep_files: bool,
 }
 
@@ -471,6 +472,7 @@ impl EngineHarness {
             state_path,
             download_dir,
             latest: Arc::new(Mutex::new(Vec::new())),
+            batch_proxy_result: Arc::new(Mutex::new(None)),
             keep_files: false,
         }
     }
@@ -483,6 +485,7 @@ impl EngineHarness {
             state_path,
             download_dir,
             latest: Arc::new(Mutex::new(Vec::new())),
+            batch_proxy_result: Arc::new(Mutex::new(None)),
             keep_files: false,
         }
     }
@@ -637,6 +640,20 @@ impl EngineHarness {
         }
     }
 
+    pub fn wait_for_batch_proxy_result(&mut self) -> (usize, usize) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(result) = self.batch_proxy_result.lock().unwrap().take() {
+                return result;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timeout waiting for batch proxy result"
+            );
+            self.poll_once(Duration::from_millis(100));
+        }
+    }
+
     pub fn wait_for_empty(&mut self, timeout: Duration) {
         let deadline = std::time::Instant::now() + timeout;
         loop {
@@ -713,8 +730,14 @@ impl EngineHarness {
     }
 
     pub fn poll_once(&mut self, timeout: Duration) {
-        if let Ok(EngineEvent::Snapshot(snapshot)) = self.engine.events.recv_timeout(timeout) {
-            *self.latest.lock().unwrap() = snapshot;
+        match self.engine.events.recv_timeout(timeout) {
+            Ok(EngineEvent::Snapshot(snapshot)) => {
+                *self.latest.lock().unwrap() = snapshot;
+            }
+            Ok(EngineEvent::BatchProxyApplied { applied, skipped }) => {
+                *self.batch_proxy_result.lock().unwrap() = Some((applied, skipped));
+            }
+            _ => {}
         }
     }
 

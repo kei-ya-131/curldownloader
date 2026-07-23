@@ -111,6 +111,58 @@ fn applies_one_proxy_configuration_to_multiple_queued_tasks() {
 }
 
 #[test]
+fn reports_applied_and_skipped_tasks_for_mixed_bulk_proxy_update() {
+    let server = support::TestHttpServer::start(vec![
+        support::Route {
+            path: "/completed.bin",
+            body: b"completed",
+            ranges: false,
+            etag: "completed-v1",
+            filename: "completed.bin",
+        },
+        support::Route {
+            path: "/queued.bin",
+            body: b"queued",
+            ranges: false,
+            etag: "queued-v1",
+            filename: "queued.bin",
+        },
+    ]);
+    let mut harness = support::EngineHarness::new(1);
+    let tasks = harness.add_batch(&[
+        format!("{}/completed.bin", server.base_url),
+        format!("{}/queued.bin", server.base_url),
+    ]);
+    harness.start(tasks[0].id);
+    let completed = harness.wait_for(
+        tasks[0].id,
+        TaskStatus::Completed,
+        std::time::Duration::from_secs(60),
+    );
+    assert_eq!(completed.filename, "completed.bin");
+
+    let proxy = ProxySettings {
+        enabled: true,
+        host: "127.0.0.1".into(),
+        port: 8080,
+        ..ProxySettings::default()
+    };
+    harness
+        .engine
+        .commands
+        .send(EngineCommand::UpdateProxy {
+            ids: vec![tasks[0].id, tasks[1].id],
+            proxy,
+        })
+        .unwrap();
+
+    let updated = harness.wait_for_proxy(&[tasks[1].id], "127.0.0.1");
+    assert_eq!(updated.len(), 1);
+    assert_eq!(updated[0].id, tasks[1].id);
+    assert_eq!(harness.wait_for_batch_proxy_result(), (1, 1));
+}
+
+#[test]
 fn downloads_four_ranges_and_merges_exact_bytes() {
     let server = support::TestHttpServer::start(vec![support::Route {
         path: "/range.bin",

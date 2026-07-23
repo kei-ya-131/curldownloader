@@ -172,6 +172,19 @@ impl CurlDownloaderApp {
             match event {
                 EngineEvent::Snapshot(tasks) => {
                     self.tasks = tasks;
+                    let draft_proxy_is_stale = self
+                        .draft
+                        .as_ref()
+                        .and_then(|draft| {
+                            self.tasks
+                                .iter()
+                                .find(|task| task.id == draft.id)
+                                .map(|task| !draft_proxy_matches_snapshot(draft, task))
+                        })
+                        .unwrap_or(false);
+                    if draft_proxy_is_stale {
+                        self.draft = None;
+                    }
                     if self.selected.is_none() {
                         self.selected = self.tasks.first().map(|task| task.id);
                     }
@@ -623,7 +636,7 @@ impl CurlDownloaderApp {
                     }
                 }
                 ui.colored_label(
-                    status_color(task.status),
+                    status_color(ui, task.status),
                     egui::RichText::new(status_icon(task.status))
                         .size(21.0)
                         .strong(),
@@ -638,7 +651,7 @@ impl CurlDownloaderApp {
             });
             ui.horizontal_wrapped(|ui| {
                 ui.colored_label(
-                    status_color(task.status),
+                    status_color(ui, task.status),
                     egui::RichText::new(status_label(task.status)).strong(),
                 );
                 ui.weak(format!("{} 段", task.actual_segments.max(1)));
@@ -647,7 +660,7 @@ impl CurlDownloaderApp {
             ui.add(
                 egui::ProgressBar::new(progress_fraction(task))
                     .desired_height(14.0)
-                    .fill(status_color(task.status))
+                    .fill(status_color(ui, task.status))
                     .text(format!("{:.1}%", progress_fraction(task) * 100.0)),
             );
             ui.horizontal_wrapped(|ui| {
@@ -710,7 +723,7 @@ impl CurlDownloaderApp {
                 self.ensure_draft(&task);
                 ui.horizontal(|ui| {
                     ui.colored_label(
-                        status_color(task.status),
+                        status_color(ui, task.status),
                         egui::RichText::new(status_icon(task.status))
                             .size(30.0)
                             .strong(),
@@ -719,7 +732,7 @@ impl CurlDownloaderApp {
                         ui.heading(&task.filename);
                         ui.horizontal(|ui| {
                             ui.colored_label(
-                                status_color(task.status),
+                                status_color(ui, task.status),
                                 egui::RichText::new(status_label(task.status)).strong(),
                             );
                             ui.weak(format!("下載工具：{}", curl_source_label(task.curl_source)));
@@ -830,11 +843,17 @@ impl CurlDownloaderApp {
                                     ui.with_layout(
                                         egui::Layout::right_to_left(egui::Align::Center),
                                         |ui| {
-                                            ui.checkbox(&mut draft.proxy.enabled, "啟用 Proxy");
+                                            ui.add_enabled(
+                                                can_edit,
+                                                egui::Checkbox::new(
+                                                    &mut draft.proxy.enabled,
+                                                    "啟用 Proxy",
+                                                ),
+                                            );
                                         },
                                     );
                                 });
-                                ui.add_enabled_ui(can_edit || needs_password, |ui| {
+                                ui.add_enabled_ui(can_edit, |ui| {
                                     ui.horizontal_wrapped(|ui| {
                                         ui.label("協定");
                                         egui::ComboBox::from_id_salt("proxy-protocol")
@@ -867,19 +886,28 @@ impl CurlDownloaderApp {
                                             )
                                             .changed();
                                     });
+                                });
+                                if can_edit || needs_password {
                                     ui.horizontal_wrapped(|ui| {
                                         ui.label("帳號");
-                                        changed |= ui
-                                            .text_edit_singleline(&mut draft.proxy.username)
-                                            .changed();
+                                        if can_edit {
+                                            changed |= ui
+                                                .text_edit_singleline(&mut draft.proxy.username)
+                                                .changed();
+                                        } else {
+                                            ui.label(&draft.proxy.username);
+                                        }
                                         ui.label("密碼");
                                         let response = ui.add(
                                             egui::TextEdit::singleline(&mut draft.password_input)
                                                 .password(!draft.show_password),
                                         );
                                         draft.show_password = response.is_pointer_button_down_on();
+                                        if can_edit {
+                                            changed |= response.changed();
+                                        }
                                     });
-                                });
+                                }
                                 if !can_edit && !needs_password {
                                     ui.weak("下載已開始，檔名、位置及 Proxy 設定已鎖定。");
                                 }
@@ -981,16 +1009,18 @@ fn task_card_frame(ui: &egui::Ui, selected: bool) -> egui::Frame {
     }
 }
 
-fn status_color(status: TaskStatus) -> egui::Color32 {
+fn status_color(ui: &egui::Ui, status: TaskStatus) -> egui::Color32 {
+    let visuals = ui.visuals();
     match status {
         TaskStatus::Queued | TaskStatus::Paused | TaskStatus::Cancelled => {
-            egui::Color32::from_rgb(125, 135, 150)
+            visuals.weak_text_color()
         }
-        TaskStatus::Probing | TaskStatus::Downloading => egui::Color32::from_rgb(38, 128, 220),
-        TaskStatus::Pausing | TaskStatus::Finalizing => egui::Color32::from_rgb(190, 122, 37),
-        TaskStatus::NeedsProxyPassword => egui::Color32::from_rgb(190, 108, 38),
-        TaskStatus::Completed => egui::Color32::from_rgb(40, 157, 99),
-        TaskStatus::Failed => egui::Color32::from_rgb(200, 61, 75),
+        TaskStatus::Probing | TaskStatus::Downloading => visuals.hyperlink_color,
+        TaskStatus::Pausing | TaskStatus::Finalizing | TaskStatus::NeedsProxyPassword => {
+            visuals.warn_fg_color
+        }
+        TaskStatus::Completed => visuals.widgets.active.fg_stroke.color,
+        TaskStatus::Failed => visuals.error_fg_color,
     }
 }
 
@@ -998,7 +1028,7 @@ fn show_progress_card(ui: &mut egui::Ui, task: &TaskSnapshot) {
     card_frame(ui).show(ui, |ui| {
         ui.heading("下載進度");
         ui.horizontal(|ui| {
-            draw_progress_ring(ui, progress_fraction(task), status_color(task.status));
+            draw_progress_ring(ui, progress_fraction(task), status_color(ui, task.status));
             ui.vertical(|ui| {
                 ui.label("已下載 / 總大小");
                 ui.label(egui::RichText::new(progress_text(task)).size(16.0).strong());
@@ -1011,7 +1041,7 @@ fn show_progress_card(ui: &mut egui::Ui, task: &TaskSnapshot) {
             });
         });
         ui.colored_label(
-            status_color(task.status),
+            status_color(ui, task.status),
             egui::RichText::new(format!(
                 "{} {}",
                 status_icon(task.status),
@@ -1145,6 +1175,15 @@ fn proxy_from_snapshot(task: &TaskSnapshot) -> ProxySettings {
         password: None,
         requires_password: task.proxy.requires_password,
     }
+}
+
+fn draft_proxy_matches_snapshot(draft: &TaskDraft, task: &TaskSnapshot) -> bool {
+    draft.proxy.enabled == task.proxy.enabled
+        && draft.proxy.protocol == task.proxy.protocol
+        && draft.proxy.host == task.proxy.host
+        && draft.proxy.port == task.proxy.port
+        && draft.proxy.username == task.proxy.username
+        && draft.proxy.requires_password == task.proxy.requires_password
 }
 
 fn curl_source_label(source: CurlSource) -> &'static str {
