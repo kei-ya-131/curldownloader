@@ -420,7 +420,11 @@ mod tests {
         assert!(socks5.arguments_text().contains("socks5://127.0.0.1:1080"));
         proxy.protocol = ProxyProtocol::Socks5h;
         let socks5h = CurlCommandSpec::base(&proxy).unwrap();
-        assert!(socks5h.arguments_text().contains("socks5h://127.0.0.1:1080"));
+        assert!(
+            socks5h
+                .arguments_text()
+                .contains("socks5h://127.0.0.1:1080")
+        );
     }
 
     #[test]
