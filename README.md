@@ -14,6 +14,14 @@ powershell -ExecutionPolicy Bypass -File scripts/build-release.ps1
 
 成功後 `dist/` 只會有 `CurlDownloader.exe`。
 
+如果本機沒有管理員權限或沒有 Visual Studio linker，可使用已安裝的 Rust GNU toolchain 建立 Windows x64 fallback release：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/build-release-gnu.ps1
+```
+
+此 fallback 同樣只產生一個 `CurlDownloader.exe`，但正式 MSVC 發佈仍應使用上方腳本。
+
 ## Use
 
 在上方輸入 HTTP/HTTPS URL，按「新增下載」，於任務設定修改檔名、下載目錄與分段數，再按「開始」。下載中的任務可以「暫停」，重啟程式或再次按「開始」會從工作目錄中的部分檔續傳。完成後可從佇列按「開啟位置」。
