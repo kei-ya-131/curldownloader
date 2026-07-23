@@ -256,6 +256,14 @@ pub struct ProxySnapshot {
     pub requires_password: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CurlSource {
+    #[default]
+    NotStarted,
+    Local,
+    Embedded,
+}
+
 #[derive(Clone, Debug)]
 pub struct TaskSnapshot {
     pub id: TaskId,
@@ -275,6 +283,7 @@ pub struct TaskSnapshot {
     pub active_millis: u64,
     pub proxy: ProxySnapshot,
     pub error: Option<TaskError>,
+    pub curl_source: CurlSource,
 }
 
 pub struct NewTask {

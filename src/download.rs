@@ -67,16 +67,13 @@ impl EngineMetrics {
 }
 
 pub fn spawn_engine(state_path: PathBuf, state: PersistedState) -> Result<EngineHandle, String> {
-    let runtime = CurlRuntime::extract().map_err(|error| error.to_string())?;
     let (command_tx, command_rx) = mpsc::channel();
     let (event_tx, event_rx) = mpsc::channel();
     let metrics = Arc::new(EngineMetrics::default());
     let thread_metrics = Arc::clone(&metrics);
     thread::Builder::new()
         .name("download-engine".into())
-        .spawn(move || {
-            Engine::new(state_path, state, runtime, event_tx, thread_metrics).run(command_rx)
-        })
+        .spawn(move || Engine::new(state_path, state, event_tx, thread_metrics).run(command_rx))
         .map_err(|error| error.to_string())?;
     Ok(EngineHandle {
         commands: command_tx,
@@ -273,7 +270,8 @@ struct Engine {
     range_probe: HashSet<TaskId>,
     pending_start: HashSet<TaskId>,
     meters: HashMap<TaskId, ProgressMeter>,
-    runtime: CurlRuntime,
+    runtime: Option<CurlRuntime>,
+    curl_source: CurlSource,
     events: Sender<EngineEvent>,
     metrics: Arc<EngineMetrics>,
     shutting_down: bool,
@@ -283,7 +281,6 @@ impl Engine {
     fn new(
         state_path: PathBuf,
         mut state: PersistedState,
-        runtime: CurlRuntime,
         events: Sender<EngineEvent>,
         metrics: Arc<EngineMetrics>,
     ) -> Self {
@@ -306,7 +303,8 @@ impl Engine {
             range_probe: HashSet::new(),
             pending_start: HashSet::new(),
             meters: HashMap::new(),
-            runtime,
+            runtime: None,
+            curl_source: CurlSource::NotStarted,
             events,
             metrics,
             shutting_down: false,
@@ -870,7 +868,10 @@ impl Engine {
                 Stdio::from(OpenOptions::new().create(true).append(true).open(output)?)
             }
         };
-        let child = self.runtime.spawn(&mut spec, stdout)?;
+        let child = {
+            let runtime = self.ensure_runtime()?;
+            runtime.spawn(&mut spec, stdout)?
+        };
         if let Ok(mut command_line) = self.metrics.last_command.lock() {
             *command_line = spec.arguments_text();
         }
@@ -890,6 +891,18 @@ impl Engine {
         );
         self.metrics.started();
         Ok(())
+    }
+
+    fn ensure_runtime(&mut self) -> io::Result<&CurlRuntime> {
+        if self.runtime.is_none() {
+            let runtime = CurlRuntime::extract()?;
+            self.curl_source = runtime.source();
+            self.runtime = Some(runtime);
+        }
+        Ok(self
+            .runtime
+            .as_ref()
+            .expect("curl runtime must be initialized"))
     }
 
     fn poll_jobs(&mut self) {
@@ -1284,6 +1297,7 @@ impl Engine {
                         requires_password: task.proxy.requires_password,
                     },
                     error: task.last_error.clone(),
+                    curl_source: self.curl_source,
                 }
             })
             .collect();

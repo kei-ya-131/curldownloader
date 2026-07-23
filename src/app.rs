@@ -1,8 +1,8 @@
 use crate::{
     download::{EngineHandle, spawn_engine},
     model::{
-        EngineCommand, EngineEvent, GlobalSettings, NewTask, PersistedState, ProxyProtocol,
-        ProxySettings, TaskId, TaskSnapshot, TaskStatus,
+        CurlSource, EngineCommand, EngineEvent, GlobalSettings, NewTask, PersistedState,
+        ProxyProtocol, ProxySettings, TaskId, TaskSnapshot, TaskStatus,
     },
     storage,
 };
@@ -380,6 +380,7 @@ impl CurlDownloaderApp {
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new(status_label(task.status)).strong());
                         ui.small(format!("{} 段", task.actual_segments.max(1)));
+                        ui.small(format!("下載工具：{}", curl_source_label(task.curl_source)));
                     });
                     let bar_width = ui.available_width();
                     ui.add_sized(
@@ -444,6 +445,7 @@ impl CurlDownloaderApp {
             let needs_password = task.status == TaskStatus::NeedsProxyPassword;
             ui.heading(&task.filename);
             ui.label(format!("狀態：{}", status_label(task.status)));
+            ui.label(format!("下載工具：{}", curl_source_label(task.curl_source)));
             if let Some(error) = &task.error {
                 ui.colored_label(
                     egui::Color32::LIGHT_RED,
@@ -611,6 +613,14 @@ fn status_label(status: TaskStatus) -> &'static str {
     }
 }
 
+fn curl_source_label(source: CurlSource) -> &'static str {
+    match source {
+        CurlSource::NotStarted => "尚未啟動",
+        CurlSource::Local => "本機 curl",
+        CurlSource::Embedded => "內置 curl",
+    }
+}
+
 fn progress_fraction(task: &TaskSnapshot) -> f32 {
     if task.status == TaskStatus::Completed {
         return 1.0;
@@ -775,5 +785,12 @@ mod tests {
             format_speed_text(TaskStatus::Downloading, 1_024.0, 512.0),
             "目前速度 1.00 KiB/s"
         );
+    }
+
+    #[test]
+    fn labels_curl_source_for_the_current_task() {
+        assert_eq!(curl_source_label(CurlSource::NotStarted), "尚未啟動");
+        assert_eq!(curl_source_label(CurlSource::Local), "本機 curl");
+        assert_eq!(curl_source_label(CurlSource::Embedded), "內置 curl");
     }
 }

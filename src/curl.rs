@@ -1,4 +1,4 @@
-use crate::model::{ProxyProtocol, ProxySettings};
+use crate::model::{CurlSource, ProxyProtocol, ProxySettings};
 use sha2::{Digest, Sha256};
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -119,6 +119,14 @@ impl CurlRuntime {
             return Err(io::Error::other("解壓 curl 校驗失敗"));
         }
         Ok(Self { exe, root })
+    }
+
+    pub fn source(&self) -> CurlSource {
+        if self.root.as_os_str().is_empty() {
+            CurlSource::Local
+        } else {
+            CurlSource::Embedded
+        }
     }
 
     pub fn spawn(&self, spec: &mut CurlCommandSpec, stdout: Stdio) -> io::Result<Child> {
@@ -534,6 +542,7 @@ mod tests {
     #[test]
     fn embedded_runtime_reuses_one_executable_for_multiple_jobs() {
         let runtime = CurlRuntime::extract_embedded().unwrap();
+        assert_eq!(runtime.source(), crate::model::CurlSource::Embedded);
         let mut spec = CurlCommandSpec {
             args: vec!["--version".into()],
             stdin_config: None,

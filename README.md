@@ -24,7 +24,9 @@ powershell -ExecutionPolicy Bypass -File scripts/build-release-gnu.ps1
 
 ## Security software warning
 
-本程式使用 `asInvoker`，不要求系統管理員權限，也不會啟動 PowerShell；下載工作只會啟動內嵌的 curl 子程序。未簽署的新 Windows EXE 可能被企業端防毒軟件以「新發現程式」攔截，請使用安全軟件的「Allow Once」或由管理員加入公司白名單。這類攔截不能由程式安全地繞過。
+發佈檔 `CurlDownloader.exe` 是直接啟動的原生 Windows GUI EXE，使用 `asInvoker`，不要求系統管理員權限，也不包含 PowerShell／CMD 啟動器。建置腳本中的 PowerShell 只在建置階段使用；請在檔案總管直接雙擊 `dist\CurlDownloader.exe`，不要以 `powershell -Command` 或其他 shell 作為啟動器。下載工作只會在按下開始後啟動 curl 子程序。
+
+未簽署的新 Windows EXE 仍可能被企業端防毒軟件以「新發現程式」攔截；程式不能安全地停用或繞過 Trend Micro 的信譽判定。若要完全消除這類提示，需要由管理員加入白名單，或使用具有效程式碼簽署憑證的發佈檔。
 
 ## Use
 
@@ -32,7 +34,7 @@ powershell -ExecutionPolicy Bypass -File scripts/build-release-gnu.ps1
 
 Windows 下載時只會在背景啟動隱藏的 curl 子程序，不會顯示 CMD 控制台視窗。
 
-程式啟動下載時會先從 PATH 尋找本機 `curl.exe`，並以 `curl.exe --version` 確認可以執行；找不到或無法啟動時，才會使用內嵌且經 SHA-256 驗證的 curl。若 curl 啟動失敗，可在任務的「詳細診斷」查看已清理 Proxy 憑證的作業系統／curl 錯誤。
+程式啟動下載時會先從 PATH 尋找本機 `curl.exe`，並以 `curl.exe --version` 確認可以執行；找不到或無法啟動時，才會使用內嵌且經 SHA-256 驗證的 curl。程式只在第一次真正開始下載時選擇及驗證 curl；啟動程式、瀏覽歷史或新增待確認任務都不會建立內置 curl runtime。任務面板會顯示「尚未啟動」、「本機 curl」或「內置 curl」。若 curl 啟動失敗，可在任務的「詳細診斷」查看已清理 Proxy 憑證的作業系統／curl 錯誤。
 
 ## Proxy
 

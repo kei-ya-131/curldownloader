@@ -1,6 +1,32 @@
 mod support;
 
-use curl_downloader::model::{EngineCommand, NewTask, TaskStatus};
+use curl_downloader::model::{CurlSource, EngineCommand, NewTask, TaskStatus};
+
+#[test]
+fn curl_runtime_is_lazy_until_download_starts() {
+    let server = support::TestHttpServer::start(vec![support::Route {
+        path: "/lazy.bin",
+        body: b"lazy",
+        ranges: false,
+        etag: "lazy-v1",
+        filename: "lazy.bin",
+    }]);
+    let mut harness = support::EngineHarness::new(1);
+    let queued = harness.add_batch(&[format!("{}/lazy.bin", server.base_url)])[0].clone();
+
+    assert_eq!(queued.curl_source, CurlSource::NotStarted);
+
+    harness.start(queued.id);
+    let completed = harness.wait_for(
+        queued.id,
+        TaskStatus::Completed,
+        std::time::Duration::from_secs(60),
+    );
+    assert!(matches!(
+        completed.curl_source,
+        CurlSource::Local | CurlSource::Embedded
+    ));
+}
 
 #[test]
 fn downloads_four_ranges_and_merges_exact_bytes() {
