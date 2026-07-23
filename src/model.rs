@@ -111,6 +111,15 @@ impl ProxySettings {
         Ok(())
     }
 
+    pub fn set_password_secret(&mut self, password: Zeroizing<String>) -> Result<(), String> {
+        if password.contains(['\0', '\r', '\n']) {
+            return Err("Proxy 密碼含有不允許字元".into());
+        }
+        self.requires_password = !password.is_empty();
+        self.password = (!password.is_empty()).then_some(password);
+        Ok(())
+    }
+
     pub fn clear_password(&mut self) {
         self.password = None;
     }
