@@ -12,9 +12,21 @@ if ((Get-FileHash -Algorithm SHA256 -LiteralPath 'assets/curl.exe').Hash.ToUpper
 }
 
 cargo fmt --check
+if ($LASTEXITCODE -ne 0) {
+    throw "cargo fmt failed with exit code $LASTEXITCODE."
+}
 cargo clippy --all-targets --target $target -- -D warnings
+if ($LASTEXITCODE -ne 0) {
+    throw "cargo clippy failed with exit code $LASTEXITCODE."
+}
 cargo test --target $target
+if ($LASTEXITCODE -ne 0) {
+    throw "cargo test failed with exit code $LASTEXITCODE."
+}
 cargo build --release --target $target
+if ($LASTEXITCODE -ne 0) {
+    throw "cargo build failed with exit code $LASTEXITCODE."
+}
 
 if (Test-Path -LiteralPath 'dist') {
     Remove-Item -LiteralPath 'dist' -Recurse -Force
