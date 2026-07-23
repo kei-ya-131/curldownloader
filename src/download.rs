@@ -399,6 +399,7 @@ impl Engine {
                 requested_segments,
                 proxy,
             } => self.update_draft(id, url, filename, target_dir, requested_segments, proxy),
+            EngineCommand::UpdateProxy { ids, proxy } => self.update_proxy(ids, proxy),
             EngineCommand::SetProxyPassword { id, password } => {
                 if let Some(task) = self.task_mut(id) {
                     if task.proxy.set_password_secret(password).is_ok() {
@@ -521,6 +522,65 @@ impl Engine {
             task.status = TaskStatus::NeedsProxyPassword;
         }
         let _ = self.persist();
+    }
+
+    fn update_proxy(&mut self, ids: Vec<TaskId>, proxy: ProxySettings) {
+        if let Err(error) = proxy.validate() {
+            let _ = self
+                .events
+                .send(EngineEvent::Fatal(format!("Proxy 設定無效：{error}")));
+            return;
+        }
+        for id in ids {
+            let Some(status) = self.task(id).map(|task| task.status) else {
+                continue;
+            };
+            if !matches!(
+                status,
+                TaskStatus::Queued
+                    | TaskStatus::Paused
+                    | TaskStatus::Failed
+                    | TaskStatus::NeedsProxyPassword
+            ) {
+                continue;
+            }
+            let source_changed = self
+                .task(id)
+                .is_some_and(|task| proxy_configuration_changed(&task.proxy, &proxy));
+            if source_changed {
+                self.stop_task_jobs(id);
+                self.queue.retain(|queued| *queued != id);
+                self.pending_start.remove(&id);
+                self.range_probe.remove(&id);
+            }
+            let needs_password =
+                proxy.enabled && proxy.requires_password && proxy.password.is_none();
+            if let Some(task) = self.task_mut(id) {
+                task.proxy = proxy.clone();
+                task.last_error = None;
+                if source_changed {
+                    task.effective_url = None;
+                    task.total_size = None;
+                    task.etag = None;
+                    task.last_modified = None;
+                    task.range_support = RangeSupport::Unknown;
+                    task.segments.clear();
+                    task.status = if needs_password {
+                        TaskStatus::NeedsProxyPassword
+                    } else {
+                        TaskStatus::Queued
+                    };
+                } else if needs_password {
+                    task.status = TaskStatus::NeedsProxyPassword;
+                }
+            }
+            if !source_changed && needs_password {
+                self.stop_task_jobs(id);
+                self.queue.retain(|queued| *queued != id);
+            }
+        }
+        let _ = self.persist();
+        self.publish_snapshot();
     }
 
     fn request_start(&mut self, id: TaskId) {
@@ -998,6 +1058,7 @@ impl Engine {
         }
         self.range_probe.remove(&job.task_id);
         if let Some(task) = self.task_mut(job.task_id) {
+            task.last_error = None;
             task.effective_url = Some(meta.effective_url);
             task.total_size = meta.total_size;
             task.range_support = meta.range_support;
@@ -1058,6 +1119,7 @@ impl Engine {
             if let Some(segment) = task.segments.first_mut() {
                 segment.downloaded = length;
             }
+            task.last_error = None;
         }
         self.finalize_task(job.task_id);
     }
@@ -1120,6 +1182,7 @@ impl Engine {
             {
                 segment.downloaded = segment.end.saturating_sub(segment.start).saturating_add(1);
             }
+            task.last_error = None;
         }
         if !self.task_has_incomplete_segments(job.task_id) {
             self.finalize_task(job.task_id);
@@ -1176,6 +1239,7 @@ impl Engine {
         let _ = fs::remove_dir_all(work);
         if let Some(task) = self.task_mut(id) {
             task.proxy.clear_password();
+            task.last_error = None;
             task.status = TaskStatus::Completed;
         }
         let _ = self.persist();

@@ -615,6 +615,28 @@ impl EngineHarness {
         }
     }
 
+    pub fn wait_for_proxy(&mut self, ids: &[TaskId], host: &str) -> Vec<TaskSnapshot> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let snapshot = self.latest.lock().unwrap().clone();
+            if ids.iter().all(|id| {
+                snapshot
+                    .iter()
+                    .any(|task| task.id == *id && task.proxy.enabled && task.proxy.host == host)
+            }) {
+                return snapshot
+                    .into_iter()
+                    .filter(|task| ids.contains(&task.id))
+                    .collect();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timeout waiting for proxy update; latest={snapshot:?}"
+            );
+            self.poll_once(Duration::from_millis(100));
+        }
+    }
+
     pub fn wait_for_empty(&mut self, timeout: Duration) {
         let deadline = std::time::Instant::now() + timeout;
         loop {

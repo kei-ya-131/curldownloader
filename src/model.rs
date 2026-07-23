@@ -309,6 +309,10 @@ pub enum EngineCommand {
         requested_segments: u8,
         proxy: ProxySettings,
     },
+    UpdateProxy {
+        ids: Vec<TaskId>,
+        proxy: ProxySettings,
+    },
     SetProxyPassword {
         id: TaskId,
         password: Zeroizing<String>,

@@ -7,7 +7,7 @@ use crate::{
     storage,
 };
 use eframe::egui;
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{collections::HashSet, path::PathBuf, sync::Arc, time::Duration};
 
 pub const CHINESE_FONT_NAME: &str = "NotoSansTC-VF";
 const CHINESE_FONT_BYTES: &[u8] = include_bytes!("../assets/NotoSansTC-VF.ttf");
@@ -55,11 +55,14 @@ pub struct CurlDownloaderApp {
     engine: EngineHandle,
     tasks: Vec<TaskSnapshot>,
     selected: Option<TaskId>,
+    checked_tasks: HashSet<TaskId>,
     url_input: String,
     input_error: Option<String>,
     batch_input: String,
     batch_error: Option<String>,
     show_batch_dialog: bool,
+    batch_proxy_dialog: bool,
+    batch_proxy: Option<BatchProxyDraft>,
     fatal: Option<String>,
     draft: Option<TaskDraft>,
     last_download_dir: PathBuf,
@@ -75,6 +78,13 @@ struct TaskDraft {
     target_dir: PathBuf,
     target_dir_input: String,
     segments: u8,
+    proxy: ProxySettings,
+    password_input: String,
+    show_password: bool,
+}
+
+#[derive(Clone)]
+struct BatchProxyDraft {
     proxy: ProxySettings,
     password_input: String,
     show_password: bool,
@@ -139,11 +149,14 @@ impl CurlDownloaderApp {
             engine,
             tasks: Vec::new(),
             selected: None,
+            checked_tasks: HashSet::new(),
             url_input: String::new(),
             input_error: None,
             batch_input: String::new(),
             batch_error: None,
             show_batch_dialog: false,
+            batch_proxy_dialog: false,
+            batch_proxy: None,
             fatal,
             draft: None,
             last_download_dir,
@@ -166,6 +179,11 @@ impl CurlDownloaderApp {
                             self.draft = None;
                         }
                     }
+                    self.checked_tasks.retain(|id| {
+                        self.tasks
+                            .iter()
+                            .any(|task| task.id == *id && can_edit_proxy_in_bulk(task.status))
+                    });
                     if self
                         .selected
                         .and_then(|id| self.tasks.iter().find(|task| task.id == id))
@@ -190,6 +208,47 @@ impl CurlDownloaderApp {
     fn selected_task(&self) -> Option<TaskSnapshot> {
         self.selected
             .and_then(|id| self.tasks.iter().find(|task| task.id == id).cloned())
+    }
+
+    fn open_batch_proxy_dialog(&mut self) {
+        if self.checked_tasks.is_empty() {
+            return;
+        }
+        let proxy = self
+            .selected_task()
+            .filter(|task| self.checked_tasks.contains(&task.id))
+            .map(|task| proxy_from_snapshot(&task))
+            .unwrap_or_default();
+        self.batch_proxy = Some(BatchProxyDraft {
+            proxy,
+            password_input: String::new(),
+            show_password: false,
+        });
+        self.batch_proxy_dialog = true;
+    }
+
+    fn apply_batch_proxy(&mut self) {
+        let Some(draft) = self.batch_proxy.clone() else {
+            return;
+        };
+        let mut proxy = draft.proxy;
+        if draft.password_input.is_empty() {
+            proxy.clear_password();
+        } else if proxy.set_password(draft.password_input).is_err() {
+            self.input_error = Some("Proxy 密碼含有不允許字元".into());
+            return;
+        }
+        if !proxy.enabled {
+            proxy.clear_password();
+            proxy.requires_password = false;
+        }
+        let ids = self.checked_tasks.iter().copied().collect::<Vec<_>>();
+        let _ = self
+            .engine
+            .commands
+            .send(EngineCommand::UpdateProxy { ids, proxy });
+        self.batch_proxy_dialog = false;
+        self.batch_proxy = None;
     }
 
     fn ensure_draft(&mut self, task: &TaskSnapshot) {
@@ -309,6 +368,15 @@ impl CurlDownloaderApp {
                 if ui.button("全部暫停").clicked() {
                     let _ = self.engine.commands.send(EngineCommand::PauseAll);
                 }
+                if !self.checked_tasks.is_empty() {
+                    ui.label(format!("已選取 {} 個任務", self.checked_tasks.len()));
+                    if ui.button("批量設定 Proxy").clicked() {
+                        self.open_batch_proxy_dialog();
+                    }
+                    if ui.button("清除選取").clicked() {
+                        self.checked_tasks.clear();
+                    }
+                }
                 if ui
                     .button("清除已完成")
                     .on_hover_text("清除已完成及已取消的任務記錄，不會刪除已下載檔案")
@@ -359,6 +427,71 @@ impl CurlDownloaderApp {
                 self.show_batch_dialog = false;
             }
         }
+        if self.batch_proxy_dialog {
+            let mut open = true;
+            let mut apply = false;
+            let mut cancel = false;
+            egui::Window::new("批量設定 Proxy")
+                .open(&mut open)
+                .collapsible(false)
+                .show(ui.ctx(), |ui| {
+                    ui.label(format!(
+                        "將套用至 {} 個已選取任務；下載中及已完成任務會略過。",
+                        self.checked_tasks.len()
+                    ));
+                    let Some(draft) = self.batch_proxy.as_mut() else {
+                        return;
+                    };
+                    ui.checkbox(&mut draft.proxy.enabled, "使用 Proxy");
+                    egui::ComboBox::from_id_salt("batch-proxy-protocol")
+                        .selected_text(draft.proxy.protocol.scheme())
+                        .show_ui(ui, |ui| {
+                            for protocol in [
+                                ProxyProtocol::Http,
+                                ProxyProtocol::Https,
+                                ProxyProtocol::Socks5,
+                                ProxyProtocol::Socks5h,
+                            ] {
+                                ui.selectable_value(
+                                    &mut draft.proxy.protocol,
+                                    protocol,
+                                    protocol.scheme(),
+                                );
+                            }
+                        });
+                    ui.horizontal(|ui| {
+                        ui.label("主機");
+                        ui.text_edit_singleline(&mut draft.proxy.host);
+                        ui.label("連接埠");
+                        ui.add(egui::DragValue::new(&mut draft.proxy.port).range(1..=65535));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("帳號");
+                        ui.text_edit_singleline(&mut draft.proxy.username);
+                        ui.label("密碼");
+                        let response = ui.add(
+                            egui::TextEdit::singleline(&mut draft.password_input)
+                                .password(!draft.show_password),
+                        );
+                        draft.show_password = response.is_pointer_button_down_on();
+                    });
+                    ui.label("密碼留空會清除批量設定中的密碼；需要驗證的任務會等待重新輸入。");
+                    ui.horizontal(|ui| {
+                        if ui.button("套用").clicked() {
+                            apply = true;
+                        }
+                        if ui.button("取消").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            if apply {
+                self.apply_batch_proxy();
+            } else if cancel || !open {
+                self.batch_proxy_dialog = false;
+                self.batch_proxy = None;
+            }
+        }
     }
 
     fn show_queue(&mut self, ui: &mut egui::Ui) {
@@ -369,14 +502,30 @@ impl CurlDownloaderApp {
                 ui.heading("下載佇列");
                 for task in self.tasks.clone() {
                     let selected = self.selected == Some(task.id);
-                    let response = ui.selectable_label(
-                        selected,
-                        egui::RichText::new(&task.filename).strong().size(15.0),
-                    );
-                    if response.clicked() {
-                        self.selected = Some(task.id);
-                        self.draft = None;
-                    }
+                    ui.horizontal(|ui| {
+                        let mut checked = self.checked_tasks.contains(&task.id);
+                        if ui
+                            .add_enabled(
+                                can_edit_proxy_in_bulk(task.status),
+                                egui::Checkbox::new(&mut checked, ""),
+                            )
+                            .changed()
+                        {
+                            if checked {
+                                self.checked_tasks.insert(task.id);
+                            } else {
+                                self.checked_tasks.remove(&task.id);
+                            }
+                        }
+                        let response = ui.selectable_label(
+                            selected,
+                            egui::RichText::new(&task.filename).strong().size(15.0),
+                        );
+                        if response.clicked() {
+                            self.selected = Some(task.id);
+                            self.draft = None;
+                        }
+                    });
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new(status_label(task.status)).strong());
                         ui.small(format!("{} 段", task.actual_segments.max(1)));
@@ -613,6 +762,28 @@ fn status_label(status: TaskStatus) -> &'static str {
     }
 }
 
+fn can_edit_proxy_in_bulk(status: TaskStatus) -> bool {
+    matches!(
+        status,
+        TaskStatus::Queued
+            | TaskStatus::Paused
+            | TaskStatus::Failed
+            | TaskStatus::NeedsProxyPassword
+    )
+}
+
+fn proxy_from_snapshot(task: &TaskSnapshot) -> ProxySettings {
+    ProxySettings {
+        enabled: task.proxy.enabled,
+        protocol: task.proxy.protocol,
+        host: task.proxy.host.clone(),
+        port: task.proxy.port,
+        username: task.proxy.username.clone(),
+        password: None,
+        requires_password: task.proxy.requires_password,
+    }
+}
+
 fn curl_source_label(source: CurlSource) -> &'static str {
     match source {
         CurlSource::NotStarted => "尚未啟動",
@@ -792,5 +963,17 @@ mod tests {
         assert_eq!(curl_source_label(CurlSource::NotStarted), "尚未啟動");
         assert_eq!(curl_source_label(CurlSource::Local), "本機 curl");
         assert_eq!(curl_source_label(CurlSource::Embedded), "內置 curl");
+    }
+
+    #[test]
+    fn only_editable_tasks_can_receive_bulk_proxy_settings() {
+        assert!(can_edit_proxy_in_bulk(TaskStatus::Queued));
+        assert!(can_edit_proxy_in_bulk(TaskStatus::Paused));
+        assert!(can_edit_proxy_in_bulk(TaskStatus::Failed));
+        assert!(can_edit_proxy_in_bulk(TaskStatus::NeedsProxyPassword));
+        assert!(!can_edit_proxy_in_bulk(TaskStatus::Probing));
+        assert!(!can_edit_proxy_in_bulk(TaskStatus::Downloading));
+        assert!(!can_edit_proxy_in_bulk(TaskStatus::Completed));
+        assert!(!can_edit_proxy_in_bulk(TaskStatus::Cancelled));
     }
 }

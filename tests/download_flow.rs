@@ -1,6 +1,8 @@
 mod support;
 
-use curl_downloader::model::{CurlSource, EngineCommand, NewTask, TaskStatus};
+use curl_downloader::model::{
+    CurlSource, EngineCommand, NewTask, ProxySettings, TaskError, TaskStatus,
+};
 
 #[test]
 fn curl_runtime_is_lazy_until_download_starts() {
@@ -26,6 +28,86 @@ fn curl_runtime_is_lazy_until_download_starts() {
         completed.curl_source,
         CurlSource::Local | CurlSource::Embedded
     ));
+}
+
+#[test]
+fn successful_download_clears_previous_error() {
+    let server = support::TestHttpServer::start(vec![support::Route {
+        path: "/retry.bin",
+        body: b"retry",
+        ranges: false,
+        etag: "retry-v1",
+        filename: "retry.bin",
+    }]);
+    let mut harness = support::EngineHarness::new(1);
+    let queued = harness
+        .add_batch(&[format!("{}/retry.bin", server.base_url)])
+        .remove(0);
+    let state_path = harness.shutdown_keep_files();
+    let mut state = curl_downloader::storage::load_state(&state_path).unwrap();
+    state.tasks[0].status = TaskStatus::Failed;
+    state.tasks[0].last_error = Some(TaskError {
+        kind: curl_downloader::model::ErrorKind::Network,
+        summary: "無法取得來源資訊".into(),
+        code: Some(35),
+        diagnostic: "curl: (35) Recv failure: Connection was reset".into(),
+        action: "檢查網址或 Proxy 後重試".into(),
+    });
+    curl_downloader::storage::save_state(&state_path, &state).unwrap();
+
+    let mut restarted =
+        support::EngineHarness::from_state(state_path, harness.download_dir().to_path_buf());
+    restarted.start(queued.id);
+    let completed = restarted.wait_for(
+        queued.id,
+        TaskStatus::Completed,
+        std::time::Duration::from_secs(60),
+    );
+
+    assert!(completed.error.is_none());
+}
+
+#[test]
+fn applies_one_proxy_configuration_to_multiple_queued_tasks() {
+    let server = support::TestHttpServer::start(vec![
+        support::Route {
+            path: "/first.bin",
+            body: b"first",
+            ranges: false,
+            etag: "first-v1",
+            filename: "first.bin",
+        },
+        support::Route {
+            path: "/second.bin",
+            body: b"second",
+            ranges: false,
+            etag: "second-v1",
+            filename: "second.bin",
+        },
+    ]);
+    let mut harness = support::EngineHarness::new(1);
+    let tasks = harness.add_batch(&[
+        format!("{}/first.bin", server.base_url),
+        format!("{}/second.bin", server.base_url),
+    ]);
+    let ids = tasks.iter().map(|task| task.id).collect::<Vec<_>>();
+    let proxy = ProxySettings {
+        enabled: true,
+        host: "127.0.0.1".into(),
+        port: 8080,
+        ..ProxySettings::default()
+    };
+
+    harness
+        .engine
+        .commands
+        .send(EngineCommand::UpdateProxy { ids, proxy })
+        .unwrap();
+    let updated = harness.wait_for_proxy(&[tasks[0].id, tasks[1].id], "127.0.0.1");
+
+    assert_eq!(updated.len(), 2);
+    assert!(updated.iter().all(|task| task.proxy.enabled));
+    assert!(updated.iter().all(|task| task.proxy.port == 8080));
 }
 
 #[test]
