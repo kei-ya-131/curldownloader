@@ -531,8 +531,11 @@ impl Engine {
                 .send(EngineEvent::Fatal(format!("Proxy 設定無效：{error}")));
             return;
         }
+        let mut applied = 0;
+        let mut skipped = 0;
         for id in ids {
             let Some(status) = self.task(id).map(|task| task.status) else {
+                skipped += 1;
                 continue;
             };
             if !matches!(
@@ -542,6 +545,7 @@ impl Engine {
                     | TaskStatus::Failed
                     | TaskStatus::NeedsProxyPassword
             ) {
+                skipped += 1;
                 continue;
             }
             let source_changed = self
@@ -578,8 +582,12 @@ impl Engine {
                 self.stop_task_jobs(id);
                 self.queue.retain(|queued| *queued != id);
             }
+            applied += 1;
         }
         let _ = self.persist();
+        let _ = self
+            .events
+            .send(EngineEvent::BatchProxyApplied { applied, skipped });
         self.publish_snapshot();
     }
 

@@ -324,6 +324,7 @@ pub enum EngineCommand {
 
 pub enum EngineEvent {
     Snapshot(Vec<TaskSnapshot>),
+    BatchProxyApplied { applied: usize, skipped: usize },
     Fatal(String),
     ShutdownComplete,
 }

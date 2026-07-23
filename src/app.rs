@@ -57,12 +57,14 @@ pub struct CurlDownloaderApp {
     selected: Option<TaskId>,
     checked_tasks: HashSet<TaskId>,
     url_input: String,
+    queue_search: String,
     input_error: Option<String>,
     batch_input: String,
     batch_error: Option<String>,
     show_batch_dialog: bool,
     batch_proxy_dialog: bool,
     batch_proxy: Option<BatchProxyDraft>,
+    batch_proxy_message: Option<String>,
     fatal: Option<String>,
     draft: Option<TaskDraft>,
     last_download_dir: PathBuf,
@@ -141,22 +143,22 @@ impl CurlDownloaderApp {
         let engine = spawn_engine(state_path, state)
             .unwrap_or_else(|error| panic!("無法啟動下載引擎：{error}"));
 
-        let mut visuals = egui::Visuals::dark();
-        visuals.selection.bg_fill = egui::Color32::from_rgb(40, 100, 190);
         cc.egui_ctx.set_fonts(chinese_font_definitions());
-        cc.egui_ctx.set_visuals(visuals);
+        cc.egui_ctx.set_theme(egui::ThemePreference::System);
         Self {
             engine,
             tasks: Vec::new(),
             selected: None,
             checked_tasks: HashSet::new(),
             url_input: String::new(),
+            queue_search: String::new(),
             input_error: None,
             batch_input: String::new(),
             batch_error: None,
             show_batch_dialog: false,
             batch_proxy_dialog: false,
             batch_proxy: None,
+            batch_proxy_message: None,
             fatal,
             draft: None,
             last_download_dir,
@@ -197,6 +199,9 @@ impl CurlDownloaderApp {
                         }
                     }
                 }
+                EngineEvent::BatchProxyApplied { applied, skipped } => {
+                    self.batch_proxy_message = Some(format_batch_proxy_result(applied, skipped));
+                }
                 EngineEvent::Fatal(message) => self.fatal = Some(message),
                 EngineEvent::ShutdownComplete => {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -208,6 +213,15 @@ impl CurlDownloaderApp {
     fn selected_task(&self) -> Option<TaskSnapshot> {
         self.selected
             .and_then(|id| self.tasks.iter().find(|task| task.id == id).cloned())
+    }
+
+    fn select_all_editable(&mut self) {
+        self.checked_tasks = self
+            .tasks
+            .iter()
+            .filter(|task| can_edit_proxy_in_bulk(task.status))
+            .map(|task| task.id)
+            .collect();
     }
 
     fn open_batch_proxy_dialog(&mut self) {
@@ -336,65 +350,94 @@ impl CurlDownloaderApp {
     }
 
     fn show_top_bar(&mut self, ui: &mut egui::Ui) {
-        egui::Panel::top("top-bar").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                let response = ui.text_edit_singleline(&mut self.url_input);
-                if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
-                    self.add_url();
-                }
-                if ui.button("新增下載").clicked() {
-                    self.add_url();
-                }
-                if ui.button("批量新增").clicked() {
-                    self.batch_error = None;
-                    self.show_batch_dialog = true;
-                }
-                ui.label("最大 curl：");
-                if ui
-                    .add(egui::DragValue::new(&mut self.max_processes).range(1..=16))
-                    .changed()
-                {
-                    let _ = self
-                        .engine
-                        .commands
-                        .send(EngineCommand::SetMaxProcesses(self.max_processes));
-                }
-                if ui.button("全部開始").clicked() {
-                    if let Some(draft) = self.draft.clone() {
-                        self.send_draft(&draft);
+        let panel_fill = ui.visuals().panel_fill;
+        egui::Panel::top("top-bar")
+            .frame(egui::Frame::new().fill(panel_fill).inner_margin(10))
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new("Curl Downloader").strong().size(18.0));
+                    let response = ui.add_sized(
+                        [260.0, 30.0],
+                        egui::TextEdit::singleline(&mut self.url_input)
+                            .hint_text("貼上 HTTP/HTTPS 網址"),
+                    );
+                    if response.lost_focus()
+                        && ui.input(|input| input.key_pressed(egui::Key::Enter))
+                    {
+                        self.add_url();
                     }
-                    let _ = self.engine.commands.send(EngineCommand::StartAll);
-                }
-                if ui.button("全部暫停").clicked() {
-                    let _ = self.engine.commands.send(EngineCommand::PauseAll);
-                }
-                if !self.checked_tasks.is_empty() {
-                    ui.label(format!("已選取 {} 個任務", self.checked_tasks.len()));
-                    if ui.button("批量設定 Proxy").clicked() {
-                        self.open_batch_proxy_dialog();
+                    if ui
+                        .add(egui::Button::new(
+                            egui::RichText::new("＋ 新增下載").strong(),
+                        ))
+                        .clicked()
+                    {
+                        self.add_url();
                     }
-                    if ui.button("清除選取").clicked() {
-                        self.checked_tasks.clear();
+                    if ui.button("☷ 批量新增").clicked() {
+                        self.batch_error = None;
+                        self.show_batch_dialog = true;
                     }
+                    ui.separator();
+                    ui.label("最大 curl");
+                    if ui
+                        .add(egui::DragValue::new(&mut self.max_processes).range(1..=16))
+                        .changed()
+                    {
+                        let _ = self
+                            .engine
+                            .commands
+                            .send(EngineCommand::SetMaxProcesses(self.max_processes));
+                    }
+                    if ui.button("▶ 開始全部").clicked() {
+                        if let Some(draft) = self.draft.clone() {
+                            self.send_draft(&draft);
+                        }
+                        let _ = self.engine.commands.send(EngineCommand::StartAll);
+                    }
+                    if ui.button("Ⅱ 暫停全部").clicked() {
+                        let _ = self.engine.commands.send(EngineCommand::PauseAll);
+                    }
+                    ui.separator();
+                    if ui.button("全選可編輯").clicked() {
+                        self.select_all_editable();
+                    }
+                    if !self.checked_tasks.is_empty() {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "已選取 {} 個任務",
+                                self.checked_tasks.len()
+                            ))
+                            .strong(),
+                        );
+                        if ui.button("批量設定 Proxy").clicked() {
+                            self.open_batch_proxy_dialog();
+                        }
+                        if ui.button("清除選取").clicked() {
+                            self.checked_tasks.clear();
+                        }
+                    }
+                    if ui
+                        .button("清除已完成")
+                        .on_hover_text("清除已完成及已取消的任務記錄，不會刪除已下載檔案")
+                        .clicked()
+                    {
+                        let _ = self.engine.commands.send(EngineCommand::ClearHistory);
+                    }
+                });
+                if let Some(error) = &self.input_error {
+                    ui.colored_label(ui.visuals().error_fg_color, error);
                 }
-                if ui
-                    .button("清除已完成")
-                    .on_hover_text("清除已完成及已取消的任務記錄，不會刪除已下載檔案")
-                    .clicked()
-                {
-                    let _ = self.engine.commands.send(EngineCommand::ClearHistory);
+                if let Some(message) = &self.batch_proxy_message {
+                    ui.colored_label(ui.visuals().text_color(), format!("✓ {message}"));
+                }
+                if let Some(message) = &self.fatal {
+                    ui.colored_label(ui.visuals().warn_fg_color, message);
+                }
+                if self.shutting_down {
+                    ui.colored_label(ui.visuals().hyperlink_color, "正在安全停止下載…");
                 }
             });
-            if let Some(error) = &self.input_error {
-                ui.colored_label(egui::Color32::LIGHT_RED, error);
-            }
-            if let Some(message) = &self.fatal {
-                ui.colored_label(egui::Color32::YELLOW, message);
-            }
-            if self.shutting_down {
-                ui.colored_label(egui::Color32::LIGHT_BLUE, "正在安全停止下載…");
-            }
-        });
         if self.show_batch_dialog {
             let mut open = true;
             let mut submit = false;
@@ -410,7 +453,7 @@ impl CurlDownloaderApp {
                             .desired_width(620.0),
                     );
                     if let Some(error) = &self.batch_error {
-                        ui.colored_label(egui::Color32::LIGHT_RED, error);
+                        ui.colored_label(ui.visuals().error_fg_color, error);
                     }
                     ui.horizontal(|ui| {
                         if ui.button("批量新增").clicked() {
@@ -497,237 +540,405 @@ impl CurlDownloaderApp {
     fn show_queue(&mut self, ui: &mut egui::Ui) {
         egui::Panel::left("queue")
             .resizable(true)
-            .default_size(470.0)
+            .default_size(350.0)
             .show(ui, |ui| {
-                ui.heading("下載佇列");
-                for task in self.tasks.clone() {
-                    let selected = self.selected == Some(task.id);
-                    ui.horizontal(|ui| {
-                        let mut checked = self.checked_tasks.contains(&task.id);
-                        if ui
-                            .add_enabled(
-                                can_edit_proxy_in_bulk(task.status),
-                                egui::Checkbox::new(&mut checked, ""),
-                            )
-                            .changed()
-                        {
-                            if checked {
-                                self.checked_tasks.insert(task.id);
-                            } else {
-                                self.checked_tasks.remove(&task.id);
-                            }
-                        }
-                        let response = ui.selectable_label(
-                            selected,
-                            egui::RichText::new(&task.filename).strong().size(15.0),
-                        );
-                        if response.clicked() {
-                            self.selected = Some(task.id);
-                            self.draft = None;
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(status_label(task.status)).strong());
-                        ui.small(format!("{} 段", task.actual_segments.max(1)));
-                        ui.small(format!("下載工具：{}", curl_source_label(task.curl_source)));
-                    });
-                    let bar_width = ui.available_width();
-                    ui.add_sized(
-                        [bar_width, 26.0],
-                        egui::ProgressBar::new(progress_fraction(&task))
-                            .text(format!("{:.1}%", progress_fraction(&task) * 100.0)),
+                egui::Frame::new().inner_margin(12).show(ui, |ui| {
+                    ui.heading("下載佇列");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.queue_search)
+                            .hint_text("搜尋下載…")
+                            .desired_width(ui.available_width()),
                     );
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(
-                            egui::RichText::new(progress_text(&task))
-                                .strong()
-                                .size(14.0),
-                        );
-                        ui.label(egui::RichText::new(speed_text(&task)).strong().size(14.0));
-                        ui.label(format!("剩餘 {}", format_eta(task.eta_seconds)));
-                    });
-                    ui.horizontal(|ui| {
-                        if matches!(
-                            task.status,
-                            TaskStatus::Queued | TaskStatus::Paused | TaskStatus::Failed
-                        ) && ui.button("開始").clicked()
-                        {
-                            self.flush_draft(task.id);
-                            let _ = self.engine.commands.send(EngineCommand::Start(task.id));
-                        }
-                        if matches!(task.status, TaskStatus::Probing | TaskStatus::Downloading)
-                            && ui.button("暫停").clicked()
-                        {
-                            let _ = self.engine.commands.send(EngineCommand::Pause(task.id));
-                        }
-                        if !matches!(task.status, TaskStatus::Completed | TaskStatus::Cancelled)
-                            && ui.button("取消").clicked()
-                        {
-                            let _ = self.engine.commands.send(EngineCommand::Cancel(task.id));
-                        }
-                        if task.status == TaskStatus::Completed
-                            && ui
-                                .button("開啟位置")
-                                .on_hover_text("在檔案總管選取檔案")
-                                .clicked()
-                        {
-                            open_location(task.target_dir.join(task.filename));
-                        }
-                        if matches!(task.status, TaskStatus::Completed | TaskStatus::Cancelled)
-                            && ui.button("清除記錄").clicked()
-                        {
-                            let _ = self.engine.commands.send(EngineCommand::Remove(task.id));
-                        }
-                    });
+                    egui::ScrollArea::vertical()
+                        .id_salt("queue-scroll")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            let search = self.queue_search.trim().to_lowercase();
+                            let matches_search = |task: &TaskSnapshot| {
+                                search.is_empty()
+                                    || task.filename.to_lowercase().contains(&search)
+                                    || task.original_url.to_lowercase().contains(&search)
+                            };
+                            let active = self
+                                .tasks
+                                .iter()
+                                .filter(|task| queue_group(task.status) == QueueGroup::Active)
+                                .filter(|task| matches_search(task))
+                                .cloned()
+                                .collect::<Vec<_>>();
+                            let completed = self
+                                .tasks
+                                .iter()
+                                .filter(|task| queue_group(task.status) == QueueGroup::Completed)
+                                .filter(|task| matches_search(task))
+                                .cloned()
+                                .collect::<Vec<_>>();
+                            self.show_queue_section(ui, "下載佇列", &active);
+                            ui.add_space(8.0);
+                            self.show_queue_section(
+                                ui,
+                                &format!("已完成 ({})", completed.len()),
+                                &completed,
+                            );
+                            if active.is_empty() && completed.is_empty() {
+                                ui.weak("目前沒有符合的任務");
+                            }
+                        });
                     ui.separator();
-                }
+                    ui.weak(format!("全部 {} 個任務", self.tasks.len()));
+                });
             });
     }
 
-    fn show_inspector(&mut self, ui: &mut egui::Ui) {
-        egui::CentralPanel::default().show(ui, |ui| {
-            let Some(task) = self.selected_task() else {
-                ui.heading("選取任務以檢視詳細資料");
-                return;
-            };
-            self.ensure_draft(&task);
-            let needs_password = task.status == TaskStatus::NeedsProxyPassword;
-            ui.heading(&task.filename);
-            ui.label(format!("狀態：{}", status_label(task.status)));
-            ui.label(format!("下載工具：{}", curl_source_label(task.curl_source)));
-            if let Some(error) = &task.error {
-                ui.colored_label(
-                    egui::Color32::LIGHT_RED,
-                    format!("{}：{}", error.summary, error.action),
-                );
-                if !error.diagnostic.trim().is_empty() {
-                    ui.collapsing("詳細診斷（已清理敏感資料）", |ui| {
-                        ui.monospace(&error.diagnostic);
-                    });
+    fn show_queue_section(&mut self, ui: &mut egui::Ui, title: &str, tasks: &[TaskSnapshot]) {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(title).strong().size(16.0));
+            ui.separator();
+            ui.weak(format!("{} 個", tasks.len()));
+        });
+        for task in tasks {
+            self.show_task_card(ui, task);
+            ui.add_space(8.0);
+        }
+    }
+
+    fn show_task_card(&mut self, ui: &mut egui::Ui, task: &TaskSnapshot) {
+        let selected = self.selected == Some(task.id);
+        let mut checked = self.checked_tasks.contains(&task.id);
+        let mut open_task = false;
+        task_card_frame(ui, selected).show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(
+                        can_edit_proxy_in_bulk(task.status),
+                        egui::Checkbox::new(&mut checked, "選取"),
+                    )
+                    .changed()
+                {
+                    if checked {
+                        self.checked_tasks.insert(task.id);
+                    } else {
+                        self.checked_tasks.remove(&task.id);
+                    }
                 }
-            }
-            let mut pending_update = None;
-            if let Some(draft) = self.draft.as_mut() {
-                let mut changed = false;
-                let can_edit = matches!(
+                ui.colored_label(
+                    status_color(task.status),
+                    egui::RichText::new(status_icon(task.status))
+                        .size(21.0)
+                        .strong(),
+                );
+                let response = ui.selectable_label(
+                    selected,
+                    egui::RichText::new(&task.filename).strong().size(15.0),
+                );
+                if response.clicked() {
+                    open_task = true;
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.colored_label(
+                    status_color(task.status),
+                    egui::RichText::new(status_label(task.status)).strong(),
+                );
+                ui.weak(format!("{} 段", task.actual_segments.max(1)));
+                ui.weak(curl_source_label(task.curl_source));
+            });
+            ui.add(
+                egui::ProgressBar::new(progress_fraction(task))
+                    .desired_height(14.0)
+                    .fill(status_color(task.status))
+                    .text(format!("{:.1}%", progress_fraction(task) * 100.0)),
+            );
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new(progress_text(task)).strong());
+                ui.label(egui::RichText::new(speed_text(task)).strong());
+                ui.weak(format!("剩餘 {}", format_eta(task.eta_seconds)));
+            });
+            ui.horizontal_wrapped(|ui| {
+                if matches!(
                     task.status,
                     TaskStatus::Queued | TaskStatus::Paused | TaskStatus::Failed
-                );
-                ui.add_enabled_ui(can_edit, |ui| {
-                    ui.label("網址");
-                    if ui.text_edit_singleline(&mut draft.url).lost_focus() {
-                        changed = true;
-                    }
-                    ui.label("檔名");
-                    if ui.text_edit_singleline(&mut draft.filename).lost_focus() {
-                        changed = true;
-                    }
-                    ui.label("下載目錄");
-                    if ui
-                        .text_edit_singleline(&mut draft.target_dir_input)
-                        .lost_focus()
-                    {
-                        let path = PathBuf::from(draft.target_dir_input.trim());
-                        if path.is_dir() {
-                            draft.target_dir = path.clone();
-                            self.last_download_dir = path.clone();
-                            let _ = self
-                                .engine
-                                .commands
-                                .send(EngineCommand::SetLastDownloadDir(path));
-                            changed = true;
-                        } else {
-                            self.input_error = Some("下載目錄不存在".into());
-                        }
-                    }
-                    if ui
-                        .button("選擇資料夾…")
-                        .on_hover_text("選擇此任務的下載位置")
+                ) && ui.button("開始").clicked()
+                {
+                    self.flush_draft(task.id);
+                    let _ = self.engine.commands.send(EngineCommand::Start(task.id));
+                }
+                if matches!(task.status, TaskStatus::Probing | TaskStatus::Downloading)
+                    && ui.button("暫停").clicked()
+                {
+                    let _ = self.engine.commands.send(EngineCommand::Pause(task.id));
+                }
+                if !matches!(task.status, TaskStatus::Completed | TaskStatus::Cancelled)
+                    && ui.button("取消").clicked()
+                {
+                    let _ = self.engine.commands.send(EngineCommand::Cancel(task.id));
+                }
+                if task.status == TaskStatus::Completed
+                    && ui
+                        .button("開啟位置")
+                        .on_hover_text("在檔案總管開啟下載檔案所在位置")
                         .clicked()
-                    {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .set_directory(&draft.target_dir)
-                            .pick_folder()
-                        {
-                            draft.target_dir_input = path.display().to_string();
-                            draft.target_dir = path.clone();
-                            self.last_download_dir = path.clone();
-                            let _ = self
-                                .engine
-                                .commands
-                                .send(EngineCommand::SetLastDownloadDir(path));
-                            changed = true;
-                        }
-                    }
-                    ui.horizontal(|ui| {
-                        ui.label("分段");
-                        changed |= ui
-                            .add(egui::Slider::new(&mut draft.segments, 1..=8))
-                            .changed();
+                {
+                    open_location(task.target_dir.join(&task.filename));
+                }
+                if matches!(task.status, TaskStatus::Completed | TaskStatus::Cancelled)
+                    && ui.button("清除記錄").clicked()
+                {
+                    let _ = self.engine.commands.send(EngineCommand::Remove(task.id));
+                }
+            });
+        });
+        if open_task {
+            self.selected = Some(task.id);
+            self.draft = None;
+        }
+    }
+
+    fn show_inspector(&mut self, ui: &mut egui::Ui) {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().inner_margin(16))
+            .show(ui, |ui| {
+                let Some(task) = self.selected_task() else {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(80.0);
+                        ui.heading("選取任務以檢視詳細資料");
+                        ui.weak("下載進度、速度及 Proxy 設定會顯示在這裡");
                     });
-                    ui.separator();
-                    ui.checkbox(&mut draft.proxy.enabled, "使用 Proxy");
-                    egui::ComboBox::from_id_salt("proxy-protocol")
-                        .selected_text(draft.proxy.protocol.scheme())
-                        .show_ui(ui, |ui| {
-                            for protocol in [
-                                ProxyProtocol::Http,
-                                ProxyProtocol::Https,
-                                ProxyProtocol::Socks5,
-                                ProxyProtocol::Socks5h,
-                            ] {
-                                changed |= ui
-                                    .selectable_value(
-                                        &mut draft.proxy.protocol,
-                                        protocol,
-                                        protocol.scheme(),
-                                    )
-                                    .changed();
-                            }
+                    return;
+                };
+                self.ensure_draft(&task);
+                ui.horizontal(|ui| {
+                    ui.colored_label(
+                        status_color(task.status),
+                        egui::RichText::new(status_icon(task.status))
+                            .size(30.0)
+                            .strong(),
+                    );
+                    ui.vertical(|ui| {
+                        ui.heading(&task.filename);
+                        ui.horizontal(|ui| {
+                            ui.colored_label(
+                                status_color(task.status),
+                                egui::RichText::new(status_label(task.status)).strong(),
+                            );
+                            ui.weak(format!("下載工具：{}", curl_source_label(task.curl_source)));
                         });
-                    ui.horizontal(|ui| {
-                        ui.label("主機");
-                        changed |= ui.text_edit_singleline(&mut draft.proxy.host).changed();
-                        ui.label("連接埠");
-                        changed |= ui
-                            .add(egui::DragValue::new(&mut draft.proxy.port).range(1..=65535))
-                            .changed();
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("帳號");
-                        changed |= ui.text_edit_singleline(&mut draft.proxy.username).changed();
-                        ui.label("密碼");
-                        let response = ui.add(
-                            egui::TextEdit::singleline(&mut draft.password_input)
-                                .password(!draft.show_password),
-                        );
-                        draft.show_password = response.is_pointer_button_down_on();
-                        if draft.show_password {
-                            ui.label("顯示中");
-                        }
                     });
                 });
-                if !can_edit && !needs_password {
-                    ui.label("下載已開始，檔名、位置及 Proxy 設定已鎖定。");
-                }
-                if needs_password {
-                    ui.label("此任務需要 Proxy 密碼才能繼續。");
-                    if ui.button("設定密碼並開始").clicked() && !draft.password_input.is_empty()
-                    {
-                        let _ = self.engine.commands.send(EngineCommand::SetProxyPassword {
-                            id: draft.id,
-                            password: zeroize::Zeroizing::new(draft.password_input.clone()),
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.colored_label(
+                        ui.visuals().hyperlink_color,
+                        egui::RichText::new("▤  任務總覽").strong(),
+                    );
+                    ui.weak("分段設定");
+                    ui.weak("記事");
+                });
+                ui.separator();
+
+                egui::ScrollArea::vertical()
+                    .id_salt("inspector-scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        let mut pending_update = None;
+                        let mut pending_last_dir = None;
+                        let mut pending_password = None;
+                        let mut pending_error = None;
+                        let needs_password = task.status == TaskStatus::NeedsProxyPassword;
+                        let can_edit = matches!(
+                            task.status,
+                            TaskStatus::Queued | TaskStatus::Paused | TaskStatus::Failed
+                        );
+
+                        ui.columns(2, |columns| {
+                            show_progress_card(&mut columns[0], &task);
+                            show_basic_info_card(&mut columns[1], &task);
                         });
-                        draft.password_input.clear();
-                    }
-                } else if changed {
-                    pending_update = Some(draft.clone());
-                }
-            }
-            if let Some(draft) = pending_update {
-                self.send_draft(&draft);
-            }
-        });
+                        ui.add_space(12.0);
+
+                        if let Some(draft) = self.draft.as_mut() {
+                            let mut changed = false;
+                            ui.columns(2, |columns| {
+                                card_frame(&columns[0]).show(&mut columns[0], |ui| {
+                                    ui.heading("儲存位置");
+                                    ui.label("來源 URL");
+                                    changed |= ui
+                                        .add_enabled(
+                                            can_edit,
+                                            egui::TextEdit::singleline(&mut draft.url),
+                                        )
+                                        .changed();
+                                    ui.label("檔名");
+                                    changed |= ui
+                                        .add_enabled(
+                                            can_edit,
+                                            egui::TextEdit::singleline(&mut draft.filename),
+                                        )
+                                        .changed();
+                                    ui.horizontal(|ui| {
+                                        ui.label("資料夾");
+                                        let response = ui.add_enabled(
+                                            can_edit,
+                                            egui::TextEdit::singleline(&mut draft.target_dir_input),
+                                        );
+                                        if response.lost_focus() {
+                                            let path = PathBuf::from(draft.target_dir_input.trim());
+                                            if path.is_dir() {
+                                                draft.target_dir = path.clone();
+                                                pending_last_dir = Some(path);
+                                                changed = true;
+                                            } else {
+                                                pending_error = Some("下載目錄不存在".into());
+                                            }
+                                        }
+                                        if ui
+                                            .add_enabled(can_edit, egui::Button::new("瀏覽…"))
+                                            .clicked()
+                                        {
+                                            if let Some(path) = rfd::FileDialog::new()
+                                                .set_directory(&draft.target_dir)
+                                                .pick_folder()
+                                            {
+                                                draft.target_dir_input = path.display().to_string();
+                                                draft.target_dir = path.clone();
+                                                pending_last_dir = Some(path);
+                                                changed = true;
+                                            }
+                                        }
+                                    });
+                                    ui.weak("下載完成後，檔案會保存於此位置。");
+                                });
+                                card_frame(&columns[1]).show(&mut columns[1], |ui| {
+                                    ui.heading("分段設定");
+                                    ui.label("分段數");
+                                    changed |= ui
+                                        .add_enabled(
+                                            can_edit,
+                                            egui::Slider::new(&mut draft.segments, 1..=8)
+                                                .text("段"),
+                                        )
+                                        .changed();
+                                    ui.weak("分段下載可提升穩定性及速度。");
+                                });
+                            });
+                            ui.add_space(12.0);
+                            card_frame(ui).show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.heading("Proxy 設定");
+                                    ui.weak("只套用於此任務的下載連線");
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            ui.checkbox(&mut draft.proxy.enabled, "啟用 Proxy");
+                                        },
+                                    );
+                                });
+                                ui.add_enabled_ui(can_edit || needs_password, |ui| {
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label("協定");
+                                        egui::ComboBox::from_id_salt("proxy-protocol")
+                                            .selected_text(draft.proxy.protocol.scheme())
+                                            .show_ui(ui, |ui| {
+                                                for protocol in [
+                                                    ProxyProtocol::Http,
+                                                    ProxyProtocol::Https,
+                                                    ProxyProtocol::Socks5,
+                                                    ProxyProtocol::Socks5h,
+                                                ] {
+                                                    changed |= ui
+                                                        .selectable_value(
+                                                            &mut draft.proxy.protocol,
+                                                            protocol,
+                                                            protocol.scheme(),
+                                                        )
+                                                        .changed();
+                                                }
+                                            });
+                                        ui.label("主機");
+                                        changed |= ui
+                                            .text_edit_singleline(&mut draft.proxy.host)
+                                            .changed();
+                                        ui.label("連接埠");
+                                        changed |= ui
+                                            .add(
+                                                egui::DragValue::new(&mut draft.proxy.port)
+                                                    .range(1..=65535),
+                                            )
+                                            .changed();
+                                    });
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label("帳號");
+                                        changed |= ui
+                                            .text_edit_singleline(&mut draft.proxy.username)
+                                            .changed();
+                                        ui.label("密碼");
+                                        let response = ui.add(
+                                            egui::TextEdit::singleline(&mut draft.password_input)
+                                                .password(!draft.show_password),
+                                        );
+                                        draft.show_password = response.is_pointer_button_down_on();
+                                    });
+                                });
+                                if !can_edit && !needs_password {
+                                    ui.weak("下載已開始，檔名、位置及 Proxy 設定已鎖定。");
+                                }
+                                if needs_password {
+                                    ui.label("此任務需要 Proxy 密碼才能繼續。");
+                                    if ui.button("設定密碼並開始").clicked()
+                                        && !draft.password_input.is_empty()
+                                    {
+                                        pending_password =
+                                            Some((draft.id, draft.password_input.clone()));
+                                        draft.password_input.clear();
+                                    }
+                                }
+                            });
+                            if !needs_password && changed {
+                                pending_update = Some(draft.clone());
+                            }
+                        }
+
+                        if let Some(error) = &task.error {
+                            ui.add_space(12.0);
+                            card_frame(ui).show(ui, |ui| {
+                                ui.colored_label(
+                                    ui.visuals().error_fg_color,
+                                    egui::RichText::new(format!(
+                                        "! {}：{}",
+                                        error.summary, error.action
+                                    ))
+                                    .strong(),
+                                );
+                                if !error.diagnostic.trim().is_empty() {
+                                    ui.collapsing("詳細診斷（已清理敏感資料）", |ui| {
+                                        ui.monospace(&error.diagnostic);
+                                    });
+                                }
+                            });
+                        }
+
+                        if let Some(draft) = pending_update {
+                            self.send_draft(&draft);
+                        }
+                        if let Some(path) = pending_last_dir {
+                            self.last_download_dir = path.clone();
+                            let _ = self
+                                .engine
+                                .commands
+                                .send(EngineCommand::SetLastDownloadDir(path));
+                        }
+                        if let Some((id, password)) = pending_password {
+                            let _ = self.engine.commands.send(EngineCommand::SetProxyPassword {
+                                id,
+                                password: zeroize::Zeroizing::new(password),
+                            });
+                        }
+                        if let Some(error) = pending_error {
+                            self.input_error = Some(error);
+                        }
+                    });
+            });
     }
 }
 
@@ -747,6 +958,121 @@ impl eframe::App for CurlDownloaderApp {
     }
 }
 
+fn card_frame(ui: &egui::Ui) -> egui::Frame {
+    let visuals = ui.visuals();
+    egui::Frame::group(ui.style())
+        .fill(visuals.faint_bg_color)
+        .stroke(egui::Stroke::new(
+            1.0,
+            visuals.widgets.noninteractive.bg_stroke.color,
+        ))
+        .corner_radius(egui::CornerRadius::same(10))
+        .inner_margin(12)
+}
+
+fn task_card_frame(ui: &egui::Ui, selected: bool) -> egui::Frame {
+    let visuals = ui.visuals();
+    if selected {
+        card_frame(ui)
+            .fill(visuals.selection.bg_fill)
+            .stroke(egui::Stroke::new(1.5, visuals.selection.stroke.color))
+    } else {
+        card_frame(ui)
+    }
+}
+
+fn status_color(status: TaskStatus) -> egui::Color32 {
+    match status {
+        TaskStatus::Queued | TaskStatus::Paused | TaskStatus::Cancelled => {
+            egui::Color32::from_rgb(125, 135, 150)
+        }
+        TaskStatus::Probing | TaskStatus::Downloading => egui::Color32::from_rgb(38, 128, 220),
+        TaskStatus::Pausing | TaskStatus::Finalizing => egui::Color32::from_rgb(190, 122, 37),
+        TaskStatus::NeedsProxyPassword => egui::Color32::from_rgb(190, 108, 38),
+        TaskStatus::Completed => egui::Color32::from_rgb(40, 157, 99),
+        TaskStatus::Failed => egui::Color32::from_rgb(200, 61, 75),
+    }
+}
+
+fn show_progress_card(ui: &mut egui::Ui, task: &TaskSnapshot) {
+    card_frame(ui).show(ui, |ui| {
+        ui.heading("下載進度");
+        ui.horizontal(|ui| {
+            draw_progress_ring(ui, progress_fraction(task), status_color(task.status));
+            ui.vertical(|ui| {
+                ui.label("已下載 / 總大小");
+                ui.label(egui::RichText::new(progress_text(task)).size(16.0).strong());
+                ui.add_space(8.0);
+                ui.label("目前／平均速度");
+                ui.label(egui::RichText::new(speed_text(task)).size(16.0).strong());
+                ui.add_space(8.0);
+                ui.label("剩餘時間");
+                ui.label(egui::RichText::new(format_eta(task.eta_seconds)).size(16.0));
+            });
+        });
+        ui.colored_label(
+            status_color(task.status),
+            egui::RichText::new(format!(
+                "{} {}",
+                status_icon(task.status),
+                status_label(task.status)
+            ))
+            .strong(),
+        );
+    });
+}
+
+fn show_basic_info_card(ui: &mut egui::Ui, task: &TaskSnapshot) {
+    card_frame(ui).show(ui, |ui| {
+        ui.heading("基本資料");
+        egui::Grid::new(format!("basic-info-{}", task.id))
+            .num_columns(2)
+            .spacing([12.0, 8.0])
+            .show(ui, |ui| {
+                info_row(ui, "狀態", status_label(task.status));
+                info_row(ui, "下載工具", curl_source_label(task.curl_source));
+                ui.label("來源 URL");
+                ui.label(&task.original_url);
+                ui.end_row();
+                info_row(ui, "檔名", &task.filename);
+                info_row(ui, "儲存位置", &task.target_dir.display().to_string());
+            });
+    });
+}
+
+fn info_row(ui: &mut egui::Ui, label: &str, value: &str) {
+    ui.weak(label);
+    ui.label(value);
+    ui.end_row();
+}
+
+fn draw_progress_ring(ui: &mut egui::Ui, fraction: f32, color: egui::Color32) {
+    let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat(142.0), egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    let center = rect.center();
+    let radius = 49.0;
+    let track = ui.visuals().widgets.noninteractive.bg_stroke.color;
+    painter.circle_stroke(center, radius, egui::Stroke::new(10.0, track));
+    let fraction = fraction.clamp(0.0, 1.0);
+    if fraction > 0.0 {
+        let points = (0..=64)
+            .map(|step| {
+                let angle = -std::f32::consts::FRAC_PI_2
+                    + std::f32::consts::TAU * fraction * step as f32 / 64.0;
+                center + egui::Vec2::angled(angle) * radius
+            })
+            .collect::<Vec<_>>();
+        painter.add(egui::Shape::line(points, egui::Stroke::new(10.0, color)));
+    }
+    painter.text(
+        center,
+        egui::Align2::CENTER_CENTER,
+        format!("{:.0}%", fraction * 100.0),
+        egui::FontId::proportional(25.0),
+        ui.visuals().text_color(),
+    );
+}
+
 fn status_label(status: TaskStatus) -> &'static str {
     match status {
         TaskStatus::Queued => "排隊中",
@@ -759,6 +1085,43 @@ fn status_label(status: TaskStatus) -> &'static str {
         TaskStatus::Completed => "已完成",
         TaskStatus::Failed => "失敗",
         TaskStatus::Cancelled => "已取消",
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QueueGroup {
+    Active,
+    Completed,
+}
+
+fn status_icon(status: TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Queued => "○",
+        TaskStatus::Probing => "⌁",
+        TaskStatus::Downloading => "↓",
+        TaskStatus::Pausing | TaskStatus::Paused => "Ⅱ",
+        TaskStatus::NeedsProxyPassword => "?",
+        TaskStatus::Finalizing => "…",
+        TaskStatus::Completed => "✓",
+        TaskStatus::Failed => "!",
+        TaskStatus::Cancelled => "×",
+    }
+}
+
+fn queue_group(status: TaskStatus) -> QueueGroup {
+    match status {
+        TaskStatus::Completed | TaskStatus::Cancelled => QueueGroup::Completed,
+        _ => QueueGroup::Active,
+    }
+}
+
+fn format_batch_proxy_result(applied: usize, skipped: usize) -> String {
+    match (applied, skipped) {
+        (0, skipped) => format!("沒有任務套用 Proxy，略過 {skipped} 個不可修改任務"),
+        (applied, 0) => format!("已設定 {applied} 個任務"),
+        (applied, skipped) => {
+            format!("已設定 {applied} 個任務，略過 {skipped} 個不可修改任務")
+        }
     }
 }
 
@@ -975,5 +1338,26 @@ mod tests {
         assert!(!can_edit_proxy_in_bulk(TaskStatus::Downloading));
         assert!(!can_edit_proxy_in_bulk(TaskStatus::Completed));
         assert!(!can_edit_proxy_in_bulk(TaskStatus::Cancelled));
+    }
+
+    #[test]
+    fn maps_statuses_to_consistent_queue_icons_and_groups() {
+        assert_eq!(status_icon(TaskStatus::Downloading), "↓");
+        assert_eq!(status_icon(TaskStatus::Failed), "!");
+        assert_eq!(status_icon(TaskStatus::Completed), "✓");
+        assert_eq!(status_icon(TaskStatus::Cancelled), "×");
+        assert_eq!(queue_group(TaskStatus::Downloading), QueueGroup::Active);
+        assert_eq!(queue_group(TaskStatus::Failed), QueueGroup::Active);
+        assert_eq!(queue_group(TaskStatus::Completed), QueueGroup::Completed);
+        assert_eq!(queue_group(TaskStatus::Cancelled), QueueGroup::Completed);
+    }
+
+    #[test]
+    fn formats_bulk_proxy_result_for_visible_feedback() {
+        assert_eq!(format_batch_proxy_result(2, 0), "已設定 2 個任務");
+        assert_eq!(
+            format_batch_proxy_result(1, 1),
+            "已設定 1 個任務，略過 1 個不可修改任務"
+        );
     }
 }
