@@ -621,7 +621,7 @@ impl EngineHarness {
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|task| task.id == id && task.downloaded >= bytes)
+                .any(|task| task.id == id && task.actual_segments > 1 && task.downloaded >= bytes)
             {
                 return;
             }

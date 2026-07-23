@@ -46,10 +46,11 @@ fn server_without_ranges_falls_back_to_single_stream() {
 
 #[test]
 fn shutdown_then_restart_resumes_without_redownloading_prefix() {
-    let server = support::TestHttpServer::start_slow(b"0123456789abcdefghijklmnopqrstuvwxyz", 250);
-    let mut harness = support::EngineHarness::new(2);
+    let server =
+        support::TestHttpServer::start_slow(b"0123456789abcdefghijklmnopqrstuvwxyz", 1_000);
+    let mut harness = support::EngineHarness::new(1);
     let id = harness.add_and_start(format!("{}/slow.bin", server.base_url), 2);
-    harness.wait_until_downloaded(id, 8, std::time::Duration::from_secs(5));
+    harness.wait_until_downloaded(id, 8, std::time::Duration::from_secs(15));
     let state_path = harness.shutdown_keep_files();
     let before = support::part_lengths(harness.download_dir(), id);
     assert!(before.iter().any(|length| *length > 0));
@@ -60,7 +61,7 @@ fn shutdown_then_restart_resumes_without_redownloading_prefix() {
     let completed = restarted.wait_for(
         id,
         TaskStatus::Completed,
-        std::time::Duration::from_secs(20),
+        std::time::Duration::from_secs(60),
     );
     assert_eq!(
         std::fs::read(completed.target_dir.join("slow.bin")).unwrap(),
