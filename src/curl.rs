@@ -5,7 +5,7 @@ use std::{
     ffi::OsString,
     fs,
     io::{self, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -129,6 +129,232 @@ impl Drop for CurlRuntime {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct ProbeMetadata {
+    pub effective_url: String,
+    pub http_code: u16,
+    pub total_size: Option<u64>,
+    pub range_support: crate::model::RangeSupport,
+    pub content_disposition: Option<String>,
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct CurlOutcome {
+    pub exit_code: i32,
+    pub stderr: String,
+    pub headers: String,
+}
+
+fn add_transfer_defaults(spec: &mut CurlCommandSpec) {
+    spec.args.extend(
+        [
+            "--location",
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--connect-timeout",
+            "30",
+            "--retry",
+            "3",
+            "--retry-delay",
+            "1",
+            "--retry-max-time",
+            "60",
+        ]
+        .into_iter()
+        .map(Into::into),
+    );
+}
+
+pub fn build_head_probe(
+    proxy: &ProxySettings,
+    url: &str,
+    headers: &Path,
+) -> Result<CurlCommandSpec, String> {
+    let mut spec = CurlCommandSpec::base(proxy)?;
+    add_transfer_defaults(&mut spec);
+    spec.args.extend([
+        "--head".into(),
+        "--dump-header".into(),
+        headers.as_os_str().into(),
+        "--output".into(),
+        "NUL".into(),
+        "--write-out".into(),
+        "%{json}".into(),
+        url.into(),
+    ]);
+    Ok(spec)
+}
+
+pub fn build_range_probe(
+    proxy: &ProxySettings,
+    url: &str,
+    headers: &Path,
+) -> Result<CurlCommandSpec, String> {
+    let mut spec = CurlCommandSpec::base(proxy)?;
+    add_transfer_defaults(&mut spec);
+    spec.args.extend([
+        "--range".into(),
+        "0-0".into(),
+        "--dump-header".into(),
+        headers.as_os_str().into(),
+        "--output".into(),
+        "NUL".into(),
+        "--write-out".into(),
+        "%{json}".into(),
+        url.into(),
+    ]);
+    Ok(spec)
+}
+
+fn add_if_range(spec: &mut CurlCommandSpec, validator: Option<&str>) -> Result<(), String> {
+    if let Some(value) = validator {
+        if value.contains(['\0', '\r', '\n']) {
+            return Err("來源驗證值含有不允許字元".into());
+        }
+        spec.args
+            .extend(["--header".into(), format!("If-Range: {value}").into()]);
+    }
+    Ok(())
+}
+
+pub fn build_single_transfer(
+    proxy: &ProxySettings,
+    url: &str,
+    output: &Path,
+    existing: u64,
+    if_range: Option<&str>,
+    headers: &Path,
+) -> Result<CurlCommandSpec, String> {
+    let mut spec = CurlCommandSpec::base(proxy)?;
+    add_transfer_defaults(&mut spec);
+    spec.args.extend([
+        "--dump-header".into(),
+        headers.as_os_str().into(),
+        "--output".into(),
+        output.as_os_str().into(),
+    ]);
+    if existing > 0 {
+        spec.args.extend(["--continue-at".into(), "-".into()]);
+    }
+    add_if_range(&mut spec, if_range)?;
+    spec.args.push(url.into());
+    Ok(spec)
+}
+
+pub fn build_segment_transfer(
+    proxy: &ProxySettings,
+    url: &str,
+    start: u64,
+    end: u64,
+    existing: u64,
+    if_range: Option<&str>,
+    headers: &Path,
+) -> Result<CurlCommandSpec, String> {
+    let length = end
+        .checked_sub(start)
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| "分段範圍無效".to_owned())?;
+    if existing > length {
+        return Err("分段部分檔超出範圍".into());
+    }
+    let adjusted_start = start
+        .checked_add(existing)
+        .ok_or_else(|| "分段續傳偏移無效".to_owned())?;
+    let remaining = length - existing;
+    let mut spec = CurlCommandSpec::base(proxy)?;
+    add_transfer_defaults(&mut spec);
+    add_if_range(&mut spec, if_range)?;
+    spec.args.extend([
+        "--range".into(),
+        format!("{adjusted_start}-{end}").into(),
+        "--max-filesize".into(),
+        remaining.to_string().into(),
+        "--dump-header".into(),
+        headers.as_os_str().into(),
+        "--output".into(),
+        "-".into(),
+        url.into(),
+    ]);
+    Ok(spec)
+}
+
+pub fn parse_probe(headers: &str, fallback_url: &str) -> Result<ProbeMetadata, String> {
+    let normalized = headers.replace("\r\n", "\n");
+    let blocks: Vec<&str> = normalized.split("\n\n").collect();
+    let block = blocks
+        .iter()
+        .rev()
+        .find(|candidate| candidate.trim_start().starts_with("HTTP/"))
+        .ok_or_else(|| "找不到 HTTP 探測回應標頭".to_owned())?;
+    let mut meta = ProbeMetadata {
+        effective_url: fallback_url.to_owned(),
+        ..ProbeMetadata::default()
+    };
+    let mut content_range = None;
+    for (index, line) in block.lines().enumerate() {
+        if index == 0 {
+            let mut parts = line.split_whitespace();
+            let _version = parts.next();
+            meta.http_code = parts
+                .next()
+                .ok_or_else(|| "HTTP 狀態列缺少狀態碼".to_owned())?
+                .parse()
+                .map_err(|_| "HTTP 狀態碼無效".to_owned())?;
+            continue;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.trim();
+        match name.trim().to_ascii_lowercase().as_str() {
+            "content-length" => {
+                if meta.total_size.is_none() {
+                    meta.total_size = value.parse().ok();
+                }
+            }
+            "content-range" => {
+                content_range = parse_content_range(value);
+                if let Some((_, _, total)) = content_range {
+                    meta.total_size = Some(total);
+                }
+            }
+            "content-disposition" => meta.content_disposition = Some(value.to_owned()),
+            "etag" => meta.etag = Some(value.to_owned()),
+            "last-modified" => meta.last_modified = Some(value.to_owned()),
+            _ => {}
+        }
+    }
+    if meta.http_code == 206 && content_range.is_some() && meta.total_size.is_some() {
+        meta.range_support = crate::model::RangeSupport::Supported;
+    } else {
+        meta.range_support = crate::model::RangeSupport::Unsupported;
+    }
+    if let Some(json) = normalized.lines().find_map(|line| {
+        let line = line.trim();
+        line.starts_with('{')
+            .then(|| serde_json::from_str::<serde_json::Value>(line).ok())
+            .flatten()
+    }) {
+        if let Some(url) = json.get("url_effective").and_then(|value| value.as_str()) {
+            meta.effective_url = url.to_owned();
+        }
+        if let Some(code) = json.get("http_code").and_then(|value| value.as_u64()) {
+            meta.http_code = code as u16;
+        }
+    }
+    Ok(meta)
+}
+
+fn parse_content_range(value: &str) -> Option<(u64, u64, u64)> {
+    let rest = value.strip_prefix("bytes ")?;
+    let (range, total) = rest.split_once('/')?;
+    let (start, end) = range.split_once('-')?;
+    Some((start.parse().ok()?, end.parse().ok()?, total.parse().ok()?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,5 +391,36 @@ mod tests {
                 .unwrap()
                 .contains("alice:s3cret")
         );
+    }
+
+    #[test]
+    fn parses_last_redirect_header_block() {
+        let headers = "HTTP/1.1 302 Found\r\nLocation: /file\r\n\r\nHTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-0/1000\r\nContent-Disposition: attachment; filename=real.bin\r\nETag: \"v1\"\r\n\r\n";
+        let meta = parse_probe(headers, "https://example.test/file").unwrap();
+        assert_eq!(meta.total_size, Some(1000));
+        assert_eq!(meta.range_support, crate::model::RangeSupport::Supported);
+        assert_eq!(
+            meta.content_disposition.as_deref(),
+            Some("attachment; filename=real.bin")
+        );
+    }
+
+    #[test]
+    fn segment_resume_uses_adjusted_range_without_continue_at() {
+        let proxy = ProxySettings::default();
+        let spec = build_segment_transfer(
+            &proxy,
+            "https://example.test/a",
+            100,
+            199,
+            25,
+            Some("\"v1\""),
+            std::path::Path::new("headers.txt"),
+        )
+        .unwrap();
+        let args = spec.arguments_text();
+        assert!(args.contains("--range 125-199"));
+        assert!(!args.contains("--continue-at"));
+        assert!(args.contains("If-Range: \"v1\""));
     }
 }
