@@ -354,6 +354,11 @@ impl Engine {
     fn handle_command(&mut self, command: EngineCommand) {
         match command {
             EngineCommand::Add(new_task) => self.add_task(new_task),
+            EngineCommand::AddBatch(tasks) => {
+                for task in tasks {
+                    self.add_task(task);
+                }
+            }
             EngineCommand::Start(id) => self.request_start(id),
             EngineCommand::Pause(id) => self.pause_task(id),
             EngineCommand::Cancel(id) => self.cancel_task(id),
@@ -362,7 +367,12 @@ impl Engine {
                 for id in self
                     .tasks
                     .iter()
-                    .filter(|task| matches!(task.status, TaskStatus::Queued | TaskStatus::Paused))
+                    .filter(|task| {
+                        matches!(
+                            task.status,
+                            TaskStatus::Queued | TaskStatus::Paused | TaskStatus::Failed
+                        )
+                    })
                     .map(|task| task.id)
                     .collect::<Vec<_>>()
                 {
@@ -394,8 +404,8 @@ impl Engine {
                 if let Some(task) = self.task_mut(id) {
                     if task.proxy.set_password_secret(password).is_ok() {
                         task.status = TaskStatus::Queued;
-                        self.queue.push_back(id);
                         let _ = self.persist();
+                        self.request_start(id);
                     }
                 }
             }
@@ -434,10 +444,8 @@ impl Engine {
         let filename = filename::suggest_filename(None, &url, id);
         let mut task = DownloadTask::new(id, &new_task.url, filename, new_task.target_dir);
         task.created_unix_ms = current_unix_ms();
-        task.status = TaskStatus::Probing;
         let _ = fs::create_dir_all(storage::task_work_dir(&task));
         self.tasks.push(task);
-        self.queue.push_back(id);
         let _ = self.persist();
         self.publish_snapshot();
     }
@@ -482,6 +490,8 @@ impl Engine {
         });
         if source_changed {
             self.stop_task_jobs(id);
+            self.queue.retain(|queued| *queued != id);
+            self.pending_start.remove(&id);
         }
         let needs_password = proxy.enabled && proxy.requires_password && proxy.password.is_none();
         if !source_changed && needs_password {
@@ -506,9 +516,7 @@ impl Engine {
             if task.proxy.enabled && task.proxy.requires_password && task.proxy.password.is_none() {
                 task.status = TaskStatus::NeedsProxyPassword;
             } else {
-                task.status = TaskStatus::Probing;
-                self.range_probe.insert(id);
-                self.queue.push_back(id);
+                task.status = TaskStatus::Queued;
             }
         } else if needs_password {
             task.status = TaskStatus::NeedsProxyPassword;
@@ -524,10 +532,39 @@ impl Engine {
             TaskStatus::Probing => {
                 self.pending_start.insert(id);
             }
-            TaskStatus::Queued | TaskStatus::Paused => self.start_task(id),
+            TaskStatus::Queued | TaskStatus::Paused | TaskStatus::Failed => {
+                if self.task(id).is_some_and(|task| task.total_size.is_none()) {
+                    self.begin_probe(id);
+                } else {
+                    self.start_task(id);
+                }
+            }
             TaskStatus::NeedsProxyPassword => {}
             _ => {}
         }
+    }
+
+    fn begin_probe(&mut self, id: TaskId) {
+        let Some(task) = self.task(id) else {
+            return;
+        };
+        if task.proxy.enabled && task.proxy.requires_password && task.proxy.password.is_none() {
+            if let Some(task) = self.task_mut(id) {
+                task.status = TaskStatus::NeedsProxyPassword;
+            }
+            let _ = self.persist();
+            self.publish_snapshot();
+            return;
+        }
+        self.stop_task_jobs(id);
+        self.queue.retain(|queued| *queued != id);
+        self.range_probe.insert(id);
+        self.pending_start.insert(id);
+        if let Some(task) = self.task_mut(id) {
+            task.status = TaskStatus::Probing;
+        }
+        self.queue.push_back(id);
+        let _ = self.persist();
     }
 
     fn pause_task(&mut self, id: TaskId) {

@@ -515,6 +515,22 @@ impl EngineHarness {
         task.id
     }
 
+    pub fn add_batch(&mut self, urls: &[String]) -> Vec<TaskSnapshot> {
+        self.engine
+            .commands
+            .send(EngineCommand::AddBatch(
+                urls.iter()
+                    .cloned()
+                    .map(|url| NewTask {
+                        url,
+                        target_dir: self.download_dir.clone(),
+                    })
+                    .collect(),
+            ))
+            .unwrap();
+        self.wait_for_count(urls.len(), Duration::from_secs(5))
+    }
+
     pub fn add_with_proxy(
         &mut self,
         url: &str,
@@ -579,6 +595,21 @@ impl EngineHarness {
                 std::time::Instant::now() < deadline,
                 "timeout waiting for {status:?}; latest={:?}",
                 self.latest.lock().unwrap()
+            );
+            self.poll_once(Duration::from_millis(100));
+        }
+    }
+
+    pub fn wait_for_count(&mut self, count: usize, timeout: Duration) -> Vec<TaskSnapshot> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let snapshot = self.latest.lock().unwrap().clone();
+            if snapshot.len() >= count {
+                return snapshot;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timeout waiting for {count} tasks; latest={snapshot:?}"
             );
             self.poll_once(Duration::from_millis(100));
         }

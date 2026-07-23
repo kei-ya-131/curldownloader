@@ -1,6 +1,6 @@
 use crate::model::{ProxyProtocol, ProxySettings};
 use sha2::{Digest, Sha256};
-#[cfg(target_env = "msvc")]
+#[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 use std::{
     ffi::OsString,
@@ -16,7 +16,7 @@ use zeroize::Zeroizing;
 pub const CURL_BYTES: &[u8] = include_bytes!("../assets/curl.exe");
 pub const CURL_EXE_SHA256: &str =
     "8d28c1093e0b6345917d2c1710c67f78f61834d76ef983ea9fb631c75e20312f";
-#[cfg(target_env = "msvc")]
+#[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 static NEXT_RUNTIME_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_PROCESS_ID: AtomicU64 = AtomicU64::new(1);
@@ -126,7 +126,7 @@ impl CurlRuntime {
             })
             .stdout(stdout)
             .stderr(Stdio::piped());
-        #[cfg(target_env = "msvc")]
+        #[cfg(target_os = "windows")]
         command.creation_flags(CREATE_NO_WINDOW);
         let mut child = command.spawn()?;
         if let (Some(config), Some(mut stdin)) = (spec.stdin_config.take(), child.stdin.take()) {

@@ -1,8 +1,8 @@
 use crate::{
     download::{EngineHandle, spawn_engine},
     model::{
-        EngineCommand, EngineEvent, GlobalSettings, PersistedState, ProxyProtocol, ProxySettings,
-        TaskId, TaskSnapshot, TaskStatus,
+        EngineCommand, EngineEvent, GlobalSettings, NewTask, PersistedState, ProxyProtocol,
+        ProxySettings, TaskId, TaskSnapshot, TaskStatus,
     },
     storage,
 };
@@ -57,6 +57,9 @@ pub struct CurlDownloaderApp {
     selected: Option<TaskId>,
     url_input: String,
     input_error: Option<String>,
+    batch_input: String,
+    batch_error: Option<String>,
+    show_batch_dialog: bool,
     fatal: Option<String>,
     draft: Option<TaskDraft>,
     last_download_dir: PathBuf,
@@ -138,6 +141,9 @@ impl CurlDownloaderApp {
             selected: None,
             url_input: String::new(),
             input_error: None,
+            batch_input: String::new(),
+            batch_error: None,
+            show_batch_dialog: false,
             fatal,
             draft: None,
             last_download_dir,
@@ -225,6 +231,12 @@ impl CurlDownloaderApp {
         });
     }
 
+    fn flush_draft(&mut self, id: TaskId) {
+        if let Some(draft) = self.draft.as_ref().filter(|draft| draft.id == id).cloned() {
+            self.send_draft(&draft);
+        }
+    }
+
     fn add_url(&mut self) {
         let value = self.url_input.trim().to_owned();
         let Ok(url) = url::Url::parse(&value) else {
@@ -235,15 +247,33 @@ impl CurlDownloaderApp {
             self.input_error = Some("只支援 HTTP 或 HTTPS 網址".into());
             return;
         }
-        let _ = self
-            .engine
-            .commands
-            .send(EngineCommand::Add(crate::model::NewTask {
-                url: value,
-                target_dir: self.last_download_dir.clone(),
-            }));
+        let _ = self.engine.commands.send(EngineCommand::Add(NewTask {
+            url: value,
+            target_dir: self.last_download_dir.clone(),
+        }));
         self.url_input.clear();
         self.input_error = None;
+    }
+
+    fn add_batch(&mut self) {
+        let urls = match parse_batch_urls(&self.batch_input) {
+            Ok(urls) => urls,
+            Err(error) => {
+                self.batch_error = Some(error);
+                return;
+            }
+        };
+        let tasks = urls
+            .into_iter()
+            .map(|url| NewTask {
+                url,
+                target_dir: self.last_download_dir.clone(),
+            })
+            .collect();
+        let _ = self.engine.commands.send(EngineCommand::AddBatch(tasks));
+        self.batch_input.clear();
+        self.batch_error = None;
+        self.show_batch_dialog = false;
     }
 
     fn show_top_bar(&mut self, ui: &mut egui::Ui) {
@@ -256,6 +286,10 @@ impl CurlDownloaderApp {
                 if ui.button("新增下載").clicked() {
                     self.add_url();
                 }
+                if ui.button("批量新增").clicked() {
+                    self.batch_error = None;
+                    self.show_batch_dialog = true;
+                }
                 ui.label("最大 curl：");
                 if ui
                     .add(egui::DragValue::new(&mut self.max_processes).range(1..=16))
@@ -267,6 +301,9 @@ impl CurlDownloaderApp {
                         .send(EngineCommand::SetMaxProcesses(self.max_processes));
                 }
                 if ui.button("全部開始").clicked() {
+                    if let Some(draft) = self.draft.clone() {
+                        self.send_draft(&draft);
+                    }
                     let _ = self.engine.commands.send(EngineCommand::StartAll);
                 }
                 if ui.button("全部暫停").clicked() {
@@ -283,6 +320,38 @@ impl CurlDownloaderApp {
                 ui.colored_label(egui::Color32::LIGHT_BLUE, "正在安全停止下載…");
             }
         });
+        if self.show_batch_dialog {
+            let mut open = true;
+            let mut submit = false;
+            let mut cancel = false;
+            egui::Window::new("批量新增下載")
+                .open(&mut open)
+                .collapsible(false)
+                .show(ui.ctx(), |ui| {
+                    ui.label("每行輸入一個 HTTP/HTTPS 網址；新增後會先排隊，確認每個任務設定後再按開始。明文密碼不會保存。",);
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.batch_input)
+                            .desired_rows(10)
+                            .desired_width(620.0),
+                    );
+                    if let Some(error) = &self.batch_error {
+                        ui.colored_label(egui::Color32::LIGHT_RED, error);
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("批量新增").clicked() {
+                            submit = true;
+                        }
+                        if ui.button("取消").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            if submit {
+                self.add_batch();
+            } else if cancel || !open {
+                self.show_batch_dialog = false;
+            }
+        }
     }
 
     fn show_queue(&mut self, ui: &mut egui::Ui) {
@@ -321,6 +390,7 @@ impl CurlDownloaderApp {
                             TaskStatus::Queued | TaskStatus::Paused | TaskStatus::Failed
                         ) && ui.button("開始").clicked()
                         {
+                            self.flush_draft(task.id);
                             let _ = self.engine.commands.send(EngineCommand::Start(task.id));
                         }
                         if matches!(task.status, TaskStatus::Probing | TaskStatus::Downloading)
@@ -366,7 +436,11 @@ impl CurlDownloaderApp {
             let mut pending_update = None;
             if let Some(draft) = self.draft.as_mut() {
                 let mut changed = false;
-                ui.add_enabled_ui(!needs_password, |ui| {
+                let can_edit = matches!(
+                    task.status,
+                    TaskStatus::Queued | TaskStatus::Paused | TaskStatus::Failed
+                );
+                ui.add_enabled_ui(can_edit, |ui| {
                     ui.label("網址");
                     if ui.text_edit_singleline(&mut draft.url).lost_focus() {
                         changed = true;
@@ -460,6 +534,9 @@ impl CurlDownloaderApp {
                         }
                     });
                 });
+                if !can_edit && !needs_password {
+                    ui.label("下載已開始，檔名、位置及 Proxy 設定已鎖定。");
+                }
                 if needs_password {
                     ui.label("此任務需要 Proxy 密碼才能繼續。");
                     if ui.button("設定密碼並開始").clicked() && !draft.password_input.is_empty()
@@ -525,16 +602,37 @@ fn progress_text(task: &TaskSnapshot) -> String {
         .unwrap_or_else(|| format_bytes(task.downloaded))
 }
 
-#[cfg(target_env = "msvc")]
+fn parse_batch_urls(input: &str) -> Result<Vec<String>, String> {
+    let urls = input
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if urls.is_empty() {
+        return Err("請至少輸入一個網址".into());
+    }
+    for url in &urls {
+        let parsed = url::Url::parse(url).map_err(|_| format!("網址格式無效：{url}"))?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err(format!("只支援 HTTP 或 HTTPS 網址：{url}"));
+        }
+    }
+    Ok(urls)
+}
+
+fn location_directory(path: &std::path::Path) -> &std::path::Path {
+    path.parent().unwrap_or(path)
+}
+
+#[cfg(target_os = "windows")]
 fn open_location(path: PathBuf) {
-    use std::os::windows::process::CommandExt;
     let _ = std::process::Command::new("explorer.exe")
-        .arg(format!("/select,{}", path.display()))
-        .creation_flags(0x0800_0000)
+        .arg(location_directory(&path))
         .spawn();
 }
 
-#[cfg(not(target_env = "msvc"))]
+#[cfg(not(target_os = "windows"))]
 fn open_location(_path: PathBuf) {}
 
 #[cfg(test)]
@@ -566,6 +664,35 @@ mod tests {
                 .families
                 .values()
                 .all(|family| family.first().is_some_and(|name| name == CHINESE_FONT_NAME))
+        );
+    }
+
+    #[test]
+    fn parses_one_url_per_line_for_batch_downloads() {
+        assert_eq!(
+            parse_batch_urls("\n https://example.test/a.bin \n\nhttp://example.test/b.bin\n")
+                .unwrap(),
+            vec![
+                "https://example.test/a.bin".to_owned(),
+                "http://example.test/b.bin".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_batch_url() {
+        assert_eq!(
+            parse_batch_urls("https://example.test/a.bin\nftp://example.test/b.bin").unwrap_err(),
+            "只支援 HTTP 或 HTTPS 網址：ftp://example.test/b.bin"
+        );
+    }
+
+    #[test]
+    fn opens_the_parent_directory_for_a_completed_file() {
+        let file = PathBuf::from("C:\\Downloads\\completed.bin");
+        assert_eq!(
+            location_directory(&file),
+            PathBuf::from("C:\\Downloads").as_path()
         );
     }
 }

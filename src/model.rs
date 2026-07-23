@@ -284,6 +284,7 @@ pub struct NewTask {
 
 pub enum EngineCommand {
     Add(NewTask),
+    AddBatch(Vec<NewTask>),
     Start(TaskId),
     Pause(TaskId),
     Cancel(TaskId),
