@@ -309,6 +309,13 @@ impl CurlDownloaderApp {
                 if ui.button("全部暫停").clicked() {
                     let _ = self.engine.commands.send(EngineCommand::PauseAll);
                 }
+                if ui
+                    .button("清除已完成")
+                    .on_hover_text("清除已完成及已取消的任務記錄，不會刪除已下載檔案")
+                    .clicked()
+                {
+                    let _ = self.engine.commands.send(EngineCommand::ClearHistory);
+                }
             });
             if let Some(error) = &self.input_error {
                 ui.colored_label(egui::Color32::LIGHT_RED, error);
@@ -364,25 +371,30 @@ impl CurlDownloaderApp {
                     let selected = self.selected == Some(task.id);
                     let response = ui.selectable_label(
                         selected,
-                        format!("{}  ·  {}", task.filename, status_label(task.status)),
+                        egui::RichText::new(&task.filename).strong().size(15.0),
                     );
                     if response.clicked() {
                         self.selected = Some(task.id);
                         self.draft = None;
                     }
-                    ui.add(
-                        egui::ProgressBar::new(progress_fraction(&task)).text(progress_text(&task)),
-                    );
                     ui.horizontal(|ui| {
-                        ui.small(format!(
-                            "{} / {}",
-                            format_bytes(task.downloaded),
-                            task.total_size
-                                .map(format_bytes)
-                                .unwrap_or_else(|| "—".into())
-                        ));
-                        ui.small(format_speed(task.current_bps));
-                        ui.small(format_eta(task.eta_seconds));
+                        ui.label(egui::RichText::new(status_label(task.status)).strong());
+                        ui.small(format!("{} 段", task.actual_segments.max(1)));
+                    });
+                    let bar_width = ui.available_width();
+                    ui.add_sized(
+                        [bar_width, 26.0],
+                        egui::ProgressBar::new(progress_fraction(&task))
+                            .text(format!("{:.1}%", progress_fraction(&task) * 100.0)),
+                    );
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            egui::RichText::new(progress_text(&task))
+                                .strong()
+                                .size(14.0),
+                        );
+                        ui.label(egui::RichText::new(speed_text(&task)).strong().size(14.0));
+                        ui.label(format!("剩餘 {}", format_eta(task.eta_seconds)));
                     });
                     ui.horizontal(|ui| {
                         if matches!(
@@ -411,6 +423,11 @@ impl CurlDownloaderApp {
                         {
                             open_location(task.target_dir.join(task.filename));
                         }
+                        if matches!(task.status, TaskStatus::Completed | TaskStatus::Cancelled)
+                            && ui.button("清除記錄").clicked()
+                        {
+                            let _ = self.engine.commands.send(EngineCommand::Remove(task.id));
+                        }
                     });
                     ui.separator();
                 }
@@ -432,6 +449,11 @@ impl CurlDownloaderApp {
                     egui::Color32::LIGHT_RED,
                     format!("{}：{}", error.summary, error.action),
                 );
+                if !error.diagnostic.trim().is_empty() {
+                    ui.collapsing("詳細診斷（已清理敏感資料）", |ui| {
+                        ui.monospace(&error.diagnostic);
+                    });
+                }
             }
             let mut pending_update = None;
             if let Some(draft) = self.draft.as_mut() {
@@ -590,16 +612,54 @@ fn status_label(status: TaskStatus) -> &'static str {
 }
 
 fn progress_fraction(task: &TaskSnapshot) -> f32 {
+    if task.status == TaskStatus::Completed {
+        return 1.0;
+    }
     task.total_size
-        .filter(|total| *total > 0)
-        .map(|total| (task.downloaded as f64 / total as f64).clamp(0.0, 1.0) as f32)
+        .map(|total| {
+            if total == 0 {
+                0.0
+            } else {
+                (task.downloaded as f64 / total as f64).clamp(0.0, 1.0) as f32
+            }
+        })
         .unwrap_or(0.0)
 }
 
 fn progress_text(task: &TaskSnapshot) -> String {
-    task.total_size
-        .map(|_| format!("{:.1}%", progress_fraction(task) * 100.0))
-        .unwrap_or_else(|| format_bytes(task.downloaded))
+    format_progress_text(task.downloaded, task.total_size)
+}
+
+fn format_progress_text(downloaded: u64, total: Option<u64>) -> String {
+    match total {
+        Some(total) => {
+            let fraction = if total == 0 {
+                0.0
+            } else {
+                (downloaded as f64 / total as f64).clamp(0.0, 1.0)
+            };
+            format!(
+                "{:.1}%  ·  {} / {}",
+                fraction * 100.0,
+                format_bytes(downloaded),
+                format_bytes(total)
+            )
+        }
+        None if downloaded == 0 => "尚未開始".into(),
+        None => format!("{}  ·  總大小未知", format_bytes(downloaded)),
+    }
+}
+
+fn speed_text(task: &TaskSnapshot) -> String {
+    format_speed_text(task.status, task.current_bps, task.average_bps)
+}
+
+fn format_speed_text(status: TaskStatus, current_bps: f64, average_bps: f64) -> String {
+    if matches!(status, TaskStatus::Downloading | TaskStatus::Probing) {
+        format!("目前速度 {}", format_speed(current_bps))
+    } else {
+        format!("平均速度 {}", format_speed(average_bps))
+    }
 }
 
 fn parse_batch_urls(input: &str) -> Result<Vec<String>, String> {
@@ -693,6 +753,27 @@ mod tests {
         assert_eq!(
             location_directory(&file),
             PathBuf::from("C:\\Downloads").as_path()
+        );
+    }
+
+    #[test]
+    fn formats_progress_as_the_primary_download_summary() {
+        assert_eq!(
+            format_progress_text(512, Some(1024)),
+            "50.0%  ·  512 B / 1.00 KiB"
+        );
+        assert_eq!(format_progress_text(0, None), "尚未開始");
+    }
+
+    #[test]
+    fn uses_average_speed_for_terminal_downloads() {
+        assert_eq!(
+            format_speed_text(TaskStatus::Completed, 0.0, 2_048.0),
+            "平均速度 2.00 KiB/s"
+        );
+        assert_eq!(
+            format_speed_text(TaskStatus::Downloading, 1_024.0, 512.0),
+            "目前速度 1.00 KiB/s"
         );
     }
 }

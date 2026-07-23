@@ -289,6 +289,7 @@ pub enum EngineCommand {
     Pause(TaskId),
     Cancel(TaskId),
     Remove(TaskId),
+    ClearHistory,
     StartAll,
     PauseAll,
     UpdateDraft {

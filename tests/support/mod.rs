@@ -615,6 +615,21 @@ impl EngineHarness {
         }
     }
 
+    pub fn wait_for_empty(&mut self, timeout: Duration) {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let snapshot = self.latest.lock().unwrap().clone();
+            if snapshot.is_empty() {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timeout waiting for empty task history; latest={snapshot:?}"
+            );
+            self.poll_once(Duration::from_millis(100));
+        }
+    }
+
     pub fn max_observed_processes(&self) -> usize {
         self.engine.max_observed_processes()
     }

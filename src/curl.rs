@@ -3,7 +3,7 @@ use sha2::{Digest, Sha256};
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 use std::{
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     fs,
     io::{self, Write},
     path::{Path, PathBuf},
@@ -19,7 +19,6 @@ pub const CURL_EXE_SHA256: &str =
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 static NEXT_RUNTIME_ID: AtomicU64 = AtomicU64::new(1);
-static NEXT_PROCESS_ID: AtomicU64 = AtomicU64::new(1);
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
@@ -91,6 +90,16 @@ pub struct CurlRuntime {
 
 impl CurlRuntime {
     pub fn extract() -> io::Result<Self> {
+        if let Some(exe) = find_usable_curl_from_path(std::env::var_os("PATH").as_deref()) {
+            return Ok(Self {
+                exe,
+                root: PathBuf::new(),
+            });
+        }
+        Self::extract_embedded()
+    }
+
+    fn extract_embedded() -> io::Result<Self> {
         if sha256_hex(CURL_BYTES) != CURL_EXE_SHA256 {
             return Err(io::Error::other("內嵌 curl 校驗失敗"));
         }
@@ -113,10 +122,7 @@ impl CurlRuntime {
     }
 
     pub fn spawn(&self, spec: &mut CurlCommandSpec, stdout: Stdio) -> io::Result<Child> {
-        let process_id = NEXT_PROCESS_ID.fetch_add(1, Ordering::Relaxed);
-        let child_exe = self.root.join(format!("curl-process-{process_id}.exe"));
-        fs::copy(&self.exe, &child_exe)?;
-        let mut command = Command::new(child_exe);
+        let mut command = Command::new(&self.exe);
         command
             .args(&spec.args)
             .stdin(if spec.stdin_config.is_some() {
@@ -126,8 +132,7 @@ impl CurlRuntime {
             })
             .stdout(stdout)
             .stderr(Stdio::piped());
-        #[cfg(target_os = "windows")]
-        command.creation_flags(CREATE_NO_WINDOW);
+        hide_console_window(&mut command);
         let mut child = command.spawn()?;
         if let (Some(config), Some(mut stdin)) = (spec.stdin_config.take(), child.stdin.take()) {
             stdin.write_all(config.as_bytes())?;
@@ -139,8 +144,44 @@ impl CurlRuntime {
 
 impl Drop for CurlRuntime {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.root);
+        if !self.root.as_os_str().is_empty() {
+            let _ = fs::remove_dir_all(&self.root);
+        }
     }
+}
+
+fn find_usable_curl_from_path(path_value: Option<&OsStr>) -> Option<PathBuf> {
+    let path_value = path_value?;
+    for directory in std::env::split_paths(path_value).filter(|path| !path.as_os_str().is_empty()) {
+        let candidate = directory.join(if cfg!(target_os = "windows") {
+            "curl.exe"
+        } else {
+            "curl"
+        });
+        let Ok(candidate) = fs::canonicalize(candidate) else {
+            continue;
+        };
+        if candidate.is_file() && curl_is_usable(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn curl_is_usable(executable: &Path) -> bool {
+    let mut command = Command::new(executable);
+    command
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    hide_console_window(&mut command);
+    command.status().is_ok_and(|status| status.success())
+}
+
+fn hide_console_window(command: &mut Command) {
+    #[cfg(target_os = "windows")]
+    command.creation_flags(CREATE_NO_WINDOW);
 }
 
 #[derive(Clone, Debug, Default)]
@@ -456,5 +497,61 @@ mod tests {
         assert!(args.contains("--range 125-199"));
         assert!(!args.contains("--continue-at"));
         assert!(args.contains("If-Range: \"v1\""));
+    }
+
+    #[test]
+    fn prefers_a_usable_local_curl_from_path() {
+        let first = test_dir("local-curl-first");
+        let second = test_dir("local-curl-second");
+        let first_exe = first.join("curl.exe");
+        let second_exe = second.join("curl.exe");
+        fs::write(&first_exe, CURL_BYTES).unwrap();
+        fs::write(&second_exe, CURL_BYTES).unwrap();
+        let path = std::env::join_paths([&first, &second]).unwrap();
+        let expected = fs::canonicalize(&first_exe).unwrap();
+
+        assert_eq!(
+            find_usable_curl_from_path(Some(path.as_os_str())),
+            Some(expected)
+        );
+
+        let _ = fs::remove_dir_all(first);
+        let _ = fs::remove_dir_all(second);
+    }
+
+    #[test]
+    fn ignores_a_local_curl_that_cannot_start() {
+        let directory = test_dir("local-curl-invalid");
+        let executable = directory.join("curl.exe");
+        fs::write(&executable, b"not a Windows executable").unwrap();
+        let path = std::env::join_paths([&directory]).unwrap();
+
+        assert_eq!(find_usable_curl_from_path(Some(path.as_os_str())), None);
+
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn embedded_runtime_reuses_one_executable_for_multiple_jobs() {
+        let runtime = CurlRuntime::extract_embedded().unwrap();
+        let mut spec = CurlCommandSpec {
+            args: vec!["--version".into()],
+            stdin_config: None,
+        };
+        let mut child = runtime.spawn(&mut spec, Stdio::null()).unwrap();
+        assert!(child.wait().unwrap().success());
+        let files = fs::read_dir(&runtime.root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(files, vec![OsString::from("curl.exe")]);
+    }
+
+    fn test_dir(label: &str) -> PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("curl-downloader-{label}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).unwrap();
+        path
     }
 }

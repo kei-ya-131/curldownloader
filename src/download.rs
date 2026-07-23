@@ -363,6 +363,7 @@ impl Engine {
             EngineCommand::Pause(id) => self.pause_task(id),
             EngineCommand::Cancel(id) => self.cancel_task(id),
             EngineCommand::Remove(id) => self.remove_task(id),
+            EngineCommand::ClearHistory => self.clear_history(),
             EngineCommand::StartAll => {
                 for id in self
                     .tasks
@@ -595,6 +596,27 @@ impl Engine {
     fn remove_task(&mut self, id: TaskId) {
         self.cancel_task(id);
         self.tasks.retain(|task| task.id != id);
+        let _ = self.persist();
+        self.publish_snapshot();
+    }
+
+    fn clear_history(&mut self) {
+        let removed = self
+            .tasks
+            .iter()
+            .filter(|task| matches!(task.status, TaskStatus::Completed | TaskStatus::Cancelled))
+            .cloned()
+            .collect::<Vec<_>>();
+        for task in &removed {
+            self.stop_task_jobs(task.id);
+            self.queue.retain(|queued| *queued != task.id);
+            self.pending_start.remove(&task.id);
+            self.range_probe.remove(&task.id);
+            self.meters.remove(&task.id);
+            let _ = fs::remove_dir_all(storage::task_work_dir(task));
+        }
+        self.tasks
+            .retain(|task| !matches!(task.status, TaskStatus::Completed | TaskStatus::Cancelled));
         let _ = self.persist();
         self.publish_snapshot();
     }
@@ -1206,6 +1228,9 @@ impl Engine {
     fn refresh_progress(&mut self) {
         let now = current_unix_ms();
         for task in &mut self.tasks {
+            if matches!(task.status, TaskStatus::Completed | TaskStatus::Cancelled) {
+                continue;
+            }
             let work = storage::task_work_dir(task);
             if task.actual_segments > 1 {
                 for segment in &mut task.segments {
