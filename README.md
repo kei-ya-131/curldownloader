@@ -22,6 +22,10 @@ powershell -ExecutionPolicy Bypass -File scripts/build-release-gnu.ps1
 
 此 fallback 同樣只產生一個 `CurlDownloader.exe`，但正式 MSVC 發佈仍應使用上方腳本。
 
+## Security software warning
+
+本程式使用 `asInvoker`，不要求系統管理員權限，也不會啟動 PowerShell；下載工作只會啟動內嵌的 curl 子程序。未簽署的新 Windows EXE 可能被企業端防毒軟件以「新發現程式」攔截，請使用安全軟件的「Allow Once」或由管理員加入公司白名單。這類攔截不能由程式安全地繞過。
+
 ## Use
 
 在上方輸入 HTTP/HTTPS URL，按「新增下載」，於任務設定修改檔名、下載目錄與分段數，再按「開始」。下載中的任務可以「暫停」，重啟程式或再次按「開始」會從工作目錄中的部分檔續傳。完成後可從佇列按「開啟位置」。

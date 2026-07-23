@@ -7,7 +7,22 @@ use crate::{
     storage,
 };
 use eframe::egui;
-use std::{path::PathBuf, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
+
+pub const CHINESE_FONT_NAME: &str = "NotoSansTC-VF";
+const CHINESE_FONT_BYTES: &[u8] = include_bytes!("../assets/NotoSansTC-VF.ttf");
+
+pub fn chinese_font_definitions() -> egui::FontDefinitions {
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        CHINESE_FONT_NAME.to_owned(),
+        Arc::new(egui::FontData::from_static(CHINESE_FONT_BYTES)),
+    );
+    for family in fonts.families.values_mut() {
+        family.insert(0, CHINESE_FONT_NAME.to_owned());
+    }
+    fonts
+}
 
 pub fn format_bytes(bytes: u64) -> String {
     if bytes < 1024 {
@@ -115,6 +130,7 @@ impl CurlDownloaderApp {
 
         let mut visuals = egui::Visuals::dark();
         visuals.selection.bg_fill = egui::Color32::from_rgb(40, 100, 190);
+        cc.egui_ctx.set_fonts(chinese_font_definitions());
         cc.egui_ctx.set_visuals(visuals);
         Self {
             engine,
@@ -535,5 +551,21 @@ mod tests {
     fn formats_eta() {
         assert_eq!(format_eta(Some(65)), "1分 05秒");
         assert_eq!(format_eta(None), "—");
+    }
+
+    #[test]
+    fn installs_traditional_chinese_font_as_high_priority_fallback() {
+        let fonts = chinese_font_definitions();
+        let font = fonts
+            .font_data
+            .get(CHINESE_FONT_NAME)
+            .expect("Traditional Chinese font must be bundled");
+        assert!(font.font.len() > 100_000);
+        assert!(
+            fonts
+                .families
+                .values()
+                .all(|family| family.first().is_some_and(|name| name == CHINESE_FONT_NAME))
+        );
     }
 }
