@@ -1,5 +1,6 @@
 use crate::model::{ProxyProtocol, ProxySettings};
 use sha2::{Digest, Sha256};
+#[cfg(target_env = "msvc")]
 use std::os::windows::process::CommandExt;
 use std::{
     ffi::OsString,
@@ -7,6 +8,7 @@ use std::{
     io::{self, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
+    sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 use zeroize::Zeroizing;
@@ -14,7 +16,10 @@ use zeroize::Zeroizing;
 pub const CURL_BYTES: &[u8] = include_bytes!("../assets/curl.exe");
 pub const CURL_EXE_SHA256: &str =
     "8d28c1093e0b6345917d2c1710c67f78f61834d76ef983ea9fb631c75e20312f";
+#[cfg(target_env = "msvc")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+static NEXT_RUNTIME_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_PROCESS_ID: AtomicU64 = AtomicU64::new(1);
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
@@ -47,7 +52,9 @@ impl CurlCommandSpec {
             match proxy.protocol {
                 ProxyProtocol::Http | ProxyProtocol::Https => args.push("--proxy-anyauth".into()),
                 ProxyProtocol::Socks5 | ProxyProtocol::Socks5h => {
-                    args.push("--socks5-basic".into())
+                    if !proxy.username.is_empty() || proxy.password.is_some() {
+                        args.push("--socks5-basic".into());
+                    }
                 }
             }
             if !proxy.username.is_empty() || proxy.password.is_some() {
@@ -91,8 +98,11 @@ impl CurlRuntime {
             .duration_since(UNIX_EPOCH)
             .map_err(io::Error::other)?
             .as_millis();
-        let root =
-            std::env::temp_dir().join(format!("CurlDownloader-{}-{millis}", std::process::id()));
+        let runtime_id = NEXT_RUNTIME_ID.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "CurlDownloader-{}-{millis}-{runtime_id}",
+            std::process::id()
+        ));
         fs::create_dir(&root)?;
         let exe = root.join("curl.exe");
         fs::write(&exe, CURL_BYTES)?;
@@ -103,7 +113,10 @@ impl CurlRuntime {
     }
 
     pub fn spawn(&self, spec: &mut CurlCommandSpec, stdout: Stdio) -> io::Result<Child> {
-        let mut command = Command::new(&self.exe);
+        let process_id = NEXT_PROCESS_ID.fetch_add(1, Ordering::Relaxed);
+        let child_exe = self.root.join(format!("curl-process-{process_id}.exe"));
+        fs::copy(&self.exe, &child_exe)?;
+        let mut command = Command::new(child_exe);
         command
             .args(&spec.args)
             .stdin(if spec.stdin_config.is_some() {
@@ -112,8 +125,9 @@ impl CurlRuntime {
                 Stdio::null()
             })
             .stdout(stdout)
-            .stderr(Stdio::piped())
-            .creation_flags(CREATE_NO_WINDOW);
+            .stderr(Stdio::piped());
+        #[cfg(target_env = "msvc")]
+        command.creation_flags(CREATE_NO_WINDOW);
         let mut child = command.spawn()?;
         if let (Some(config), Some(mut stdin)) = (spec.stdin_config.take(), child.stdin.take()) {
             stdin.write_all(config.as_bytes())?;
@@ -152,8 +166,8 @@ fn add_transfer_defaults(spec: &mut CurlCommandSpec) {
         [
             "--location",
             "--fail",
-            "--silent",
             "--show-error",
+            "--silent",
             "--connect-timeout",
             "30",
             "--retry",
@@ -391,6 +405,22 @@ mod tests {
                 .unwrap()
                 .contains("alice:s3cret")
         );
+    }
+
+    #[test]
+    fn socks_protocols_are_selected_per_task() {
+        let mut proxy = ProxySettings {
+            enabled: true,
+            protocol: ProxyProtocol::Socks5,
+            host: "127.0.0.1".into(),
+            port: 1080,
+            ..ProxySettings::default()
+        };
+        let socks5 = CurlCommandSpec::base(&proxy).unwrap();
+        assert!(socks5.arguments_text().contains("socks5://127.0.0.1:1080"));
+        proxy.protocol = ProxyProtocol::Socks5h;
+        let socks5h = CurlCommandSpec::base(&proxy).unwrap();
+        assert!(socks5h.arguments_text().contains("socks5h://127.0.0.1:1080"));
     }
 
     #[test]
