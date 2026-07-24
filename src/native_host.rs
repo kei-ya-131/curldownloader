@@ -31,13 +31,13 @@ pub fn should_start_gui(connect_error: &io::Error) -> bool {
     }
     #[cfg(windows)]
     {
-        return matches!(
+        matches!(
             connect_error.raw_os_error(),
             Some(code)
                 if code == windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND as i32
                     || code == windows_sys::Win32::Foundation::ERROR_PIPE_BUSY as i32
                     || code == windows_sys::Win32::Foundation::ERROR_BROKEN_PIPE as i32
-        );
+        )
     }
     #[cfg(not(windows))]
     {

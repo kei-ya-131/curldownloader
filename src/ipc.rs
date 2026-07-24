@@ -190,10 +190,10 @@ pub fn spawn_server(
                 let _ = call_pipe(&request, Duration::from_millis(250));
             });
 
-        return thread::Builder::new()
+        thread::Builder::new()
             .name("native-bridge-pipe".into())
             .spawn(move || run_windows_server(commands, last_download_dir, stop))
-            .expect("無法啟動 Native Messaging Named Pipe 伺服器");
+            .expect("無法啟動 Native Messaging Named Pipe 伺服器")
     }
 
     #[cfg(not(windows))]
@@ -209,7 +209,7 @@ pub fn spawn_server(
 pub fn call_pipe(request: &IpcRequest, timeout: Duration) -> io::Result<IpcResponse> {
     #[cfg(windows)]
     {
-        return call_windows_pipe(request, timeout);
+        call_windows_pipe(request, timeout)
     }
 
     #[cfg(not(windows))]

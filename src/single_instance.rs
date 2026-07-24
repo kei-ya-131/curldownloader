@@ -30,7 +30,7 @@ pub fn acquire() -> Result<Option<GuiInstanceGuard>, String> {
             }
             return Ok(None);
         }
-        return Ok(Some(GuiInstanceGuard { handle }));
+        Ok(Some(GuiInstanceGuard { handle }))
     }
 
     #[cfg(not(windows))]
