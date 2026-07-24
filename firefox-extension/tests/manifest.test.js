@@ -20,3 +20,12 @@ test('storage implementation has no password persistence path', () => {
   const source = fs.readFileSync(path.join(root, 'storage.js'), 'utf8');
   assert.equal(source.includes('password'), false);
 });
+
+test('native host installation and XPI packaging scripts are present', () => {
+  const installScript = fs.readFileSync(path.join(root, '..', 'scripts', 'install-firefox-native-host.ps1'), 'utf8');
+  const packageScript = fs.readFileSync(path.join(root, '..', 'scripts', 'package-firefox-extension.ps1'), 'utf8');
+  assert.match(installScript, /curl_downloader/);
+  assert.match(installScript, /curl-downloader@kinkeil\.local/);
+  assert.match(installScript, /allowed_extensions/);
+  assert.match(packageScript, /Compress-Archive/);
+});

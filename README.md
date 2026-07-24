@@ -36,6 +36,37 @@ powershell -ExecutionPolicy Bypass -File scripts/build-release-gnu.ps1
 
 Windows 下載時只會在背景啟動隱藏的 curl 子程序，不會顯示 CMD 控制台視窗。
 
+## Firefox extension
+
+Firefox extension 會攔截 HTTP/HTTPS 下載，先暫停原下載並開啟設定頁。設定頁可填寫下載名稱、Windows 絕對目錄，以及 HTTP、HTTPS、SOCKS5 或 SOCKS5H Proxy 的主機、連接埠、帳號及密碼；按「交給 Curl Downloader」後，只有當 Native host 回報任務成功，才會取消並清理原 Firefox 下載。
+
+建立發行版後，以目前使用者權限註冊 Native host：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install-firefox-native-host.ps1 `
+  -ExecutablePath "$PWD\dist\CurlDownloader.exe"
+```
+
+打包 extension：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\package-firefox-extension.ps1 `
+  -OutputPath "$PWD\dist\curl-downloader.xpi"
+```
+
+在 Firefox 的 `about:addons` 使用「從檔案安裝附加元件」載入 XPI，並在附加元件設定中允許「在私人視窗中執行」。首次由 extension 取得預設目錄或提交下載時，Native host 會以目前的 EXE 路徑自動啟動 Curl Downloader；GUI 已開啟時不會建立第二個視窗。
+
+若 Native host、GUI 或設定頁提交失敗，extension 會恢復原 Firefox 下載；若 Firefox 不接受 resume，會以一次性管理標記重新建立 fallback 下載，避免 fallback 再次進入攔截流程。若關閉設定頁而未提交，也會恢復 Firefox 下載。
+
+extension storage 只保存目錄及非秘密 Proxy 預設值。Proxy 密碼只存在設定頁記憶體、Native Messaging pipe 及本次 curl 工作流，不會寫入 extension storage、`state.json` 或診斷輸出。私人視窗下載的任務資料會按既定流程交給 GUI，引擎狀態仍使用 `%APPDATA%\CurlDownloader\state.json`。
+
+卸載 Native host（只移除本工具建立的 per-user registry key 及 manifest）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install-firefox-native-host.ps1 `
+  -ExecutablePath "$PWD\dist\CurlDownloader.exe" -Uninstall
+```
+
 程式啟動下載時會先從 PATH 尋找本機 `curl.exe`，並以 `curl.exe --version` 確認可以執行；找不到或無法啟動時，才會使用內嵌且經 SHA-256 驗證的 curl。程式只在第一次真正開始下載時選擇及驗證 curl；啟動程式、瀏覽歷史或新增待確認任務都不會建立內置 curl runtime。任務面板會顯示「尚未啟動」、「本機 curl」或「內置 curl」。若 curl 啟動失敗，可在任務的「詳細診斷」查看已清理 Proxy 憑證的作業系統／curl 錯誤。
 
 ## Proxy
