@@ -8,4 +8,6 @@ pub mod download;
 pub mod filename;
 pub mod ipc;
 pub mod model;
+pub mod native_host;
+pub mod single_instance;
 pub mod storage;
