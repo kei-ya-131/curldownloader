@@ -101,7 +101,17 @@
       if (!pending || !pending.ok) {
         throw new Error('找不到下載項目。');
       }
-      fillForm(pending.download, await CurlExtensionStorage.loadDefaults());
+      const defaults = await CurlExtensionStorage.loadDefaults();
+      let nativeDefaults = { targetDir: '' };
+      try {
+        nativeDefaults = await browser.runtime.sendMessage({ type: 'get-defaults' });
+      } catch (_error) {
+        // The form remains usable with the saved extension default.
+      }
+      fillForm({
+        ...pending.download,
+        targetDir: pending.download.targetDir || (nativeDefaults && nativeDefaults.targetDir) || ''
+      }, defaults);
       setStatus('原 Firefox 下載目前保持暫停，請選擇處理方式。');
     } catch (error) {
       setStatus(error.message || '讀取下載資料失敗。', 'error');

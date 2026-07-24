@@ -37,7 +37,7 @@
         enabled: Boolean(proxy.enabled),
         protocol: String(proxy.protocol || 'http'),
         host: String(proxy.host || '').trim(),
-        port: Number(proxy.port),
+        port: Number(proxy.port) || 8080,
         username: String(proxy.username || ''),
         password: String(proxy.password || '')
       }
