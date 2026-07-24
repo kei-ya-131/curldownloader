@@ -1,0 +1,27 @@
+{
+  "manifest_version": 2,
+  "name": "Curl Downloader Bridge",
+  "version": "0.1.0",
+  "description": "在下載前將 HTTP/HTTPS 下載交給本機 Curl Downloader。",
+  "applications": {
+    "gecko": {
+      "id": "curl-downloader@kinkeil.local",
+      "strict_min_version": "115.0"
+    }
+  },
+  "permissions": [
+    "downloads",
+    "nativeMessaging",
+    "notifications",
+    "storage",
+    "tabs"
+  ],
+  "incognito": "spanning",
+  "background": {
+    "scripts": ["core.js", "storage.js", "background.js"],
+    "persistent": true
+  },
+  "browser_action": {
+    "default_title": "Curl Downloader"
+  }
+}
