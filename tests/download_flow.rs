@@ -300,3 +300,36 @@ fn completed_progress_remains_full_after_work_dir_cleanup() {
     assert_eq!(refreshed.downloaded, completed.total_size.unwrap());
     assert_eq!(refreshed.total_size, Some(8));
 }
+
+#[test]
+fn configured_task_uses_external_filename_directory_and_proxy() {
+    let server = support::TestHttpServer::start(vec![support::Route {
+        path: "/payload.bin",
+        body: b"configured payload",
+        ranges: false,
+        etag: "configured-v1",
+        filename: "server-name.bin",
+    }]);
+    let mut harness = support::EngineHarness::new(1);
+    let target_dir = harness.download_dir().join("external-target");
+    std::fs::create_dir_all(&target_dir).unwrap();
+
+    let id = harness.add_configured(
+        format!("{}/payload.bin", server.base_url),
+        "renamed-from-firefox.bin".into(),
+        target_dir.clone(),
+        ProxySettings::default(),
+    );
+    let completed = harness.wait_for(
+        id,
+        TaskStatus::Completed,
+        std::time::Duration::from_secs(60),
+    );
+
+    assert_eq!(completed.target_dir, target_dir);
+    assert_eq!(completed.filename, "renamed-from-firefox.bin");
+    assert_eq!(
+        std::fs::read(target_dir.join("renamed-from-firefox.bin")).unwrap(),
+        b"configured payload"
+    );
+}

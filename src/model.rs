@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::{fmt, path::PathBuf};
+use std::{fmt, path::PathBuf, sync::mpsc::Sender};
 use url::Host;
 use zeroize::Zeroizing;
 
@@ -291,9 +291,21 @@ pub struct NewTask {
     pub target_dir: PathBuf,
 }
 
+pub struct ConfiguredTask {
+    pub url: String,
+    pub filename: String,
+    pub target_dir: PathBuf,
+    pub requested_segments: u8,
+    pub proxy: ProxySettings,
+}
+
 pub enum EngineCommand {
     Add(NewTask),
     AddBatch(Vec<NewTask>),
+    AddConfigured {
+        task: ConfiguredTask,
+        response: Sender<Result<TaskId, String>>,
+    },
     Start(TaskId),
     Pause(TaskId),
     Cancel(TaskId),

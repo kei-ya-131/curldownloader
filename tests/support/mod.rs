@@ -4,8 +4,8 @@
 use curl_downloader::{
     download::{EngineHandle, spawn_engine},
     model::{
-        EngineCommand, EngineEvent, GlobalSettings, NewTask, PersistedState, ProxySettings, TaskId,
-        TaskSnapshot, TaskStatus,
+        ConfiguredTask, EngineCommand, EngineEvent, GlobalSettings, NewTask, PersistedState,
+        ProxySettings, TaskId, TaskSnapshot, TaskStatus,
     },
 };
 use std::{
@@ -532,6 +532,33 @@ impl EngineHarness {
             ))
             .unwrap();
         self.wait_for_count(urls.len(), Duration::from_secs(5))
+    }
+
+    pub fn add_configured(
+        &mut self,
+        url: String,
+        filename: String,
+        target_dir: PathBuf,
+        proxy: ProxySettings,
+    ) -> TaskId {
+        let (response_tx, response_rx) = std::sync::mpsc::channel();
+        self.engine
+            .commands
+            .send(EngineCommand::AddConfigured {
+                task: ConfiguredTask {
+                    url,
+                    filename,
+                    target_dir,
+                    requested_segments: 1,
+                    proxy,
+                },
+                response: response_tx,
+            })
+            .unwrap();
+        response_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap()
     }
 
     pub fn add_with_proxy(
