@@ -1,5 +1,6 @@
 use crate::{
     download::{EngineHandle, spawn_engine},
+    ipc,
     model::{
         CurlSource, EngineCommand, EngineEvent, GlobalSettings, NewTask, PersistedState,
         ProxyProtocol, ProxySettings, TaskId, TaskSnapshot, TaskStatus,
@@ -7,7 +8,16 @@ use crate::{
     storage,
 };
 use eframe::egui;
-use std::{collections::HashSet, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    path::PathBuf,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread::JoinHandle,
+    time::Duration,
+};
 
 pub const CHINESE_FONT_NAME: &str = "NotoSansTC-VF";
 const CHINESE_FONT_BYTES: &[u8] = include_bytes!("../assets/NotoSansTC-VF.ttf");
@@ -70,6 +80,9 @@ pub struct CurlDownloaderApp {
     last_download_dir: PathBuf,
     max_processes: u8,
     shutting_down: bool,
+    ipc_stop: Arc<AtomicBool>,
+    ipc_default_dir: Arc<Mutex<PathBuf>>,
+    ipc_thread: Option<JoinHandle<()>>,
 }
 
 #[derive(Clone)]
@@ -142,6 +155,13 @@ impl CurlDownloaderApp {
         let last_download_dir = state.settings.last_download_dir.clone();
         let engine = spawn_engine(state_path, state)
             .unwrap_or_else(|error| panic!("無法啟動下載引擎：{error}"));
+        let ipc_stop = Arc::new(AtomicBool::new(false));
+        let ipc_default_dir = Arc::new(Mutex::new(last_download_dir.clone()));
+        let ipc_thread = Some(ipc::spawn_server(
+            engine.commands.clone(),
+            Arc::clone(&ipc_default_dir),
+            Arc::clone(&ipc_stop),
+        ));
 
         cc.egui_ctx.set_fonts(chinese_font_definitions());
         cc.egui_ctx.set_theme(egui::ThemePreference::System);
@@ -164,6 +184,9 @@ impl CurlDownloaderApp {
             last_download_dir,
             max_processes,
             shutting_down: false,
+            ipc_stop,
+            ipc_default_dir,
+            ipc_thread,
         }
     }
 
@@ -951,6 +974,9 @@ impl CurlDownloaderApp {
                         }
                         if let Some(path) = pending_last_dir {
                             self.last_download_dir = path.clone();
+                            if let Ok(mut shared_dir) = self.ipc_default_dir.lock() {
+                                *shared_dir = path.clone();
+                            }
                             let _ = self
                                 .engine
                                 .commands
@@ -977,12 +1003,22 @@ impl eframe::App for CurlDownloaderApp {
         if ctx.input(|input| input.viewport().close_requested()) && !self.shutting_down {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.shutting_down = true;
+            self.ipc_stop.store(true, Ordering::Release);
             let _ = self.engine.commands.send(EngineCommand::Shutdown);
         }
         ctx.request_repaint_after(Duration::from_millis(200));
         self.show_top_bar(ui);
         self.show_queue(ui);
         self.show_inspector(ui);
+    }
+}
+
+impl Drop for CurlDownloaderApp {
+    fn drop(&mut self) {
+        self.ipc_stop.store(true, Ordering::Release);
+        if let Some(server) = self.ipc_thread.take() {
+            let _ = server.join();
+        }
     }
 }
 
