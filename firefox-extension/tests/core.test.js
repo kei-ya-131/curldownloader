@@ -23,6 +23,9 @@ test('enqueue message serializes the complete proxy form', () => {
     'request-1'
   );
   assert.equal(message.type, 'enqueue');
+  assert.equal(message.filename, 'renamed.zip');
+  assert.equal(message.target_dir, 'C:\\Downloads');
+  assert.equal(message.url, 'https://example.test/a.zip');
   assert.equal(message.proxy.protocol, 'socks5h');
   assert.equal(message.proxy.port, 1080);
   assert.equal(message.proxy.password, 'secret');

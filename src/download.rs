@@ -465,6 +465,7 @@ impl Engine {
         if !matches!(parsed.scheme(), "http" | "https") {
             return Err("只支援 HTTP 或 HTTPS 網址".into());
         }
+        let target_dir = new_task.target_dir.clone();
         if !new_task.target_dir.is_dir() {
             return Err("下載目錄不存在或無法存取".into());
         }
@@ -482,6 +483,7 @@ impl Engine {
         self.settings.next_task_id = self.settings.next_task_id.saturating_add(1);
         let id = task.id;
         self.tasks.push(task);
+        self.settings.last_download_dir = target_dir;
         self.persist()
             .map_err(|error| format!("無法保存下載任務：{error}"))?;
         self.publish_snapshot();

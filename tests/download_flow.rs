@@ -332,4 +332,6 @@ fn configured_task_uses_external_filename_directory_and_proxy() {
         std::fs::read(target_dir.join("renamed-from-firefox.bin")).unwrap(),
         b"configured payload"
     );
+    let saved = curl_downloader::storage::load_state(harness.state_path()).unwrap();
+    assert_eq!(saved.settings.last_download_dir, target_dir);
 }

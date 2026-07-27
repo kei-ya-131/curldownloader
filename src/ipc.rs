@@ -392,13 +392,14 @@ fn dispatch_request(
                     };
                 }
             };
+            let target_dir = PathBuf::from(target_dir);
             let (response_tx, response_rx) = std::sync::mpsc::channel();
             if commands
                 .send(EngineCommand::AddConfigured {
                     task: ConfiguredTask {
                         url,
                         filename,
-                        target_dir: PathBuf::from(target_dir),
+                        target_dir: target_dir.clone(),
                         requested_segments: 4,
                         proxy,
                     },
@@ -409,12 +410,17 @@ fn dispatch_request(
                 return enqueue_error(request_id, "engine_unavailable", "下載引擎未能接收任務");
             }
             match response_rx.recv_timeout(Duration::from_secs(5)) {
-                Ok(Ok(task_id)) => IpcResponse::EnqueueResult {
-                    request_id,
-                    ok: true,
-                    task_id: Some(task_id),
-                    error: None,
-                },
+                Ok(Ok(task_id)) => {
+                    if let Ok(mut default_dir) = last_download_dir.lock() {
+                        *default_dir = target_dir.clone();
+                    }
+                    IpcResponse::EnqueueResult {
+                        request_id,
+                        ok: true,
+                        task_id: Some(task_id),
+                        error: None,
+                    }
+                }
                 Ok(Err(message)) => enqueue_error(request_id, "invalid_task", &message),
                 Err(_) => enqueue_error(request_id, "engine_timeout", "下載引擎回應逾時"),
             }

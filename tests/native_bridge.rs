@@ -26,7 +26,7 @@ fn pipe_enqueue_reaches_the_single_download_engine() {
     let defaults = Arc::new(Mutex::new(harness.download_dir().to_path_buf()));
     let pipe = curl_downloader::ipc::spawn_server(
         harness.engine.commands.clone(),
-        defaults,
+        Arc::clone(&defaults),
         Arc::clone(&stop),
     );
     let target = harness.download_dir().join("bridge-target");
@@ -50,6 +50,7 @@ fn pipe_enqueue_reaches_the_single_download_engine() {
     };
 
     let completed = harness.wait_for(id, TaskStatus::Completed, Duration::from_secs(60));
+    assert_eq!(*defaults.lock().unwrap(), target);
     assert_eq!(
         std::fs::read(completed.target_dir.join("from-firefox.bin")).unwrap(),
         b"bridge payload"

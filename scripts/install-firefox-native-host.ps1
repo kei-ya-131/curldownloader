@@ -1,6 +1,6 @@
 ﻿[CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)][string]$ExecutablePath,
+    [string]$ExecutablePath,
     [switch]$Uninstall
 )
 
@@ -25,6 +25,17 @@ if (-not (Test-InDirectory $manifestPath $supportDirectory)) {
     throw 'Native host manifest path 不在預期的 per-user 目錄內。'
 }
 
+if (-not $Uninstall -and [string]::IsNullOrWhiteSpace($ExecutablePath)) {
+    $portableExecutable = Join-Path $PSScriptRoot 'CurlDownloader.exe'
+    $repositoryExecutable = Join-Path (Split-Path -Parent $PSScriptRoot) 'dist\CurlDownloader.exe'
+    $ExecutablePath = if (Test-Path -LiteralPath $portableExecutable -PathType Leaf) {
+        $portableExecutable
+    } elseif (Test-Path -LiteralPath $repositoryExecutable -PathType Leaf) {
+        $repositoryExecutable
+    } else {
+        throw '找不到 CurlDownloader.exe，請以 -ExecutablePath 指定。'
+    }
+}
 if ($Uninstall) {
     if (Test-Path -LiteralPath $registryPath) {
         $registeredPath = $null

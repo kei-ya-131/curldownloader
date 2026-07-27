@@ -71,7 +71,7 @@ Firefox extension 本身不能寫入 Windows Registry 或任意啟動未註冊�
 
 若 Native host、GUI 或設定頁提交失敗，extension 會恢復原 Firefox 下載；若 Firefox 不接受 resume，會以一次性管理標記重新建立 fallback 下載，避免 fallback 再次進入攔截流程。若關閉設定頁而未提交，也會恢復 Firefox 下載。
 
-extension storage 只保存目錄及非秘密 Proxy 預設值。Proxy 密碼只存在設定頁記憶體、Native Messaging pipe 及本次 curl 工作流，不會寫入 extension storage、`state.json` 或診斷輸出。私人視窗下載的任務資料會按既定流程交給 GUI，引擎狀態仍使用 `%APPDATA%\CurlDownloader\state.json`。
+extension storage 只保存目錄及非秘密 Proxy 預設值。Proxy 密碼只存在設定頁記憶體、Native Messaging pipe 及本次 curl 工作流，不會寫入 extension storage、`state.json` 或診斷輸出。私人視窗下載的任務資料會按既定流程交給 GUI，引擎狀態一般模式使用 `%APPDATA%\CurlDownloader\state.json`，portable 模式使用 portable 目錄內的 `data\state.json`。
 
 卸載 Native host（只移除本工具建立的 per-user registry key 及 manifest）：
 
@@ -86,9 +86,27 @@ powershell -ExecutionPolicy Bypass -File scripts\install-firefox-native-host.ps1
 
 每個任務可獨立設定 HTTP、HTTPS、SOCKS5 或 SOCKS5H Proxy。Proxy 密碼只在記憶體與 curl stdin 設定流中使用，不保存至 state.json；程式重啟後會要求重新輸入。
 
+## Portable 發行版
+
+建立 portable 發行目錄（需要先完成 `dist\CurlDownloader.exe` 及 `dist\curl-downloader.xpi`）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\package-portable.ps1 `
+  -OutputDirectory "$PWD\dist\CurlDownloaderPortable"
+```
+
+portable 目錄包含 `CurlDownloader.exe`、extension XPI、`portable.flag` 及啟動腳本；狀態會保存到 portable 目錄內的 `data\state.json`，不會寫入 `%APPDATA%`。可選擇直接啟動程式，或指定 Portable Firefox launcher：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Start-CurlDownloader-Portable.ps1 `
+  -FirefoxExecutablePath "C:\Tools\FirefoxPortable\FirefoxPortable.exe"
+```
+
+Firefox Windows Native Messaging 的官方發現機制仍要求 `HKCU\Software\Mozilla\NativeMessagingHosts\curl_downloader` Registry key；WebExtension 不能自行啟動未註冊的 EXE。portable 套件因此使用 `Install-Firefox-Native-Host.ps1` 一鍵寫入 per-user 設定，不需要手動開啟 regedit；若搬動 portable 目錄，重新執行該腳本即可更新 EXE 路徑。這是 Firefox 平台限制，不能只靠 `policies.json` 或把 manifest 放入 Portable Firefox 目錄來繞過。
+
 ## Data locations
 
-- 設定與任務狀態：`%APPDATA%\CurlDownloader\state.json`
+- 設定與任務狀態：一般模式為 `%APPDATA%\CurlDownloader\state.json`；portable 模式為 portable 目錄內的 `data\state.json`
 - 下載部分檔：目的地內的 `.curl-downloader` 目錄
 
 ## Limits

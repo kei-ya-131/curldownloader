@@ -5,12 +5,34 @@ use std::{
     path::{Path, PathBuf},
 };
 
+const PORTABLE_MARKER: &str = "portable.flag";
+
 pub fn state_path() -> io::Result<PathBuf> {
+    if let Some(executable) = current_portable_executable() {
+        return Ok(portable_state_path(&executable));
+    }
+
     let base = env::var_os("APPDATA")
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "找不到 APPDATA"))?;
     Ok(PathBuf::from(base)
         .join("CurlDownloader")
         .join("state.json"))
+}
+
+pub fn portable_state_path(executable: &Path) -> PathBuf {
+    executable
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("data")
+        .join("state.json")
+}
+
+fn current_portable_executable() -> Option<PathBuf> {
+    let executable = env::current_exe().ok()?;
+    let root = executable.parent()?;
+    let environment_enabled = env::var_os("CURL_DOWNLOADER_PORTABLE")
+        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+    (environment_enabled || root.join(PORTABLE_MARKER).is_file()).then_some(executable)
 }
 
 pub fn default_download_dir() -> io::Result<PathBuf> {
@@ -75,6 +97,17 @@ pub fn task_work_dir(task: &DownloadTask) -> PathBuf {
 mod tests {
     use super::*;
     use crate::model::*;
+
+    #[test]
+    fn portable_state_path_lives_next_to_executable() {
+        let root = test_dir("portable-state");
+        let executable = root.join("CurlDownloader.exe");
+        assert_eq!(
+            portable_state_path(&executable),
+            root.join("data").join("state.json")
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn saves_state_without_proxy_password() {
