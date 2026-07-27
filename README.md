@@ -40,7 +40,12 @@ Windows 下載時只會在背景啟動隱藏的 curl 子程序，不會顯示 CM
 
 Firefox extension 會攔截 HTTP/HTTPS 下載，先暫停原下載並開啟設定頁。設定頁可填寫下載名稱、Windows 絕對目錄，以及 HTTP、HTTPS、SOCKS5 或 SOCKS5H Proxy 的主機、連接埠、帳號及密碼；按「交給 Curl Downloader」後，只有當 Native host 回報任務成功，才會取消並清理原 Firefox 下載。
 
-建立發行版後，以目前使用者權限註冊 Native host：
+正常使用流程（包括 Portable Firefox ESR）：
+1. 首次使用前，直接啟動 `CurlDownloader.exe` 一次。GUI 啟動時會自動在 `HKCU\Software\Mozilla\NativeMessagingHosts\curl_downloader` 建立或更新 Native host manifest，路徑會指向目前這份 EXE；不需要手動開啟 regedit。
+2. 在 Firefox 的 `about:addons` 使用「從檔案安裝附加元件」載入 XPI，並在附加元件設定中允許「在私人視窗中執行」。
+3. 若下載設定頁顯示 Native host 未啟動或尚未註冊，啟動 Curl Downloader 完成註冊後，回到原設定頁按「重試 Curl Downloader」。
+
+如需手動修復註冊（或在卸載前清理設定），可使用目前使用者權限執行：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\install-firefox-native-host.ps1 `
@@ -63,11 +68,9 @@ powershell -ExecutionPolicy Bypass -File scripts\package-firefox-extension.ps1 `
   -OutputPath "$PWD\dist\curl-downloader.xpi"
 ```
 
-Firefox extension 本身不能寫入 Windows Registry 或任意啟動未註冊的 EXE；
-`-ExecutablePath` 就是 Native host 使用的 Curl Downloader 位置。若 EXE 被移動，
-請以新位置重新執行上面的 Native host 安裝指令，再重新啟動 Firefox。
+Firefox extension 本身不能寫入 Windows Registry 或任意啟動未註冊的 EXE；因此首次使用前必須先直接啟動一次 Curl Downloader GUI。完成第一次註冊後，Firefox Native host 可以按 manifest 啟動目前註冊的 EXE；若 GUI 已開啟則不會建立第二個視窗。若 EXE 被移動，重新啟動新位置的 GUI 即可更新 HKCU 註冊資料。
 
-在 Firefox 的 `about:addons` 使用「從檔案安裝附加元件」載入 XPI，並在附加元件設定中允許「在私人視窗中執行」。首次由 extension 取得預設目錄或提交下載時，Native host 會以目前的 EXE 路徑自動啟動 Curl Downloader；GUI 已開啟時不會建立第二個視窗。
+在 Firefox 的 `about:addons` 使用「從檔案安裝附加元件」載入 XPI，並在附加元件設定中允許「在私人視窗中執行」。若設定頁顯示 Native host 未啟動或尚未註冊，啟動 Curl Downloader 完成註冊後按「重試 Curl Downloader」；成功後會保留目前下載的檔名、目錄及 Proxy 欄位供提交。
 
 若 Native host、GUI 或設定頁提交失敗，extension 會恢復原 Firefox 下載；若 Firefox 不接受 resume，會以一次性管理標記重新建立 fallback 下載，避免 fallback 再次進入攔截流程。若關閉設定頁而未提交，也會恢復 Firefox 下載。
 
@@ -102,7 +105,7 @@ powershell -ExecutionPolicy Bypass -File .\Start-CurlDownloader-Portable.ps1 `
   -FirefoxExecutablePath "C:\Tools\FirefoxPortable\FirefoxPortable.exe"
 ```
 
-Firefox Windows Native Messaging 的官方發現機制仍要求 `HKCU\Software\Mozilla\NativeMessagingHosts\curl_downloader` Registry key；WebExtension 不能自行啟動未註冊的 EXE。portable 套件因此使用 `Install-Firefox-Native-Host.ps1` 一鍵寫入 per-user 設定，不需要手動開啟 regedit；若搬動 portable 目錄，重新執行該腳本即可更新 EXE 路徑。這是 Firefox 平台限制，不能只靠 `policies.json` 或把 manifest 放入 Portable Firefox 目錄來繞過。
+Firefox Windows Native Messaging 的官方發現機制仍要求 `HKCU\Software\Mozilla\NativeMessagingHosts\curl_downloader` Registry key；WebExtension 不能自行啟動未註冊的 EXE。portable 套件的正常流程是直接啟動 `CurlDownloader.exe`，由 GUI 自動建立或更新上述 per-user 設定；`Install-Firefox-Native-Host.ps1` 仍會隨套件提供，供手動修復或卸載。這是 Firefox 平台限制，不能只靠 `policies.json` 或把 manifest 放入 Portable Firefox 目錄來繞過。
 
 ## Data locations
 

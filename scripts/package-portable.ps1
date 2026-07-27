@@ -30,4 +30,5 @@ Copy-Item -LiteralPath $portableLauncher -Destination (Join-Path $absoluteOutput
 )
 
 Write-Output "已建立 portable 發行目錄：$absoluteOutput"
-Write-Output "請先以 Start-CurlDownloader-Portable.ps1 啟動 Curl Downloader，再載入 curl-downloader.xpi。"
+Write-Output "首次啟動 CurlDownloader.exe 時，GUI 啟動時會自動註冊 Firefox Native host。"
+Write-Output "之後可在 Firefox 載入 curl-downloader.xpi；若設定頁等待 Native host，按「重試 Curl Downloader」。"
