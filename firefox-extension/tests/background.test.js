@@ -166,3 +166,18 @@ test('Native host retry stops after five attempts', async () => {
   assert.equal(fake.calls.nativeConnects, 5);
 });
 
+test('pick-folder maps native directory to settings camelCase', async () => {
+  const fake = makeFakeBrowser({
+    nativeResponse: (message) => ({
+      type: 'folder',
+      request_id: message.request_id,
+      ok: true,
+      target_dir: 'D:\\Downloads',
+      error: null
+    })
+  });
+  const background = createBackground(fake.browser, { attempts: 1, delayMs: 0 });
+  const result = await background.handleRuntimeMessage({ type: 'pick-folder', downloadId: 1 });
+  assert.equal(result.ok, true);
+  assert.equal(result.targetDir, 'D:\\Downloads');
+});

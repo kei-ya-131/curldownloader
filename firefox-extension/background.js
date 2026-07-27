@@ -291,9 +291,14 @@ let requestSequence = 0;
     if (message.type === 'pick-folder') {
       try {
         const response = await sendNativeWithRetry({ type: 'pick_folder' });
-        return response && response.type === 'folder'
-          ? response
-          : { ok: false, error: '無法開啟目錄選擇器。' };
+        if (response && response.type === 'folder') {
+          return {
+            ok: Boolean(response.ok),
+            targetDir: response.target_dir || '',
+            error: response.error && response.error.message ? response.error.message : null
+          };
+        }
+        return { ok: false, error: '無法開啟目錄選擇器。' };
       } catch (_error) {
         return nativeUnavailable('Curl Downloader 未啟動或尚未註冊 Native host，無法開啟目錄選擇器。');
       }
