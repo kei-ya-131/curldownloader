@@ -123,5 +123,6 @@ test('managed fallback onCreated event does not re-enter interception', async ()
   });
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(fake.calls.download.length, 1);
+  assert.equal(fake.calls.download[0].saveAs, false);
   assert.deepEqual(fake.calls.pause, [3]);
 });

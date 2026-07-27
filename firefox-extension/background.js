@@ -143,6 +143,7 @@
       const id = await browserApi.downloads.download({
         url: pending.url,
         filename: core.fallbackFilename(pending.filename),
+        saveAs: false,
         conflictAction: 'uniquify'
       });
       if (managedFallbackUrls.get(pending.url)) managedFallbackIds.add(id);

@@ -47,6 +47,15 @@ powershell -ExecutionPolicy Bypass -File scripts\install-firefox-native-host.ps1
   -ExecutablePath "$PWD\dist\CurlDownloader.exe"
 ```
 
+Portable Firefox ESR 注意：Native host 仍是註冊到目前 Windows 使用者的
+`HKCU\Software\Mozilla\NativeMessagingHosts\curl_downloader`，不需要把 manifest
+複製到 Portable Firefox 目錄。若點擊下載時先出現 Firefox 原生「選擇下載檔案位置」
+對話框，請在同一個 Portable Firefox profile 開啟 `about:preferences` → 一般 →
+檔案與應用程式 → 下載，關閉「總是詢問儲存檔案的位置」；亦可在 `about:config`
+將 `browser.download.useDownloadDir` 設為 `true`，然後重新啟動 Portable Firefox。
+Firefox 的原生對話框會在 `downloads.onCreated` 之前出現，WebExtension 無法在該
+對話框已開啟後取消它。
+
 打包 extension：
 
 ```powershell
