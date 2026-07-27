@@ -14,6 +14,7 @@ url = "2.5"
 zeroize = "1.8"
 
 [target.'cfg(windows)'.dependencies]
+winreg = "0.52"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
@@ -28,3 +29,4 @@ lto = "thin"
 codegen-units = 1
 panic = "abort"
 strip = "symbols"
+

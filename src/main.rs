@@ -1,6 +1,6 @@
 #![windows_subsystem = "windows"]
 
-use curl_downloader::{app::CurlDownloaderApp, native_host, single_instance};
+use curl_downloader::{app::CurlDownloaderApp, native_host, native_registration, single_instance};
 
 fn main() -> eframe::Result {
     let arguments: Vec<_> = std::env::args_os().skip(1).collect();
@@ -15,6 +15,12 @@ fn main() -> eframe::Result {
 }
 
 fn run_gui() -> eframe::Result {
+    if let Ok(executable) = std::env::current_exe() {
+        if let Err(error) = native_registration::ensure_registered(&executable) {
+            eprintln!("Firefox Native host 自動註冊失敗：{error}");
+        }
+    }
+
     let _instance = match single_instance::acquire() {
         Ok(Some(instance)) => instance,
         Ok(None) => return Ok(()),
