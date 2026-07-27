@@ -76,6 +76,7 @@ fieldset {
 .path-row button { flex: 0 0 auto; }
 
 .actions { display: flex; gap: .65rem; align-items: center; flex-wrap: wrap; }
+#retry-native { min-width: 9rem; }
 button { padding: .45rem .85rem; border: 1px solid ButtonShadow; cursor: pointer; }
 button:not(.secondary):not(.link) { background: Highlight; color: HighlightText; border-color: Highlight; }
 button.secondary { background: ButtonFace; color: ButtonText; }

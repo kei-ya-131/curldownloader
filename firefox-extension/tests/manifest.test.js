@@ -8,12 +8,31 @@ const manifest = JSON.parse(fs.readFileSync(path.join(root, 'manifest.json'), 'u
 
 test('manifest declares the fixed Firefox identity and bridge permissions', () => {
   assert.equal(manifest.manifest_version, 2);
+  assert.equal(manifest.version, '0.1.2');
   assert.equal(manifest.applications.gecko.id, 'curl-downloader@kinkeil.local');
   assert.ok(manifest.permissions.includes('downloads'));
   assert.ok(manifest.permissions.includes('nativeMessaging'));
   assert.ok(manifest.permissions.includes('storage'));
   assert.equal(manifest.background.persistent, true);
   assert.ok(manifest.background.scripts.indexOf('core.js') < manifest.background.scripts.indexOf('background.js'));
+});
+
+test('settings exposes native host retry control', () => {
+  const settingsHtml = fs.readFileSync(path.join(root, 'settings.html'), 'utf8');
+  const settingsJs = fs.readFileSync(path.join(root, 'settings.js'), 'utf8');
+  const settingsCss = fs.readFileSync(path.join(root, 'settings.css'), 'utf8');
+  assert.match(settingsHtml, /id="retry-native"/);
+  assert.match(settingsHtml, /重試 Curl Downloader/);
+  assert.match(settingsJs, /get-defaults/);
+  assert.match(settingsJs, /retry-native/);
+  assert.match(settingsCss, /retry-native/);
+});
+test('documents GUI startup native host registration', () => {
+  const readme = fs.readFileSync(path.join(root, '..', 'README.md'), 'utf8');
+  const portableScript = fs.readFileSync(path.join(root, '..', 'scripts', 'package-portable.ps1'), 'utf8');
+  assert.match(readme, /GUI 啟動時會自動在 `HKCU/);
+  assert.match(readme, /重試 Curl Downloader/);
+  assert.match(portableScript, /GUI 啟動時會自動註冊 Firefox Native host/);
 });
 
 test('storage implementation has no password persistence path', () => {

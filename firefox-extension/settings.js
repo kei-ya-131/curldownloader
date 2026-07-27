@@ -7,6 +7,7 @@
   const statusElement = document.getElementById('status');
   const proxyFields = document.getElementById('proxy-fields');
   const submitButton = document.getElementById('submit-external');
+  const retryButton = document.getElementById('retry-native');
   let pending;
 
   function setStatus(message, kind) {
@@ -70,6 +71,38 @@
     await closeSettingsPage();
   }
 
+  async function loadNativeDefaults(manual) {
+    retryButton.hidden = !manual;
+    retryButton.disabled = true;
+    setStatus('正在等待 Curl Downloader…');
+    try {
+      const response = await browser.runtime.sendMessage({ type: 'get-defaults' });
+      if (response && response.ok) {
+        retryButton.hidden = true;
+        return response;
+      }
+      retryButton.hidden = false;
+      return response || {
+        ok: false,
+        error: 'Curl Downloader 未啟動或尚未註冊 Native host。'
+      };
+    } catch (_error) {
+      retryButton.hidden = false;
+      return {
+        ok: false,
+        error: 'Curl Downloader 未啟動或尚未註冊 Native host。'
+      };
+    } finally {
+      retryButton.disabled = false;
+    }
+  }
+
+  function applyNativeDefaults(response) {
+    if (response && response.ok && response.targetDir) {
+      document.getElementById('target-dir').value = response.targetDir;
+    }
+  }
+
   async function submitExternal(event) {
     event.preventDefault();
     const form = readForm();
@@ -107,7 +140,17 @@
     if (response && response.ok && response.targetDir) {
       document.getElementById('target-dir').value = response.targetDir;
     } else if (response && response.error) {
+      retryButton.hidden = false;
       setStatus(response.error, 'error');
+    }
+  });
+  retryButton.addEventListener('click', async () => {
+    const response = await loadNativeDefaults(true);
+    if (response && response.ok) {
+      applyNativeDefaults(response);
+      setStatus('已連線到 Curl Downloader；原 Firefox 下載目前保持暫停，請選擇處理方式。');
+    } else {
+      setStatus(`${response && response.error ? response.error : 'Curl Downloader 未啟動或尚未註冊 Native host。'}；啟動後再按「重試」。`, 'error');
     }
   });
   formElement.addEventListener('submit', submitExternal);
@@ -125,18 +168,13 @@
         throw new Error('找不到下載項目。');
       }
       const defaults = await CurlExtensionStorage.loadDefaults();
-      let nativeDefaults = { targetDir: '' };
-      try {
-        nativeDefaults = await browser.runtime.sendMessage({ type: 'get-defaults' });
-      } catch (_error) {
-        // The form remains usable with the saved extension default.
-      }
+      const nativeDefaults = await loadNativeDefaults(false);
       fillForm({
         ...pending.download,
         targetDir: pending.download.targetDir || (nativeDefaults && nativeDefaults.targetDir) || ''
       }, defaults);
       if (nativeDefaults && nativeDefaults.ok === false && nativeDefaults.error) {
-        setStatus(`${nativeDefaults.error}；請先註冊 Native host。`, 'error');
+        setStatus(`${nativeDefaults.error}；請先啟動 Curl Downloader，完成註冊後按「重試」。`, 'error');
       } else {
         setStatus('原 Firefox 下載目前保持暫停，請選擇處理方式。');
       }
