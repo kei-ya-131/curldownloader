@@ -50,9 +50,24 @@
     };
   }
 
+  async function closeSettingsPage() {
+    try {
+      if (browser.tabs && browser.tabs.getCurrent && browser.tabs.remove) {
+        const tab = await browser.tabs.getCurrent();
+        if (tab && tab.id !== undefined) {
+          await browser.tabs.remove(tab.id);
+          return;
+        }
+      }
+    } catch (_error) {
+      // Fall back to closing the extension page below.
+    }
+    window.close();
+  }
+
   async function restoreFirefox() {
     await browser.runtime.sendMessage({ type: 'restore-firefox', downloadId });
-    window.close();
+    await closeSettingsPage();
   }
 
   async function submitExternal(event) {
@@ -67,11 +82,17 @@
     try {
       const response = await browser.runtime.sendMessage({ type: 'submit-external', downloadId, form });
       if (!response || !response.ok) {
-        throw new Error(response && response.error ? response.error : 'Native host 未能接收任務');
+        const message = response && response.error ? response.error : 'Native host 未能接收任務';
+        if (!message.startsWith('Native host')) {
+          throw new Error(message);
+        }
+        setStatus(`${message} 正在關閉設定頁…`, 'error');
+        setTimeout(() => { void closeSettingsPage(); }, 700);
+        return;
       }
       await CurlExtensionStorage.saveDefaults(form);
       setStatus('已交給 Curl Downloader。', 'success');
-      window.close();
+      await closeSettingsPage();
     } catch (error) {
       submitButton.disabled = false;
       setStatus(error.message || '提交失敗，已恢復 Firefox 下載。', 'error');
@@ -85,6 +106,8 @@
     const response = await browser.runtime.sendMessage({ type: 'pick-folder', downloadId });
     if (response && response.ok && response.targetDir) {
       document.getElementById('target-dir').value = response.targetDir;
+    } else if (response && response.error) {
+      setStatus(response.error, 'error');
     }
   });
   formElement.addEventListener('submit', submitExternal);
@@ -112,7 +135,11 @@
         ...pending.download,
         targetDir: pending.download.targetDir || (nativeDefaults && nativeDefaults.targetDir) || ''
       }, defaults);
-      setStatus('原 Firefox 下載目前保持暫停，請選擇處理方式。');
+      if (nativeDefaults && nativeDefaults.ok === false && nativeDefaults.error) {
+        setStatus(`${nativeDefaults.error}；請先註冊 Native host。`, 'error');
+      } else {
+        setStatus('原 Firefox 下載目前保持暫停，請選擇處理方式。');
+      }
     } catch (error) {
       setStatus(error.message || '讀取下載資料失敗。', 'error');
       formElement.querySelectorAll('input, select, button').forEach((field) => { field.disabled = true; });

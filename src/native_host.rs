@@ -9,6 +9,16 @@ use std::{
 
 pub const NATIVE_HOST_FLAG: &str = "--native-messaging-host";
 
+pub fn is_native_host_invocation(arguments: &[OsString]) -> bool {
+    arguments
+        .iter()
+        .any(|argument| argument == NATIVE_HOST_FLAG)
+        || (arguments.len() >= 2
+            && Path::new(&arguments[0])
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("json")))
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub struct LaunchPlan {
     pub program: PathBuf,
@@ -172,6 +182,23 @@ mod tests {
         let invalid_data = io::Error::new(io::ErrorKind::InvalidData, "bad response");
         assert!(should_start_gui(&not_found));
         assert!(!should_start_gui(&invalid_data));
+    }
+
+    #[test]
+    fn detects_firefox_native_host_arguments_without_custom_flag() {
+        let firefox_arguments = vec![
+            OsString::from(r"C:\Users\test\curl_downloader.json"),
+            OsString::from("curl-downloader@kinkeil.local"),
+        ];
+        assert!(is_native_host_invocation(&firefox_arguments));
+        assert!(is_native_host_invocation(&[OsString::from(
+            NATIVE_HOST_FLAG
+        )]));
+        assert!(!is_native_host_invocation(&[]));
+        assert!(!is_native_host_invocation(&[
+            OsString::from("--unexpected"),
+            OsString::from("argument")
+        ]));
     }
 
     #[test]

@@ -63,6 +63,10 @@ powershell -ExecutionPolicy Bypass -File scripts\package-firefox-extension.ps1 `
   -OutputPath "$PWD\dist\curl-downloader.xpi"
 ```
 
+Firefox extension 本身不能寫入 Windows Registry 或任意啟動未註冊的 EXE；
+`-ExecutablePath` 就是 Native host 使用的 Curl Downloader 位置。若 EXE 被移動，
+請以新位置重新執行上面的 Native host 安裝指令，再重新啟動 Firefox。
+
 在 Firefox 的 `about:addons` 使用「從檔案安裝附加元件」載入 XPI，並在附加元件設定中允許「在私人視窗中執行」。首次由 extension 取得預設目錄或提交下載時，Native host 會以目前的 EXE 路徑自動啟動 Curl Downloader；GUI 已開啟時不會建立第二個視窗。
 
 若 Native host、GUI 或設定頁提交失敗，extension 會恢復原 Firefox 下載；若 Firefox 不接受 resume，會以一次性管理標記重新建立 fallback 下載，避免 fallback 再次進入攔截流程。若關閉設定頁而未提交，也會恢復 Firefox 下載。

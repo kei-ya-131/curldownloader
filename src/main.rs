@@ -3,7 +3,8 @@
 use curl_downloader::{app::CurlDownloaderApp, native_host, single_instance};
 
 fn main() -> eframe::Result {
-    if std::env::args_os().any(|argument| argument == native_host::NATIVE_HOST_FLAG) {
+    let arguments: Vec<_> = std::env::args_os().skip(1).collect();
+    if native_host::is_native_host_invocation(&arguments) {
         if let Err(error) = native_host::run_native_host() {
             eprintln!("Native Messaging host error: {error}");
         }
