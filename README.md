@@ -71,6 +71,9 @@ powershell -ExecutionPolicy Bypass -File scripts\package-firefox-extension.ps1 `
 Firefox extension 本身不能寫入 Windows Registry 或任意啟動未註冊的 EXE；因此首次使用前必須先直接啟動一次 Curl Downloader GUI。完成第一次註冊後，Firefox Native host 可以按 manifest 啟動目前註冊的 EXE；若 GUI 已開啟則不會建立第二個視窗。若 EXE 被移動，重新啟動新位置的 GUI 即可更新 HKCU 註冊資料。
 
 在 Firefox 的 `about:addons` 使用「從檔案安裝附加元件」載入 XPI，並在附加元件設定中允許「在私人視窗中執行」。若設定頁顯示 Native host 未啟動或尚未註冊，啟動 Curl Downloader 完成註冊後按「重試 Curl Downloader」；成功後會保留目前下載的檔名、目錄及 Proxy 欄位供提交。
+點擊工具列上的 Curl Downloader 圖示會開啟任務 popup：進行中的任務全部顯示，並列出最近完成的 10 筆。每筆會簡要顯示檔名、狀態、進度／已下載大小、速度／ETA 及目標目錄；已完成且檔案存在時可按「開啟檔案」，目標目錄存在時可按「開啟資料夾」。點擊任務卡會還原並聚焦 Curl Downloader，直接選取該任務。popup 開啟期間每秒刷新一次，關閉後停止刷新。
+
+當 Firefox Native host 因插件請求自動啟動 Curl Downloader 時，GUI 會以最小化狀態啟動；由使用者直接雙擊 `CurlDownloader.exe` 啟動時則維持正常視窗。
 
 若 Native host、GUI 或設定頁提交失敗，extension 會恢復原 Firefox 下載；若 Firefox 不接受 resume，會以一次性管理標記重新建立 fallback 下載，避免 fallback 再次進入攔截流程。若關閉設定頁而未提交，也會恢復 Firefox 下載。
 

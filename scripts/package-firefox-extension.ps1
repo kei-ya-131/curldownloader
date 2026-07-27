@@ -1,4 +1,4 @@
-﻿[CmdletBinding()]
+[CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$OutputPath
 )
@@ -13,7 +13,10 @@ $runtimeFiles = @(
     'background.js',
     'settings.html',
     'settings.css',
-    'settings.js'
+    'settings.js',
+    'popup.html',
+    'popup.css',
+    'popup.js'
 )
 $absoluteOutput = [IO.Path]::GetFullPath($OutputPath)
 $outputDirectory = Split-Path -Parent $absoluteOutput

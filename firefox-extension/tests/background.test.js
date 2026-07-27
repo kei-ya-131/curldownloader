@@ -207,7 +207,19 @@ test('task controls bridge list, show, file, and folder actions', async () => {
         return {
           type: 'task_list',
           request_id: message.request_id,
-          tasks: [{ task_id: 7, filename: 'file.zip', status: 'downloading' }]
+          tasks: [{
+            task_id: 7,
+            filename: 'file.zip',
+            status: 'downloading',
+            downloaded: 512,
+            total_size: 1024,
+            current_bps: 128,
+            average_bps: 64,
+            eta_seconds: 4,
+            target_dir: 'C:\Downloads',
+            file_available: false,
+            folder_available: true
+          }]
         };
       }
       return { type: 'action_result', request_id: message.request_id, ok: true, error: null };
@@ -218,6 +230,9 @@ test('task controls bridge list, show, file, and folder actions', async () => {
   const list = await background.handleRuntimeMessage({ type: 'get-task-summary' });
   assert.equal(list.ok, true);
   assert.equal(list.tasks[0].task_id, 7);
+  assert.equal(list.tasks[0].downloaded, 512);
+  assert.equal(list.tasks[0].target_dir, 'C:\Downloads');
+  assert.equal(list.tasks[0].folder_available, true);
   for (const type of ['show-task', 'open-file', 'open-folder']) {
     const result = await background.handleRuntimeMessage({ type, taskId: 7 });
     assert.equal(result.ok, true);

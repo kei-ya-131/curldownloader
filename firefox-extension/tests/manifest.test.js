@@ -49,4 +49,6 @@ test('native host installation and XPI packaging scripts are present', () => {
   assert.match(installScript, /curl-downloader@kinkeil\.local/);
   assert.match(installScript, /allowed_extensions/);
   assert.match(packageScript, /Compress-Archive/);
+  assert.match(packageScript, /'popup\.html'/);
+  assert.match(packageScript, /'popup\.js'/);
 });
