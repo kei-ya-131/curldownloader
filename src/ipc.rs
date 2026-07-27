@@ -1,4 +1,6 @@
-use crate::model::{ProxyProtocol, ProxySettings};
+use crate::model::{
+    ConfiguredTask, EngineCommand, ProxyProtocol, ProxySettings, TaskId, TaskSnapshot, TaskStatus,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     io::{self, Read, Write},
@@ -12,10 +14,79 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::model::{ConfiguredTask, EngineCommand};
-
 pub const MAX_FRAME_BYTES: usize = 64 * 1024;
 pub const PIPE_NAME: &str = r"\\.\pipe\curl-downloader-v1";
+#[derive(Clone, Debug, Serialize)]
+pub struct WireTaskSummary {
+    pub task_id: TaskId,
+    pub filename: String,
+    pub status: String,
+    pub downloaded: u64,
+    pub total_size: Option<u64>,
+    pub current_bps: f64,
+    pub average_bps: f64,
+    pub eta_seconds: Option<u64>,
+    pub target_dir: String,
+    pub file_available: bool,
+    pub folder_available: bool,
+}
+
+pub fn build_task_summaries(tasks: &[TaskSnapshot]) -> Vec<WireTaskSummary> {
+    let mut summaries = tasks
+        .iter()
+        .filter(|task| !matches!(task.status, TaskStatus::Completed | TaskStatus::Cancelled))
+        .map(task_summary)
+        .collect::<Vec<_>>();
+    let mut completed = tasks
+        .iter()
+        .filter(|task| task.status == TaskStatus::Completed)
+        .collect::<Vec<_>>();
+    completed.sort_by(|left, right| {
+        let left_key = (
+            left.completed_unix_ms.unwrap_or(left.created_unix_ms),
+            left.id,
+        );
+        let right_key = (
+            right.completed_unix_ms.unwrap_or(right.created_unix_ms),
+            right.id,
+        );
+        right_key.cmp(&left_key)
+    });
+    summaries.extend(completed.into_iter().take(10).map(task_summary));
+    summaries
+}
+
+fn task_summary(task: &TaskSnapshot) -> WireTaskSummary {
+    let target = task.target_dir.join(&task.filename);
+    WireTaskSummary {
+        task_id: task.id,
+        filename: task.filename.clone(),
+        status: wire_status_name(task.status).into(),
+        downloaded: task.downloaded,
+        total_size: task.total_size,
+        current_bps: task.current_bps,
+        average_bps: task.average_bps,
+        eta_seconds: task.eta_seconds,
+        target_dir: task.target_dir.to_string_lossy().into_owned(),
+        file_available: task.status == TaskStatus::Completed && target.is_file(),
+        folder_available: task.target_dir.is_dir(),
+    }
+}
+
+fn wire_status_name(status: TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Queued => "queued",
+        TaskStatus::Probing => "probing",
+        TaskStatus::Downloading => "downloading",
+        TaskStatus::Pausing => "pausing",
+        TaskStatus::Paused => "paused",
+        TaskStatus::NeedsProxyPassword => "needs_proxy_password",
+        TaskStatus::Finalizing => "finalizing",
+        TaskStatus::Completed => "completed",
+        TaskStatus::Failed => "failed",
+        TaskStatus::Cancelled => "cancelled",
+    }
+}
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -502,6 +573,10 @@ fn pipe_name_wide() -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{
+        CurlSource, DownloadTask, ProxyProtocol, ProxySnapshot, RangeSupport, TaskId, TaskSnapshot,
+        TaskStatus,
+    };
 
     #[test]
     fn frame_round_trip_handles_partial_reader() {
@@ -540,6 +615,91 @@ mod tests {
         );
     }
 
+    fn test_snapshot(
+        id: TaskId,
+        status: TaskStatus,
+        created_unix_ms: u64,
+        completed_unix_ms: Option<u64>,
+    ) -> TaskSnapshot {
+        TaskSnapshot {
+            id,
+            original_url: format!("https://example.test/{id}"),
+            effective_url: None,
+            filename: format!("file-{id}.bin"),
+            target_dir: PathBuf::from(format!(r"C:\Downloads\{id}")),
+            status,
+            requested_segments: 4,
+            actual_segments: 1,
+            downloaded: id * 10,
+            total_size: Some(1000),
+            range_support: RangeSupport::Unknown,
+            current_bps: 20.0,
+            average_bps: 10.0,
+            eta_seconds: Some(50),
+            active_millis: 100,
+            created_unix_ms,
+            proxy: ProxySnapshot {
+                enabled: false,
+                protocol: ProxyProtocol::Http,
+                host: String::new(),
+                port: 8080,
+                username: String::new(),
+                requires_password: false,
+            },
+            error: None,
+            curl_source: CurlSource::NotStarted,
+            completed_unix_ms,
+        }
+    }
+
+    #[test]
+    fn task_summary_keeps_all_incomplete_tasks_and_only_ten_completed_tasks() {
+        let mut tasks = vec![
+            test_snapshot(1, TaskStatus::Downloading, 1, None),
+            test_snapshot(2, TaskStatus::Paused, 2, None),
+            test_snapshot(3, TaskStatus::Cancelled, 3, None),
+        ];
+        tasks.extend(
+            (4..=15).map(|id| test_snapshot(id, TaskStatus::Completed, id, Some(id * 100))),
+        );
+
+        let summaries = build_task_summaries(&tasks);
+        assert!(summaries.iter().any(|task| task.status == "downloading"));
+        assert!(summaries.iter().any(|task| task.status == "paused"));
+        assert!(!summaries.iter().any(|task| task.task_id == 3));
+        let completed = summaries
+            .iter()
+            .filter(|task| task.status == "completed")
+            .collect::<Vec<_>>();
+        assert_eq!(completed.len(), 10);
+        assert_eq!(completed.first().unwrap().task_id, 15);
+        assert_eq!(completed.last().unwrap().task_id, 6);
+    }
+
+    #[test]
+    fn task_summary_does_not_expose_url_or_proxy_fields() {
+        let summary = build_task_summaries(&[test_snapshot(1, TaskStatus::Downloading, 1, None)])
+            .pop()
+            .unwrap();
+        let json = serde_json::to_value(summary).unwrap();
+        assert!(json.get("original_url").is_none());
+        assert!(json.get("proxy").is_none());
+        assert_eq!(json["status"], "downloading");
+    }
+
+    #[test]
+    fn old_download_state_without_completion_time_remains_loadable() {
+        let mut json = serde_json::to_value(DownloadTask::new(
+            1,
+            "https://example.test/file.bin",
+            "file.bin".into(),
+            PathBuf::from(r"C:\Downloads"),
+        ))
+        .unwrap();
+        json.as_object_mut().unwrap().remove("completed_unix_ms");
+        let task: DownloadTask = serde_json::from_value(json).unwrap();
+        assert_eq!(task.completed_unix_ms, None);
+    }
     struct ChunkedReader {
         bytes: Vec<u8>,
         offset: usize,

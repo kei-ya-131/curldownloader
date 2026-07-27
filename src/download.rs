@@ -1288,6 +1288,7 @@ impl Engine {
         if let Some(task) = self.task_mut(id) {
             task.proxy.clear_password();
             task.last_error = None;
+            task.completed_unix_ms = Some(current_unix_ms());
             task.status = TaskStatus::Completed;
         }
         let _ = self.persist();
@@ -1400,6 +1401,8 @@ impl Engine {
                     average_bps: meter.map(ProgressMeter::average_bps).unwrap_or(0.0),
                     eta_seconds: meter.and_then(|meter| meter.eta_seconds(task.total_size)),
                     active_millis: task.active_millis,
+                    created_unix_ms: task.created_unix_ms,
+                    completed_unix_ms: task.completed_unix_ms,
                     proxy: ProxySnapshot {
                         enabled: task.proxy.enabled,
                         protocol: task.proxy.protocol,

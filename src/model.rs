@@ -194,6 +194,8 @@ pub struct DownloadTask {
     pub segments: Vec<SegmentState>,
     pub active_millis: u64,
     pub created_unix_ms: u64,
+    #[serde(default)]
+    pub completed_unix_ms: Option<u64>,
     pub last_error: Option<TaskError>,
 }
 
@@ -216,6 +218,7 @@ impl DownloadTask {
             segments: Vec::new(),
             active_millis: 0,
             created_unix_ms: 0,
+            completed_unix_ms: None,
             last_error: None,
         }
     }
@@ -281,6 +284,8 @@ pub struct TaskSnapshot {
     pub average_bps: f64,
     pub eta_seconds: Option<u64>,
     pub active_millis: u64,
+    pub created_unix_ms: u64,
+    pub completed_unix_ms: Option<u64>,
     pub proxy: ProxySnapshot,
     pub error: Option<TaskError>,
     pub curl_source: CurlSource,
