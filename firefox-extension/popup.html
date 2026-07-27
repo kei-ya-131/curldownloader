@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Curl Downloader</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <main class="popup">
+    <header class="popup-header">
+      <div>
+        <p class="eyebrow">CURL DOWNLOADER</p>
+        <h1>下載任務</h1>
+      </div>
+      <span id="connection-status" class="connection" role="status">正在連線…</span>
+    </header>
+    <p id="error" class="error" role="alert" hidden></p>
+
+    <section aria-labelledby="active-heading">
+      <div class="section-heading">
+        <h2 id="active-heading">進行中</h2>
+        <span id="active-count" class="count">0</span>
+      </div>
+      <div id="active-tasks" class="task-list" aria-live="polite"></div>
+    </section>
+
+    <section aria-labelledby="completed-heading">
+      <div class="section-heading">
+        <h2 id="completed-heading">最近完成</h2>
+        <span id="completed-count" class="count">0</span>
+      </div>
+      <div id="completed-tasks" class="task-list" aria-live="polite"></div>
+    </section>
+  </main>
+  <script src="popup.js"></script>
+</body>
+</html>

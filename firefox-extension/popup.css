@@ -1,0 +1,71 @@
+:root {
+  color-scheme: light dark;
+  font: message-box;
+  background: Canvas;
+  color: CanvasText;
+}
+
+body {
+  margin: 0;
+  min-width: 27rem;
+  max-width: 34rem;
+  background: color-mix(in srgb, Canvas 92%, Highlight 8%);
+}
+
+.popup { padding: 1rem; }
+.popup-header, .section-heading, .task-main, .task-meta, .task-actions {
+  display: flex;
+  align-items: center;
+}
+.popup-header, .section-heading { justify-content: space-between; }
+.eyebrow {
+  margin: 0;
+  color: Highlight;
+  font-size: .68rem;
+  letter-spacing: .12em;
+  font-weight: 700;
+}
+h1 { margin: .15rem 0 0; font-size: 1.3rem; }
+h2 { margin: 1rem 0 .45rem; font-size: .95rem; }
+.connection { color: GrayText; font-size: .78rem; }
+.connection.ready { color: #218739; }
+.connection.offline { color: #d23b3b; }
+.error {
+  margin: .75rem 0;
+  padding: .55rem .7rem;
+  border: 1px solid #d23b3b;
+  border-radius: .45rem;
+  color: #d23b3b;
+}
+.count {
+  min-width: 1.4rem;
+  padding: .12rem .4rem;
+  border-radius: 1rem;
+  background: color-mix(in srgb, Highlight 18%, Canvas);
+  color: Highlight;
+  text-align: center;
+  font-size: .75rem;
+}
+.task-list { display: grid; gap: .55rem; }
+.task-card {
+  padding: .7rem;
+  border: 1px solid ButtonShadow;
+  border-radius: .55rem;
+  background: Canvas;
+  cursor: pointer;
+}
+.task-card:hover, .task-card:focus-visible {
+  border-color: Highlight;
+  outline: 2px solid color-mix(in srgb, Highlight 35%, transparent);
+}
+.task-main { gap: .5rem; justify-content: space-between; }
+.filename { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 650; }
+.status { flex: 0 0 auto; color: GrayText; font-size: .78rem; }
+.progress-track { height: .35rem; margin: .55rem 0; overflow: hidden; border-radius: 1rem; background: ButtonFace; }
+.progress-fill { height: 100%; border-radius: inherit; background: Highlight; }
+.task-meta { gap: .65rem; color: GrayText; font-size: .76rem; flex-wrap: wrap; }
+.target { margin-top: .35rem; overflow: hidden; color: GrayText; font-size: .72rem; text-overflow: ellipsis; white-space: nowrap; }
+.task-actions { gap: .4rem; margin-top: .55rem; }
+button { min-height: 1.8rem; padding: .25rem .55rem; border: 1px solid ButtonShadow; border-radius: .35rem; background: ButtonFace; color: ButtonText; cursor: pointer; font: inherit; font-size: .75rem; }
+button:hover { border-color: Highlight; }
+.empty { margin: .2rem 0 .7rem; color: GrayText; font-size: .8rem; }

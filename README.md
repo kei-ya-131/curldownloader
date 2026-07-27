@@ -36,15 +36,83 @@ powershell -ExecutionPolicy Bypass -File scripts/build-release-gnu.ps1
 
 Windows 下載時只會在背景啟動隱藏的 curl 子程序，不會顯示 CMD 控制台視窗。
 
+## Firefox extension
+
+Firefox extension 會攔截 HTTP/HTTPS 下載，先暫停原下載並開啟設定頁。設定頁可填寫下載名稱、Windows 絕對目錄，以及 HTTP、HTTPS、SOCKS5 或 SOCKS5H Proxy 的主機、連接埠、帳號及密碼；按「交給 Curl Downloader」後，只有當 Native host 回報任務成功，才會取消並清理原 Firefox 下載。「使用 Firefox」會恢復原生下載；「取消」會取消並清理該 Firefox 下載。
+
+正常使用流程（包括 Portable Firefox ESR）：
+1. 首次使用前，直接啟動 `CurlDownloader.exe` 一次。GUI 啟動時會自動在 `HKCU\Software\Mozilla\NativeMessagingHosts\curl_downloader` 建立或更新 Native host manifest，路徑會指向目前這份 EXE；不需要手動開啟 regedit。
+2. 在 Firefox 的 `about:addons` 使用「從檔案安裝附加元件」載入 XPI，並在附加元件設定中允許「在私人視窗中執行」。
+3. 若下載設定頁顯示 Native host 未啟動或尚未註冊，啟動 Curl Downloader 完成註冊後，回到原設定頁按「重試 Curl Downloader」。
+
+如需手動修復註冊（或在卸載前清理設定），可使用目前使用者權限執行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install-firefox-native-host.ps1 `
+  -ExecutablePath "$PWD\dist\CurlDownloader.exe"
+```
+
+Portable Firefox ESR 注意：Native host 仍是註冊到目前 Windows 使用者的
+`HKCU\Software\Mozilla\NativeMessagingHosts\curl_downloader`，不需要把 manifest
+複製到 Portable Firefox 目錄。若點擊下載時先出現 Firefox 原生「選擇下載檔案位置」
+對話框，請在同一個 Portable Firefox profile 開啟 `about:preferences` → 一般 →
+檔案與應用程式 → 下載，關閉「總是詢問儲存檔案的位置」；亦可在 `about:config`
+將 `browser.download.useDownloadDir` 設為 `true`，然後重新啟動 Portable Firefox。
+Firefox 的原生對話框會在 `downloads.onCreated` 之前出現，WebExtension 無法在該
+對話框已開啟後取消它。
+
+打包 extension：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\package-firefox-extension.ps1 `
+  -OutputPath "$PWD\dist\curl-downloader.xpi"
+```
+
+Firefox extension 本身不能寫入 Windows Registry 或任意啟動未註冊的 EXE；因此首次使用前必須先直接啟動一次 Curl Downloader GUI。完成第一次註冊後，Firefox Native host 可以按 manifest 啟動目前註冊的 EXE；若 GUI 已開啟則不會建立第二個視窗。若 EXE 被移動，重新啟動新位置的 GUI 即可更新 HKCU 註冊資料。
+
+在 Firefox 的 `about:addons` 使用「從檔案安裝附加元件」載入 XPI，並在附加元件設定中允許「在私人視窗中執行」。若設定頁顯示 Native host 未啟動或尚未註冊，啟動 Curl Downloader 完成註冊後按「重試 Curl Downloader」；成功後會保留目前下載的檔名、目錄及 Proxy 欄位供提交。
+點擊工具列上的 Curl Downloader 圖示會開啟任務 popup：進行中的任務全部顯示，並列出最近完成的 10 筆。每筆會簡要顯示檔名、狀態、進度／已下載大小、速度／ETA 及目標目錄；已完成且檔案存在時可按「開啟檔案」，目標目錄存在時可按「開啟資料夾」。點擊任務卡會還原並聚焦 Curl Downloader，直接選取該任務。popup 開啟期間每秒刷新一次，關閉後停止刷新。
+
+當 Firefox Native host 因插件請求自動啟動 Curl Downloader 時，GUI 會以最小化狀態啟動；由使用者直接雙擊 `CurlDownloader.exe` 啟動時則維持正常視窗。
+
+若 Native host、GUI 或設定頁提交失敗，extension 會恢復原 Firefox 下載；若 Firefox 不接受 resume，會以一次性管理標記重新建立 fallback 下載，避免 fallback 再次進入攔截流程。若關閉設定頁而未提交，也會恢復 Firefox 下載。
+
+extension storage 只保存目錄及非秘密 Proxy 預設值。Proxy 密碼只存在設定頁記憶體、Native Messaging pipe 及本次 curl 工作流，不會寫入 extension storage、`state.json` 或診斷輸出。私人視窗下載的任務資料會按既定流程交給 GUI，引擎狀態一般模式使用 `%APPDATA%\CurlDownloader\state.json`，portable 模式使用 portable 目錄內的 `data\state.json`。
+
+卸載 Native host（只移除本工具建立的 per-user registry key 及 manifest）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install-firefox-native-host.ps1 `
+  -ExecutablePath "$PWD\dist\CurlDownloader.exe" -Uninstall
+```
+
 程式啟動下載時會先從 PATH 尋找本機 `curl.exe`，並以 `curl.exe --version` 確認可以執行；找不到或無法啟動時，才會使用內嵌且經 SHA-256 驗證的 curl。程式只在第一次真正開始下載時選擇及驗證 curl；啟動程式、瀏覽歷史或新增待確認任務都不會建立內置 curl runtime。任務面板會顯示「尚未啟動」、「本機 curl」或「內置 curl」。若 curl 啟動失敗，可在任務的「詳細診斷」查看已清理 Proxy 憑證的作業系統／curl 錯誤。
 
 ## Proxy
 
 每個任務可獨立設定 HTTP、HTTPS、SOCKS5 或 SOCKS5H Proxy。Proxy 密碼只在記憶體與 curl stdin 設定流中使用，不保存至 state.json；程式重啟後會要求重新輸入。
 
+## Portable 發行版
+
+建立 portable 發行目錄（需要先完成 `dist\CurlDownloader.exe` 及 `dist\curl-downloader.xpi`）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\package-portable.ps1 `
+  -OutputDirectory "$PWD\dist\CurlDownloaderPortable"
+```
+
+portable 目錄包含 `CurlDownloader.exe`、extension XPI、`portable.flag` 及啟動腳本；狀態會保存到 portable 目錄內的 `data\state.json`，不會寫入 `%APPDATA%`。可選擇直接啟動程式，或指定 Portable Firefox launcher：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Start-CurlDownloader-Portable.ps1 `
+  -FirefoxExecutablePath "C:\Tools\FirefoxPortable\FirefoxPortable.exe"
+```
+
+Firefox Windows Native Messaging 的官方發現機制仍要求 `HKCU\Software\Mozilla\NativeMessagingHosts\curl_downloader` Registry key；WebExtension 不能自行啟動未註冊的 EXE。portable 套件的正常流程是直接啟動 `CurlDownloader.exe`，由 GUI 自動建立或更新上述 per-user 設定；`Install-Firefox-Native-Host.ps1` 仍會隨套件提供，供手動修復或卸載。這是 Firefox 平台限制，不能只靠 `policies.json` 或把 manifest 放入 Portable Firefox 目錄來繞過。
+
 ## Data locations
 
-- 設定與任務狀態：`%APPDATA%\CurlDownloader\state.json`
+- 設定與任務狀態：一般模式為 `%APPDATA%\CurlDownloader\state.json`；portable 模式為 portable 目錄內的 `data\state.json`
 - 下載部分檔：目的地內的 `.curl-downloader` 目錄
 
 ## Limits

@@ -1,4 +1,4 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 
 Set-Location (Join-Path $PSScriptRoot '..')
 $toolchain = 'stable-x86_64-pc-windows-gnu'

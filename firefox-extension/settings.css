@@ -1,0 +1,84 @@
+:root {
+  color-scheme: light dark;
+  font: message-box;
+  background: Canvas;
+  color: CanvasText;
+}
+
+body {
+  margin: 0;
+  min-width: 34rem;
+  background: color-mix(in srgb, Canvas 92%, Highlight 8%);
+}
+
+.card {
+  max-width: 44rem;
+  margin: 2rem auto;
+  padding: 2rem;
+  border: 1px solid ButtonShadow;
+  border-radius: 1rem;
+  background: Canvas;
+  box-shadow: 0 1rem 3rem color-mix(in srgb, CanvasText 18%, transparent);
+}
+
+.eyebrow {
+  margin: 0;
+  color: Highlight;
+  font-size: .75rem;
+  letter-spacing: .12em;
+  font-weight: 700;
+}
+
+h1 { margin: .35rem 0 .75rem; }
+
+.status {
+  min-height: 1.25rem;
+  margin: 0 0 1.25rem;
+  color: GrayText;
+}
+
+.status.error { color: #d23b3b; }
+.status.success { color: #218739; }
+
+label, legend { font-weight: 600; }
+label { display: block; margin: 1rem 0; }
+
+input, select, button {
+  box-sizing: border-box;
+  min-height: 2.35rem;
+  border-radius: .45rem;
+  font: inherit;
+}
+
+input, select {
+  width: 100%;
+  margin-top: .35rem;
+  padding: .45rem .6rem;
+  border: 1px solid ButtonShadow;
+  background: Field;
+  color: FieldText;
+}
+
+input[readonly] { color: GrayText; }
+
+fieldset {
+  margin: 1.5rem 0;
+  padding: 0 1rem 1rem;
+  border: 1px solid ButtonShadow;
+  border-radius: .65rem;
+}
+
+.checkbox { display: flex; gap: .5rem; align-items: center; }
+.checkbox input { width: auto; min-height: auto; margin: 0; }
+.proxy-fields[aria-disabled="true"] { opacity: .58; }
+.path-row { display: flex; gap: .5rem; }
+.path-row input { flex: 1; }
+.path-row button { flex: 0 0 auto; }
+
+.actions { display: flex; gap: .65rem; align-items: center; flex-wrap: wrap; }
+#retry-native { min-width: 9rem; }
+button { padding: .45rem .85rem; border: 1px solid ButtonShadow; cursor: pointer; }
+button:not(.secondary):not(.link) { background: Highlight; color: HighlightText; border-color: Highlight; }
+button.secondary { background: ButtonFace; color: ButtonText; }
+button.link { border-color: transparent; background: transparent; color: LinkText; }
+button:disabled { cursor: wait; opacity: .6; }

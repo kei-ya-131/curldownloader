@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Curl Downloader 設定下載</title>
+  <link rel="stylesheet" href="settings.css">
+</head>
+<body>
+  <main class="card">
+    <header>
+      <p class="eyebrow">CURL DOWNLOADER</p>
+      <h1>設定這次下載</h1>
+      <p id="status" class="status" role="status">正在讀取下載資料…</p>
+    </header>
+
+    <form id="download-form">
+      <label>來源 URL
+        <input id="url" type="url" readonly>
+      </label>
+      <label>下載名稱
+        <input id="filename" type="text" required autocomplete="off">
+      </label>
+      <label>絕對下載目錄
+        <span class="path-row">
+          <input id="target-dir" type="text" required placeholder="例如 C:\\Downloads" autocomplete="off">
+          <button id="browse" type="button" class="secondary">瀏覽…</button>
+        </span>
+      </label>
+
+      <fieldset>
+        <legend>Proxy</legend>
+        <label class="checkbox"><input id="proxy-enabled" type="checkbox"> 啟用 Proxy</label>
+        <div id="proxy-fields" class="proxy-fields" aria-disabled="true">
+          <label>類型
+            <select id="proxy-protocol">
+              <option value="http">HTTP</option>
+              <option value="https">HTTPS</option>
+              <option value="socks5">SOCKS5</option>
+              <option value="socks5h">SOCKS5H</option>
+            </select>
+          </label>
+          <label>主機
+            <input id="proxy-host" type="text" autocomplete="off">
+          </label>
+          <label>連接埠
+            <input id="proxy-port" type="number" min="1" max="65535" inputmode="numeric">
+          </label>
+          <label>帳號（可選）
+            <input id="proxy-username" type="text" autocomplete="off">
+          </label>
+          <label>密碼（只在本次請求使用）
+            <input id="proxy-password" type="password" autocomplete="new-password">
+          </label>
+        </div>
+      </fieldset>
+
+      <div class="actions">
+        <button id="retry-native" type="button" class="secondary" hidden>重試 Curl Downloader</button>
+        <button id="submit-external" type="submit">交給 Curl Downloader</button>
+        <button id="use-firefox" type="button" class="secondary">使用 Firefox</button>
+        <button id="cancel" type="button" class="link">取消</button>
+      </div>
+    </form>
+  </main>
+  <script src="core.js"></script>
+  <script src="storage.js"></script>
+  <script src="settings.js"></script>
+</body>
+</html>

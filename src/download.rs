@@ -357,6 +357,16 @@ impl Engine {
                     self.add_task(task);
                 }
             }
+            EngineCommand::AddConfigured { task, response } => {
+                let result = self.add_configured_task(task);
+                let should_start = result.is_ok();
+                let _ = response.send(result);
+                if should_start {
+                    if let Some(id) = self.tasks.last().map(|task| task.id) {
+                        self.request_start(id);
+                    }
+                }
+            }
             EngineCommand::Start(id) => self.request_start(id),
             EngineCommand::Pause(id) => self.pause_task(id),
             EngineCommand::Cancel(id) => self.cancel_task(id),
@@ -448,6 +458,36 @@ impl Engine {
         self.tasks.push(task);
         let _ = self.persist();
         self.publish_snapshot();
+    }
+
+    fn add_configured_task(&mut self, new_task: ConfiguredTask) -> Result<TaskId, String> {
+        let parsed = url::Url::parse(&new_task.url).map_err(|_| "網址格式無效".to_owned())?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err("只支援 HTTP 或 HTTPS 網址".into());
+        }
+        let target_dir = new_task.target_dir.clone();
+        if !new_task.target_dir.is_dir() {
+            return Err("下載目錄不存在或無法存取".into());
+        }
+        new_task.proxy.validate()?;
+
+        let id = self.settings.next_task_id;
+        let filename = filename::sanitize_filename(&new_task.filename, id);
+        let mut task = DownloadTask::new(id, &new_task.url, filename, new_task.target_dir);
+        task.requested_segments = new_task.requested_segments.clamp(1, 8);
+        task.proxy = new_task.proxy;
+        task.created_unix_ms = current_unix_ms();
+        fs::create_dir_all(storage::task_work_dir(&task))
+            .map_err(|error| format!("無法建立下載工作目錄：{error}"))?;
+
+        self.settings.next_task_id = self.settings.next_task_id.saturating_add(1);
+        let id = task.id;
+        self.tasks.push(task);
+        self.settings.last_download_dir = target_dir;
+        self.persist()
+            .map_err(|error| format!("無法保存下載任務：{error}"))?;
+        self.publish_snapshot();
+        Ok(id)
     }
 
     fn update_draft(
@@ -1248,6 +1288,7 @@ impl Engine {
         if let Some(task) = self.task_mut(id) {
             task.proxy.clear_password();
             task.last_error = None;
+            task.completed_unix_ms = Some(current_unix_ms());
             task.status = TaskStatus::Completed;
         }
         let _ = self.persist();
@@ -1360,6 +1401,8 @@ impl Engine {
                     average_bps: meter.map(ProgressMeter::average_bps).unwrap_or(0.0),
                     eta_seconds: meter.and_then(|meter| meter.eta_seconds(task.total_size)),
                     active_millis: task.active_millis,
+                    created_unix_ms: task.created_unix_ms,
+                    completed_unix_ms: task.completed_unix_ms,
                     proxy: ProxySnapshot {
                         enabled: task.proxy.enabled,
                         protocol: task.proxy.protocol,
