@@ -15,10 +15,10 @@ fn main() -> eframe::Result {
 }
 
 fn run_gui() -> eframe::Result {
-    if let Ok(executable) = std::env::current_exe() {
-        if let Err(error) = native_registration::ensure_registered(&executable) {
-            eprintln!("Firefox Native host 自動註冊失敗：{error}");
-        }
+    if let Ok(executable) = std::env::current_exe()
+        && let Err(error) = native_registration::ensure_registered(&executable)
+    {
+        eprintln!("Firefox Native host 自動註冊失敗：{error}");
     }
 
     let _instance = match single_instance::acquire() {
