@@ -14,6 +14,7 @@ test('manifest declares the fixed Firefox identity and bridge permissions', () =
   assert.ok(manifest.permissions.includes('nativeMessaging'));
   assert.ok(manifest.permissions.includes('storage'));
   assert.equal(manifest.background.persistent, true);
+  assert.equal(manifest.browser_action.default_popup, 'popup.html');
   assert.ok(manifest.background.scripts.indexOf('core.js') < manifest.background.scripts.indexOf('background.js'));
 });
 

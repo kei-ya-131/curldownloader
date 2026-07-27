@@ -22,6 +22,7 @@
     "persistent": true
   },
   "browser_action": {
-    "default_title": "Curl Downloader"
+    "default_title": "Curl Downloader",
+    "default_popup": "popup.html"
   }
 }
