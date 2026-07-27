@@ -368,7 +368,7 @@ let requestSequence = 0;
         return nativeUnavailable('Curl Downloader 未啟動或尚未註冊 Native host，無法開啟目錄選擇器。');
       }
     }
-    if (message.type === 'list-tasks') return listTasks();
+    if (message.type === 'get-task-summary') return listTasks();
     if (message.type === 'show-task' || message.type === 'open-file' || message.type === 'open-folder') {
       return sendTaskAction(message);
     }

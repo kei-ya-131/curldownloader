@@ -215,7 +215,7 @@ test('task controls bridge list, show, file, and folder actions', async () => {
   });
   const background = createBackground(fake.browser, { attempts: 1, delayMs: 0 });
 
-  const list = await background.handleRuntimeMessage({ type: 'list-tasks' });
+  const list = await background.handleRuntimeMessage({ type: 'get-task-summary' });
   assert.equal(list.ok, true);
   assert.equal(list.tasks[0].task_id, 7);
   for (const type of ['show-task', 'open-file', 'open-folder']) {
