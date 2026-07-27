@@ -85,6 +85,8 @@ pub struct CurlDownloaderApp {
     ipc_default_dir: Arc<Mutex<PathBuf>>,
     ipc_snapshots: ipc::SharedSnapshots,
     ipc_ui_receiver: Receiver<ipc::UiCommand>,
+    pending_show_task: Option<TaskId>,
+    start_minimized: bool,
     ipc_thread: Option<JoinHandle<()>>,
 }
 
@@ -109,7 +111,7 @@ struct BatchProxyDraft {
 }
 
 impl CurlDownloaderApp {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, start_minimized: bool) -> Self {
         let state_path = storage::state_path().unwrap_or_else(|_| {
             std::env::temp_dir()
                 .join("CurlDownloader")
@@ -195,6 +197,8 @@ impl CurlDownloaderApp {
             ipc_default_dir,
             ipc_snapshots,
             ipc_ui_receiver,
+            pending_show_task: None,
+            start_minimized,
             ipc_thread,
         }
     }
@@ -255,6 +259,22 @@ impl CurlDownloaderApp {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             }
+        }
+        while let Ok(command) = self.ipc_ui_receiver.try_recv() {
+            match command {
+                ipc::UiCommand::ShowTask { task_id } => {
+                    self.pending_show_task = Some(task_id);
+                }
+            }
+        }
+        if let Some(task_id) = self.pending_show_task
+            && let Some(selected) = resolve_show_task(&self.tasks, task_id)
+        {
+            self.selected = Some(selected);
+            self.draft = None;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            self.pending_show_task = None;
         }
     }
 
@@ -1008,9 +1028,20 @@ impl CurlDownloaderApp {
     }
 }
 
+fn resolve_show_task(tasks: &[TaskSnapshot], task_id: TaskId) -> Option<TaskId> {
+    tasks
+        .iter()
+        .find(|task| task.id == task_id)
+        .map(|task| task.id)
+}
+
 impl eframe::App for CurlDownloaderApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        if self.start_minimized {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            self.start_minimized = false;
+        }
         self.pump_events(&ctx);
         if ctx.input(|input| input.viewport().close_requested()) && !self.shutting_down {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -1446,5 +1477,44 @@ mod tests {
             format_batch_proxy_result(1, 1),
             "已設定 1 個任務，略過 1 個不可修改任務"
         );
+    }
+
+    #[test]
+    fn show_task_command_selects_existing_task_and_ignores_unknown_task() {
+        let tasks = vec![test_snapshot(7, TaskStatus::Downloading)];
+        assert_eq!(resolve_show_task(&tasks, 7), Some(7));
+        assert_eq!(resolve_show_task(&tasks, 999), None);
+    }
+
+    fn test_snapshot(id: TaskId, status: TaskStatus) -> TaskSnapshot {
+        TaskSnapshot {
+            id,
+            original_url: "https://example.test/file.bin".into(),
+            effective_url: None,
+            filename: "file.bin".into(),
+            target_dir: PathBuf::from("C:\\Downloads"),
+            status,
+            requested_segments: 1,
+            actual_segments: 1,
+            downloaded: 0,
+            total_size: None,
+            range_support: crate::model::RangeSupport::Unknown,
+            current_bps: 0.0,
+            average_bps: 0.0,
+            eta_seconds: None,
+            active_millis: 0,
+            created_unix_ms: 0,
+            completed_unix_ms: None,
+            proxy: crate::model::ProxySnapshot {
+                enabled: false,
+                protocol: ProxyProtocol::Http,
+                host: String::new(),
+                port: 8080,
+                username: String::new(),
+                requires_password: false,
+            },
+            error: None,
+            curl_source: CurlSource::NotStarted,
+        }
     }
 }

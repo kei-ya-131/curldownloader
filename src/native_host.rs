@@ -32,6 +32,13 @@ pub fn launch_plan(executable: &Path) -> LaunchPlan {
     }
 }
 
+pub fn minimized_launch_plan(executable: &Path) -> LaunchPlan {
+    LaunchPlan {
+        program: executable.to_path_buf(),
+        args: vec![OsString::from("--minimized")],
+    }
+}
+
 pub fn should_start_gui(connect_error: &io::Error) -> bool {
     if matches!(
         connect_error.kind(),
@@ -55,8 +62,12 @@ pub fn should_start_gui(connect_error: &io::Error) -> bool {
     }
 }
 
-pub fn launch_gui(executable: &Path) -> io::Result<Child> {
-    let plan = launch_plan(executable);
+pub fn launch_gui(executable: &Path, minimized: bool) -> io::Result<Child> {
+    let plan = if minimized {
+        minimized_launch_plan(executable)
+    } else {
+        launch_plan(executable)
+    };
     let mut command = Command::new(&plan.program);
     command
         .args(&plan.args)
@@ -118,7 +129,7 @@ fn forward_request(request: &IpcRequest) -> io::Result<IpcResponse> {
         Ok(response) => Ok(response),
         Err(error) if should_start_gui(&error) => {
             let executable = std::env::current_exe()?;
-            let _child = launch_gui(&executable)?;
+            let _child = launch_gui(&executable, true)?;
             ipc::call_pipe_with_retry(
                 request,
                 Duration::from_millis(100),
@@ -211,6 +222,18 @@ mod tests {
             PathBuf::from(r"C:\Program Files\CurlDownloader\CurlDownloader.exe")
         );
         assert!(plan.args.is_empty());
+    }
+
+    #[test]
+    fn minimized_launch_plan_marks_extension_started_gui() {
+        let plan = minimized_launch_plan(Path::new(
+            r"C:\Program Files\CurlDownloader\CurlDownloader.exe",
+        ));
+        assert_eq!(
+            plan.program,
+            PathBuf::from(r"C:\Program Files\CurlDownloader\CurlDownloader.exe")
+        );
+        assert_eq!(plan.args, vec![OsString::from("--minimized")]);
     }
 
     #[test]

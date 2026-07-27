@@ -11,10 +11,10 @@ fn main() -> eframe::Result {
         return Ok(());
     }
 
-    run_gui()
+    run_gui(arguments.iter().any(|argument| argument == "--minimized"))
 }
 
-fn run_gui() -> eframe::Result {
+fn run_gui(minimized: bool) -> eframe::Result {
     if let Ok(executable) = std::env::current_exe()
         && let Err(error) = native_registration::ensure_registered(&executable)
     {
@@ -39,6 +39,6 @@ fn run_gui() -> eframe::Result {
     eframe::run_native(
         "Curl Downloader",
         options,
-        Box::new(|cc| Ok(Box::new(CurlDownloaderApp::new(cc)))),
+        Box::new(move |cc| Ok(Box::new(CurlDownloaderApp::new(cc, minimized)))),
     )
 }
