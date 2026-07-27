@@ -181,3 +181,19 @@ test('pick-folder maps native directory to settings camelCase', async () => {
   assert.equal(result.ok, true);
   assert.equal(result.targetDir, 'D:\\Downloads');
 });
+
+test('cancel-download cancels and erases paused Firefox item', async () => {
+  const fake = makeFakeBrowser();
+  const background = createBackground(fake.browser, { attempts: 1, delayMs: 0 });
+  await background.handleCreatedDownload({
+    id: 7,
+    url: 'https://example.test/file.zip',
+    filename: 'file.zip'
+  });
+  const result = await background.handleRuntimeMessage({ type: 'cancel-download', downloadId: 7 });
+  assert.equal(result.ok, true);
+  assert.deepEqual(fake.calls.cancel, [7]);
+  assert.deepEqual(fake.calls.erase, [{ id: 7 }]);
+  const pending = await background.handleRuntimeMessage({ type: 'get-pending', downloadId: 7 });
+  assert.equal(pending.ok, false);
+});

@@ -190,6 +190,20 @@ let requestSequence = 0;
     }
   }
 
+  async function cancelFirefoxDownload(pending) {
+    try {
+      await browserApi.downloads.cancel(pending.downloadId);
+    } catch (_error) {
+      return { ok: false, error: 'Firefox 下載未能取消。' };
+    }
+    try {
+      await browserApi.downloads.erase({ id: pending.downloadId });
+    } catch (_error) {
+      // Cancellation succeeded; failure to erase history must not keep the task pending.
+    }
+    return { ok: true };
+  }
+
   async function handleCreatedDownload(download) {
     if (consumeManagedFallback(download)) return { ignored: true };
     if (!core.isSupportedDownloadUrl(download.url)) return { ignored: true };
@@ -288,6 +302,13 @@ let requestSequence = 0;
       pendingDownloads.delete(id);
       return result;
     }
+    if (message.type === 'cancel-download') {
+      const pending = pendingDownloads.get(id);
+      if (!pending) return { ok: false, error: '找不到下載項目。' };
+      const result = await cancelFirefoxDownload(pending);
+      if (result.ok) pendingDownloads.delete(id);
+      return result;
+    }
     if (message.type === 'pick-folder') {
       try {
         const response = await sendNativeWithRetry({ type: 'pick_folder' });
@@ -342,5 +363,3 @@ let requestSequence = 0;
     sendNativeWithRetry
   };
 });
-
-

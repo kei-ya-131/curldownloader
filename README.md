@@ -38,7 +38,7 @@ Windows 下載時只會在背景啟動隱藏的 curl 子程序，不會顯示 CM
 
 ## Firefox extension
 
-Firefox extension 會攔截 HTTP/HTTPS 下載，先暫停原下載並開啟設定頁。設定頁可填寫下載名稱、Windows 絕對目錄，以及 HTTP、HTTPS、SOCKS5 或 SOCKS5H Proxy 的主機、連接埠、帳號及密碼；按「交給 Curl Downloader」後，只有當 Native host 回報任務成功，才會取消並清理原 Firefox 下載。
+Firefox extension 會攔截 HTTP/HTTPS 下載，先暫停原下載並開啟設定頁。設定頁可填寫下載名稱、Windows 絕對目錄，以及 HTTP、HTTPS、SOCKS5 或 SOCKS5H Proxy 的主機、連接埠、帳號及密碼；按「交給 Curl Downloader」後，只有當 Native host 回報任務成功，才會取消並清理原 Firefox 下載。「使用 Firefox」會恢復原生下載；「取消」會取消並清理該 Firefox 下載。
 
 正常使用流程（包括 Portable Firefox ESR）：
 1. 首次使用前，直接啟動 `CurlDownloader.exe` 一次。GUI 啟動時會自動在 `HKCU\Software\Mozilla\NativeMessagingHosts\curl_downloader` 建立或更新 Native host manifest，路徑會指向目前這份 EXE；不需要手動開啟 regedit。

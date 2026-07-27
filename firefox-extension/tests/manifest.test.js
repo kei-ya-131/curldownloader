@@ -25,6 +25,7 @@ test('settings exposes native host retry control', () => {
   assert.match(settingsHtml, /重試 Curl Downloader/);
   assert.match(settingsJs, /get-defaults/);
   assert.match(settingsJs, /retry-native/);
+  assert.match(settingsJs, /cancel-download/);
   assert.match(settingsCss, /retry-native/);
 });
 test('documents GUI startup native host registration', () => {

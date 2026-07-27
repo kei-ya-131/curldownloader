@@ -8,6 +8,7 @@
   const proxyFields = document.getElementById('proxy-fields');
   const submitButton = document.getElementById('submit-external');
   const retryButton = document.getElementById('retry-native');
+  const cancelButton = document.getElementById('cancel');
   let pending;
 
   function setStatus(message, kind) {
@@ -69,6 +70,20 @@
   async function restoreFirefox() {
     await browser.runtime.sendMessage({ type: 'restore-firefox', downloadId });
     await closeSettingsPage();
+  }
+
+  async function cancelDownload() {
+    cancelButton.disabled = true;
+    try {
+      const response = await browser.runtime.sendMessage({ type: 'cancel-download', downloadId });
+      if (!response || !response.ok) {
+        throw new Error(response && response.error ? response.error : 'Firefox 下載未能取消。');
+      }
+      await closeSettingsPage();
+    } catch (error) {
+      cancelButton.disabled = false;
+      setStatus(error.message || 'Firefox 下載未能取消。', 'error');
+    }
   }
 
   async function loadNativeDefaults(manual) {
@@ -155,7 +170,7 @@
   });
   formElement.addEventListener('submit', submitExternal);
   document.getElementById('use-firefox').addEventListener('click', restoreFirefox);
-  document.getElementById('cancel').addEventListener('click', restoreFirefox);
+  cancelButton.addEventListener('click', cancelDownload);
 
   (async () => {
     if (!Number.isInteger(downloadId)) {
