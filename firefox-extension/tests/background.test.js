@@ -2,7 +2,12 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const createBackground = require('../background.js');
 
-function makeFakeBrowser({ resumeFails = false, nativeDisconnect = false } = {}) {
+function makeFakeBrowser({
+  resumeFails = false,
+  nativeDisconnect = false,
+  nativeFailuresBeforeSuccess = 0,
+  nativeResponse = null
+} = {}) {
   const events = {
     created: null,
     removed: null,
@@ -15,7 +20,8 @@ function makeFakeBrowser({ resumeFails = false, nativeDisconnect = false } = {})
     erase: [],
     download: [],
     tabs: [],
-    notifications: []
+    notifications: [],
+    nativeConnects: 0
   };
   const port = {
     messages: [],
@@ -25,6 +31,8 @@ function makeFakeBrowser({ resumeFails = false, nativeDisconnect = false } = {})
       port.messages.push(message);
       if (nativeDisconnect && port.disconnectListener) {
         queueMicrotask(() => port.disconnectListener());
+      } else if (nativeResponse && port.messageListener) {
+        queueMicrotask(() => port.messageListener(nativeResponse(message)));
       }
     }
   };
@@ -60,7 +68,13 @@ function makeFakeBrowser({ resumeFails = false, nativeDisconnect = false } = {})
       }
     },
     runtime: {
-      connectNative: () => port,
+      connectNative: () => {
+        calls.nativeConnects += 1;
+        if (calls.nativeConnects <= nativeFailuresBeforeSuccess) {
+          throw new Error('No such native application');
+        }
+        return port;
+      },
       onMessage: { addListener(listener) { events.message = listener; } },
       sendMessage: async () => ({ ok: true })
     },
@@ -90,7 +104,7 @@ test('supported download pauses and opens one settings tab', async () => {
 
 test('Native host failure resumes the original Firefox download', async () => {
   const fake = makeFakeBrowser({ nativeDisconnect: true });
-  const background = createBackground(fake.browser);
+  const background = createBackground(fake.browser, { attempts: 1, delayMs: 0 });
   await background.handleCreatedDownload({
     id: 2,
     url: 'https://example.test/file.zip',
@@ -126,3 +140,29 @@ test('managed fallback onCreated event does not re-enter interception', async ()
   assert.equal(fake.calls.download[0].saveAs, false);
   assert.deepEqual(fake.calls.pause, [3]);
 });
+
+test('Native host retry succeeds after Curl Downloader starts', async () => {
+  const fake = makeFakeBrowser({
+    nativeFailuresBeforeSuccess: 2,
+    nativeResponse: (message) => ({
+      type: 'defaults',
+      request_id: message.request_id,
+      target_dir: 'C:\\Downloads'
+    })
+  });
+  const background = createBackground(fake.browser, { attempts: 5, delayMs: 0 });
+  const result = await background.handleRuntimeMessage({ type: 'get-defaults' });
+  assert.equal(result.ok, true);
+  assert.equal(result.targetDir, 'C:\\Downloads');
+  assert.equal(fake.calls.nativeConnects, 3);
+});
+
+test('Native host retry stops after five attempts', async () => {
+  const fake = makeFakeBrowser({ nativeFailuresBeforeSuccess: Infinity });
+  const background = createBackground(fake.browser, { attempts: 5, delayMs: 0 });
+  const result = await background.handleRuntimeMessage({ type: 'get-defaults' });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'native_unavailable');
+  assert.equal(fake.calls.nativeConnects, 5);
+});
+

@@ -1,19 +1,22 @@
 (function (root, factory) {
   if (typeof module === 'object' && module.exports) {
-    module.exports = (browserApi) => factory(
+    module.exports = (browserApi, options = {}) => factory(
       browserApi,
       require('./core.js'),
-      require('./storage.js')
+      require('./storage.js'),
+      options
     );
   } else {
     root.CurlDownloaderBackground = factory(
       root.browser,
       root.CurlExtensionCore,
-      root.CurlExtensionStorage
+      root.CurlExtensionStorage,
+      {}
     );
   }
-})(typeof globalThis === 'object' ? globalThis : this, function (browserApi, core, storage) {
+})(typeof globalThis === 'object' ? globalThis : this, function (browserApi, core, storage, runtimeOptions) {
   'use strict';
+  runtimeOptions = runtimeOptions || {};
 
   const pendingDownloads = new Map();
   const settingsTabs = new Map();
@@ -21,7 +24,11 @@
   const managedFallbackUrls = new Map();
   const nativeRequests = new Map();
   let nativePort = null;
-  let requestSequence = 0;
+let requestSequence = 0;
+  const nativeRetryOptions = {
+    attempts: Number.isInteger(runtimeOptions.attempts) ? Math.max(1, runtimeOptions.attempts) : 5,
+    delayMs: Number.isFinite(runtimeOptions.delayMs) ? Math.max(0, runtimeOptions.delayMs) : 2000
+  };
 
   function defaultProxy() {
     return { enabled: false, protocol: 'http', host: '', port: 8080, username: '' };
@@ -105,6 +112,35 @@
         reject(error);
       }
     });
+  }
+
+  async function sendNativeWithRetry(message, options = nativeRetryOptions) {
+    const attempts = Number.isInteger(options.attempts)
+      ? Math.max(1, options.attempts)
+      : nativeRetryOptions.attempts;
+    const delayMs = Number.isFinite(options.delayMs)
+      ? Math.max(0, options.delayMs)
+      : nativeRetryOptions.delayMs;
+    let lastError;
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      try {
+        return await sendNative(message);
+      } catch (error) {
+        lastError = error;
+        if (attempt + 1 < attempts && delayMs > 0) {
+          await new Promise((resolve) => setTimeout(resolve, delayMs));
+        }
+      }
+    }
+    throw lastError || new Error('Native host unavailable');
+  }
+
+  function nativeUnavailable(error) {
+    return {
+      ok: false,
+      code: 'native_unavailable',
+      error: error || 'Curl Downloader 未啟動或尚未註冊 Native host。'
+    };
   }
 
   function consumeManagedFallback(download) {
@@ -209,7 +245,7 @@
     const request = core.buildEnqueueMessage(pending, form, 'pending');
     let accepted = false;
     try {
-      const response = await sendNative(request);
+      const response = await sendNativeWithRetry(request);
       if (!response || response.type !== 'enqueue_result' || !response.ok) {
         throw new Error('Curl Downloader 未接收任務');
       }
@@ -233,7 +269,7 @@
         await restoreFirefoxDownload(pending);
         pendingDownloads.delete(pending.downloadId);
       }
-      return { ok: false, error: 'Native host 未能接收下載，已恢復 Firefox。' };
+      return { ok: false, code: 'native_unavailable', error: 'Native host 未能接收下載，已恢復 Firefox。' };
     }
   }
 
@@ -254,22 +290,22 @@
     }
     if (message.type === 'pick-folder') {
       try {
-        const response = await sendNative({ type: 'pick_folder' });
+        const response = await sendNativeWithRetry({ type: 'pick_folder' });
         return response && response.type === 'folder'
           ? response
           : { ok: false, error: '無法開啟目錄選擇器。' };
       } catch (_error) {
-        return { ok: false, error: 'Native host 未能開啟目錄選擇器。' };
+        return nativeUnavailable('Curl Downloader 未啟動或尚未註冊 Native host，無法開啟目錄選擇器。');
       }
     }
     if (message.type === 'get-defaults') {
       try {
-        const response = await sendNative({ type: 'get_defaults' });
+        const response = await sendNativeWithRetry({ type: 'get_defaults' });
         return response && response.type === 'defaults'
           ? { ok: true, targetDir: response.target_dir || '' }
           : { ok: false, error: '無法讀取 Curl Downloader 預設目錄。' };
       } catch (_error) {
-        return { ok: false, error: 'Native host 未能讀取預設目錄。' };
+        return nativeUnavailable();
       }
     }
     return { ok: false, error: '未知訊息類型' };
@@ -297,6 +333,9 @@
     handleCreatedDownload,
     restoreFirefoxDownload,
     submitExternalDownload,
-    handleRuntimeMessage
+    handleRuntimeMessage,
+    sendNativeWithRetry
   };
 });
+
+
