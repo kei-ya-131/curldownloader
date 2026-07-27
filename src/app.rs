@@ -14,6 +14,7 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
+        mpsc::Receiver,
     },
     thread::JoinHandle,
     time::Duration,
@@ -82,6 +83,8 @@ pub struct CurlDownloaderApp {
     shutting_down: bool,
     ipc_stop: Arc<AtomicBool>,
     ipc_default_dir: Arc<Mutex<PathBuf>>,
+    ipc_snapshots: ipc::SharedSnapshots,
+    ipc_ui_receiver: Receiver<ipc::UiCommand>,
     ipc_thread: Option<JoinHandle<()>>,
 }
 
@@ -157,9 +160,13 @@ impl CurlDownloaderApp {
             .unwrap_or_else(|error| panic!("無法啟動下載引擎：{error}"));
         let ipc_stop = Arc::new(AtomicBool::new(false));
         let ipc_default_dir = Arc::new(Mutex::new(last_download_dir.clone()));
+        let ipc_snapshots = Arc::new(Mutex::new(Vec::<TaskSnapshot>::new()));
+        let (ipc_ui_sender, ipc_ui_receiver) = std::sync::mpsc::channel();
         let ipc_thread = Some(ipc::spawn_server(
             engine.commands.clone(),
             Arc::clone(&ipc_default_dir),
+            Arc::clone(&ipc_snapshots),
+            ipc_ui_sender,
             Arc::clone(&ipc_stop),
         ));
 
@@ -186,6 +193,8 @@ impl CurlDownloaderApp {
             shutting_down: false,
             ipc_stop,
             ipc_default_dir,
+            ipc_snapshots,
+            ipc_ui_receiver,
             ipc_thread,
         }
     }
@@ -194,6 +203,9 @@ impl CurlDownloaderApp {
         while let Ok(event) = self.engine.events.try_recv() {
             match event {
                 EngineEvent::Snapshot(tasks) => {
+                    if let Ok(mut snapshots) = self.ipc_snapshots.lock() {
+                        *snapshots = tasks.clone();
+                    }
                     self.tasks = tasks;
                     let draft_proxy_is_stale = self
                         .draft

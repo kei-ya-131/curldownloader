@@ -16,7 +16,7 @@ use std::{
 
 pub const MAX_FRAME_BYTES: usize = 64 * 1024;
 pub const PIPE_NAME: &str = r"\\.\pipe\curl-downloader-v1";
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct WireTaskSummary {
     pub task_id: TaskId,
     pub filename: String,
@@ -100,6 +100,21 @@ pub enum IpcRequest {
     PickFolder {
         request_id: String,
     },
+    ListTasks {
+        request_id: String,
+    },
+    ShowTask {
+        request_id: String,
+        task_id: TaskId,
+    },
+    OpenFile {
+        request_id: String,
+        task_id: TaskId,
+    },
+    OpenFolder {
+        request_id: String,
+        task_id: TaskId,
+    },
     Enqueue {
         request_id: String,
         url: String,
@@ -115,6 +130,10 @@ impl IpcRequest {
             Self::Ping { request_id }
             | Self::GetDefaults { request_id }
             | Self::PickFolder { request_id }
+            | Self::ListTasks { request_id }
+            | Self::ShowTask { request_id, .. }
+            | Self::OpenFile { request_id, .. }
+            | Self::OpenFolder { request_id, .. }
             | Self::Enqueue { request_id, .. } => request_id,
         }
     }
@@ -147,6 +166,15 @@ pub enum IpcResponse {
         task_id: Option<u64>,
         error: Option<WireError>,
     },
+    TaskList {
+        request_id: String,
+        tasks: Vec<WireTaskSummary>,
+    },
+    ActionResult {
+        request_id: String,
+        ok: bool,
+        error: Option<WireError>,
+    },
 }
 
 impl IpcResponse {
@@ -156,11 +184,19 @@ impl IpcResponse {
             | Self::Pong { request_id, .. }
             | Self::Defaults { request_id, .. }
             | Self::Folder { request_id, .. }
-            | Self::EnqueueResult { request_id, .. } => request_id,
+            | Self::EnqueueResult { request_id, .. }
+            | Self::TaskList { request_id, .. }
+            | Self::ActionResult { request_id, .. } => request_id,
         }
     }
 }
 
+#[derive(Debug)]
+pub enum UiCommand {
+    ShowTask { task_id: TaskId },
+}
+
+pub type SharedSnapshots = Arc<Mutex<Vec<TaskSnapshot>>>;
 #[derive(Debug, Deserialize, Serialize)]
 pub struct WireError {
     pub code: String,
@@ -244,6 +280,8 @@ pub fn write_frame<W: Write>(writer: &mut W, body: &[u8]) -> io::Result<()> {
 pub fn spawn_server(
     commands: Sender<EngineCommand>,
     last_download_dir: Arc<Mutex<PathBuf>>,
+    snapshots: SharedSnapshots,
+    ui_commands: Sender<UiCommand>,
     stop: Arc<AtomicBool>,
 ) -> thread::JoinHandle<()> {
     #[cfg(windows)]
@@ -263,13 +301,15 @@ pub fn spawn_server(
 
         thread::Builder::new()
             .name("native-bridge-pipe".into())
-            .spawn(move || run_windows_server(commands, last_download_dir, stop))
+            .spawn(move || {
+                run_windows_server(commands, last_download_dir, snapshots, ui_commands, stop)
+            })
             .expect("無法啟動 Native Messaging Named Pipe 伺服器")
     }
 
     #[cfg(not(windows))]
     {
-        let _ = (commands, last_download_dir, stop);
+        let _ = (commands, last_download_dir, snapshots, ui_commands, stop);
         thread::Builder::new()
             .name("native-bridge-pipe".into())
             .spawn(|| {})
@@ -343,6 +383,8 @@ fn is_pipe_connection_error(error: &io::Error) -> bool {
 fn run_windows_server(
     commands: Sender<EngineCommand>,
     last_download_dir: Arc<Mutex<PathBuf>>,
+    snapshots: SharedSnapshots,
+    ui_commands: Sender<UiCommand>,
     stop: Arc<AtomicBool>,
 ) {
     use std::{
@@ -399,7 +441,13 @@ fn run_windows_server(
         let mut stream = unsafe { File::from_raw_handle(handle as RawHandle) };
         if let Ok(body) = read_frame(&mut stream, MAX_FRAME_BYTES) {
             if let Ok(request) = serde_json::from_slice::<IpcRequest>(&body) {
-                let response = dispatch_request(request, &commands, &last_download_dir);
+                let response = dispatch_request(
+                    request,
+                    &commands,
+                    &last_download_dir,
+                    &snapshots,
+                    &ui_commands,
+                );
                 if let Ok(body) = serde_json::to_vec(&response) {
                     let _ = write_frame(&mut stream, &body);
                 }
@@ -414,6 +462,8 @@ fn dispatch_request(
     request: IpcRequest,
     commands: &Sender<EngineCommand>,
     last_download_dir: &Arc<Mutex<PathBuf>>,
+    snapshots: &SharedSnapshots,
+    ui_commands: &Sender<UiCommand>,
 ) -> IpcResponse {
     match request {
         IpcRequest::Ping { request_id } => IpcResponse::Pong {
@@ -442,6 +492,37 @@ fn dispatch_request(
                 error: None,
             }
         }
+        IpcRequest::ListTasks { request_id } => IpcResponse::TaskList {
+            request_id,
+            tasks: snapshots
+                .lock()
+                .map(|tasks| build_task_summaries(&tasks))
+                .unwrap_or_default(),
+        },
+        IpcRequest::ShowTask {
+            request_id,
+            task_id,
+        } => {
+            if !task_exists(snapshots, task_id) {
+                action_error(request_id, "task_not_found", "找不到下載任務。")
+            } else if ui_commands.send(UiCommand::ShowTask { task_id }).is_err() {
+                action_error(
+                    request_id,
+                    "gui_unavailable",
+                    "Curl Downloader GUI 未能接收操作。",
+                )
+            } else {
+                action_success(request_id)
+            }
+        }
+        IpcRequest::OpenFile {
+            request_id,
+            task_id,
+        } => open_task_file(request_id, task_id, snapshots),
+        IpcRequest::OpenFolder {
+            request_id,
+            task_id,
+        } => open_task_folder(request_id, task_id, snapshots),
         IpcRequest::Enqueue {
             request_id,
             url,
@@ -499,6 +580,81 @@ fn dispatch_request(
     }
 }
 
+#[cfg(windows)]
+fn task_exists(snapshots: &SharedSnapshots, task_id: TaskId) -> bool {
+    snapshots
+        .lock()
+        .map(|tasks| tasks.iter().any(|task| task.id == task_id))
+        .unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn open_task_file(request_id: String, task_id: TaskId, snapshots: &SharedSnapshots) -> IpcResponse {
+    let Some(task) = snapshots
+        .lock()
+        .ok()
+        .and_then(|tasks| tasks.iter().find(|task| task.id == task_id).cloned())
+    else {
+        return action_error(request_id, "task_not_found", "找不到下載任務。");
+    };
+    if task.status != TaskStatus::Completed {
+        return action_error(request_id, "file_unavailable", "下載尚未完成。");
+    }
+    let path = task.target_dir.join(&task.filename);
+    if !path.is_file() {
+        return action_error(request_id, "file_unavailable", "下載檔案不存在。");
+    }
+    match std::process::Command::new("explorer.exe").arg(path).spawn() {
+        Ok(_) => action_success(request_id),
+        Err(_) => action_error(request_id, "open_file_failed", "無法開啟下載檔案。"),
+    }
+}
+
+#[cfg(windows)]
+fn open_task_folder(
+    request_id: String,
+    task_id: TaskId,
+    snapshots: &SharedSnapshots,
+) -> IpcResponse {
+    let Some(task) = snapshots
+        .lock()
+        .ok()
+        .and_then(|tasks| tasks.iter().find(|task| task.id == task_id).cloned())
+    else {
+        return action_error(request_id, "task_not_found", "找不到下載任務。");
+    };
+    if !task.target_dir.is_dir() {
+        return action_error(request_id, "folder_unavailable", "目標下載資料夾不存在。");
+    }
+    match std::process::Command::new("explorer.exe")
+        .arg(task.target_dir)
+        .spawn()
+    {
+        Ok(_) => action_success(request_id),
+        Err(_) => action_error(request_id, "open_folder_failed", "無法開啟目標下載資料夾。"),
+    }
+}
+
+#[cfg(windows)]
+fn action_success(request_id: String) -> IpcResponse {
+    IpcResponse::ActionResult {
+        request_id,
+        ok: true,
+        error: None,
+    }
+}
+
+#[cfg(windows)]
+fn action_error(request_id: String, code: &str, message: &str) -> IpcResponse {
+    IpcResponse::ActionResult {
+        request_id,
+        ok: false,
+        error: Some(WireError {
+            code: code.into(),
+            message: message.into(),
+        }),
+    }
+}
 #[cfg(windows)]
 fn enqueue_error(request_id: String, code: &str, message: &str) -> IpcResponse {
     IpcResponse::EnqueueResult {
@@ -615,6 +771,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn task_control_requests_use_stable_wire_names() {
+        let list = serde_json::to_value(IpcRequest::ListTasks {
+            request_id: "1".into(),
+        })
+        .unwrap();
+        let show = serde_json::to_value(IpcRequest::ShowTask {
+            request_id: "2".into(),
+            task_id: 7,
+        })
+        .unwrap();
+        let file = serde_json::to_value(IpcRequest::OpenFile {
+            request_id: "3".into(),
+            task_id: 7,
+        })
+        .unwrap();
+        let folder = serde_json::to_value(IpcRequest::OpenFolder {
+            request_id: "4".into(),
+            task_id: 7,
+        })
+        .unwrap();
+        assert_eq!(list["type"], "list_tasks");
+        assert_eq!(show["type"], "show_task");
+        assert_eq!(file["type"], "open_file");
+        assert_eq!(folder["type"], "open_folder");
+    }
+
+    #[test]
+    fn action_response_keeps_request_id_and_error_shape() {
+        let response = IpcResponse::ActionResult {
+            request_id: "9".into(),
+            ok: false,
+            error: Some(WireError {
+                code: "task_not_found".into(),
+                message: "找不到任務".into(),
+            }),
+        };
+        let json = serde_json::to_value(response).unwrap();
+        assert_eq!(json["type"], "action_result");
+        assert_eq!(json["request_id"], "9");
+        assert_eq!(json["error"]["code"], "task_not_found");
+    }
     fn test_snapshot(
         id: TaskId,
         status: TaskStatus,
