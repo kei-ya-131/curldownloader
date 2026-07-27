@@ -197,3 +197,52 @@ test('cancel-download cancels and erases paused Firefox item', async () => {
   const pending = await background.handleRuntimeMessage({ type: 'get-pending', downloadId: 7 });
   assert.equal(pending.ok, false);
 });
+
+test('task controls bridge list, show, file, and folder actions', async () => {
+  const messages = [];
+  const fake = makeFakeBrowser({
+    nativeResponse: (message) => {
+      messages.push(message);
+      if (message.type === 'list_tasks') {
+        return {
+          type: 'task_list',
+          request_id: message.request_id,
+          tasks: [{ task_id: 7, filename: 'file.zip', status: 'downloading' }]
+        };
+      }
+      return { type: 'action_result', request_id: message.request_id, ok: true, error: null };
+    }
+  });
+  const background = createBackground(fake.browser, { attempts: 1, delayMs: 0 });
+
+  const list = await background.handleRuntimeMessage({ type: 'list-tasks' });
+  assert.equal(list.ok, true);
+  assert.equal(list.tasks[0].task_id, 7);
+  for (const type of ['show-task', 'open-file', 'open-folder']) {
+    const result = await background.handleRuntimeMessage({ type, taskId: 7 });
+    assert.equal(result.ok, true);
+  }
+  assert.deepEqual(messages.map((message) => message.type), [
+    'list_tasks',
+    'show_task',
+    'open_file',
+    'open_folder'
+  ]);
+  assert.equal(messages.every((message) => message.task_id === undefined || message.task_id === 7), true);
+});
+
+test('task control errors stay in popup flow without Firefox fallback', async () => {
+  const fake = makeFakeBrowser({
+    nativeResponse: (message) => ({
+      type: 'action_result',
+      request_id: message.request_id,
+      ok: false,
+      error: { code: 'file_unavailable', message: '檔案尚未完成。' }
+    })
+  });
+  const background = createBackground(fake.browser, { attempts: 1, delayMs: 0 });
+  const result = await background.handleRuntimeMessage({ type: 'open-file', taskId: 7 });
+  assert.deepEqual(result, { ok: false, error: '檔案尚未完成。' });
+  assert.deepEqual(fake.calls.resume, []);
+  assert.deepEqual(fake.calls.download, []);
+});

@@ -287,6 +287,50 @@ let requestSequence = 0;
     }
   }
 
+  function validTaskId(value) {
+    const taskId = Number(value);
+    return Number.isSafeInteger(taskId) && taskId >= 0 ? taskId : null;
+  }
+
+  async function listTasks() {
+    try {
+      const response = await sendNativeWithRetry({ type: 'list_tasks' });
+      if (!response || response.type !== 'task_list' || !Array.isArray(response.tasks)) {
+        return { ok: false, error: '無法讀取 Curl Downloader 任務。' };
+      }
+      return { ok: true, tasks: response.tasks };
+    } catch (_error) {
+      return nativeUnavailable('Curl Downloader 未啟動或尚未註冊 Native host，無法讀取任務。');
+    }
+  }
+
+  async function sendTaskAction(message) {
+    const taskId = validTaskId(message.taskId);
+    if (taskId === null) return { ok: false, error: '任務編號無效。' };
+    const nativeType = {
+      'show-task': 'show_task',
+      'open-file': 'open_file',
+      'open-folder': 'open_folder'
+    }[message.type];
+    try {
+      const response = await sendNativeWithRetry({ type: nativeType, task_id: taskId });
+      if (!response || response.type !== 'action_result') {
+        return { ok: false, error: 'Curl Downloader 未能完成操作。' };
+      }
+      if (!response.ok) {
+        return {
+          ok: false,
+          error: response.error && response.error.message
+            ? response.error.message
+            : 'Curl Downloader 未能完成操作。'
+        };
+      }
+      return { ok: true };
+    } catch (_error) {
+      return nativeUnavailable('Curl Downloader 未啟動或尚未註冊 Native host。');
+    }
+  }
+
   async function handleRuntimeMessage(message) {
     if (!message || typeof message !== 'object') return { ok: false, error: '訊息無效' };
     const id = Number(message.downloadId);
@@ -323,6 +367,10 @@ let requestSequence = 0;
       } catch (_error) {
         return nativeUnavailable('Curl Downloader 未啟動或尚未註冊 Native host，無法開啟目錄選擇器。');
       }
+    }
+    if (message.type === 'list-tasks') return listTasks();
+    if (message.type === 'show-task' || message.type === 'open-file' || message.type === 'open-folder') {
+      return sendTaskAction(message);
     }
     if (message.type === 'get-defaults') {
       try {
