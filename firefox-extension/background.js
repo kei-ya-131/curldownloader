@@ -22,9 +22,8 @@
   const settingsTabs = new Map();
   const managedFallbackIds = new Set();
   const managedFallbackUrls = new Map();
-  const nativeRequests = new Map();
-  let nativePort = null;
-let requestSequence = 0;
+  let nativeQueue = Promise.resolve();
+  let requestSequence = 0;
   const nativeRetryOptions = {
     attempts: Number.isInteger(runtimeOptions.attempts) ? Math.max(1, runtimeOptions.attempts) : 5,
     delayMs: Number.isFinite(runtimeOptions.delayMs) ? Math.max(0, runtimeOptions.delayMs) : 2000
@@ -79,41 +78,18 @@ let requestSequence = 0;
     }).catch(() => undefined);
   }
 
-  function disconnectNativePort() {
-    nativePort = null;
-    for (const request of nativeRequests.values()) {
-      request.reject(new Error('Native host 連線已中斷'));
-    }
-    nativeRequests.clear();
-  }
-
-  function ensureNativePort() {
-    if (nativePort) return nativePort;
-    nativePort = browserApi.runtime.connectNative('curl_downloader');
-    nativePort.onMessage.addListener((response) => {
-      const request = nativeRequests.get(response && response.request_id);
-      if (!request) return;
-      nativeRequests.delete(response.request_id);
-      request.resolve(response);
-    });
-    nativePort.onDisconnect.addListener(disconnectNativePort);
-    return nativePort;
-  }
-
   function sendNative(message) {
     const requestId = `firefox-${Date.now()}-${requestSequence++}`;
     const request = { ...message, request_id: requestId };
-    return new Promise((resolve, reject) => {
-      nativeRequests.set(requestId, { resolve, reject });
-      try {
-        ensureNativePort().postMessage(request);
-      } catch (error) {
-        nativeRequests.delete(requestId);
-        reject(error);
+    const operation = nativeQueue.then(() => {
+      if (!browserApi.runtime || typeof browserApi.runtime.sendNativeMessage !== 'function') {
+        throw new Error('Firefox 不支援一次性 Native Messaging');
       }
+      return browserApi.runtime.sendNativeMessage('curl_downloader', request);
     });
+    nativeQueue = operation.catch(() => undefined);
+    return operation;
   }
-
   async function sendNativeWithRetry(message, options = nativeRetryOptions) {
     const attempts = Number.isInteger(options.attempts)
       ? Math.max(1, options.attempts)

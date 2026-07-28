@@ -8,7 +8,6 @@ use std::{
 };
 
 pub const NATIVE_HOST_FLAG: &str = "--native-messaging-host";
-
 pub fn is_native_host_invocation(arguments: &[OsString]) -> bool {
     arguments
         .iter()
@@ -233,6 +232,14 @@ mod tests {
             plan.program,
             PathBuf::from(r"C:\Program Files\CurlDownloader\CurlDownloader.exe")
         );
+        assert_eq!(plan.args, vec![OsString::from("--minimized")]);
+    }
+
+    #[test]
+    fn native_host_restart_uses_current_gui_executable_minimized() {
+        let executable = Path::new(r"C:\Tools\CurlDownloader.exe");
+        let plan = minimized_launch_plan(executable);
+        assert_eq!(plan.program, executable);
         assert_eq!(plan.args, vec![OsString::from("--minimized")]);
     }
 

@@ -21,20 +21,7 @@ function makeFakeBrowser({
     download: [],
     tabs: [],
     notifications: [],
-    nativeConnects: 0
-  };
-  const port = {
-    messages: [],
-    onMessage: { addListener(listener) { port.messageListener = listener; } },
-    onDisconnect: { addListener(listener) { port.disconnectListener = listener; } },
-    postMessage(message) {
-      port.messages.push(message);
-      if (nativeDisconnect && port.disconnectListener) {
-        queueMicrotask(() => port.disconnectListener());
-      } else if (nativeResponse && port.messageListener) {
-        queueMicrotask(() => port.messageListener(nativeResponse(message)));
-      }
-    }
+    nativeMessages: []
   };
   let nextTabId = 10;
   let nextDownloadId = 100;
@@ -68,12 +55,15 @@ function makeFakeBrowser({
       }
     },
     runtime: {
-      connectNative: () => {
-        calls.nativeConnects += 1;
-        if (calls.nativeConnects <= nativeFailuresBeforeSuccess) {
+      sendNativeMessage: async (_hostName, message) => {
+        calls.nativeMessages.push(message);
+        if (nativeDisconnect) throw new Error('Native host disconnected');
+        if (calls.nativeMessages.length <= nativeFailuresBeforeSuccess) {
           throw new Error('No such native application');
         }
-        return port;
+        return nativeResponse
+          ? nativeResponse(message)
+          : { type: 'defaults', request_id: message.request_id, target_dir: '' };
       },
       onMessage: { addListener(listener) { events.message = listener; } },
       sendMessage: async () => ({ ok: true })
@@ -86,9 +76,51 @@ function makeFakeBrowser({
       async create(details) { calls.notifications.push(details); }
     }
   };
-  return { browser, events, calls, port };
+  return { browser, events, calls };
 }
 
+function makeDelayedNativeBrowser() {
+  const fake = makeFakeBrowser({ nativeResponse: (message) => ({
+    type: message.type === 'get_defaults' ? 'defaults' : 'task_list',
+    request_id: message.request_id,
+    target_dir: 'C:\\Downloads',
+    tasks: []
+  }) });
+  let inFlight = 0;
+  fake.maxNativeInFlight = 0;
+  const original = fake.browser.runtime.sendNativeMessage;
+  fake.browser.runtime.sendNativeMessage = async (...args) => {
+    inFlight += 1;
+    fake.maxNativeInFlight = Math.max(fake.maxNativeInFlight, inFlight);
+    await new Promise((resolve) => setImmediate(resolve));
+    const result = await original(...args);
+    inFlight -= 1;
+    return result;
+  };
+  return fake;
+}
+
+test('uses one-shot Native Messaging and never creates a persistent port', async () => {
+  const fake = makeFakeBrowser({
+    nativeResponse: (message) => ({
+      type: 'defaults', request_id: message.request_id, target_dir: 'C:\\Downloads'
+    })
+  });
+  const background = createBackground(fake.browser, { attempts: 1, delayMs: 0 });
+  const result = await background.handleRuntimeMessage({ type: 'get-defaults' });
+  assert.equal(result.ok, true);
+  assert.equal(fake.calls.nativeMessages.length, 1);
+});
+
+test('serializes two Native calls so only one is in flight', async () => {
+  const fake = makeDelayedNativeBrowser();
+  const background = createBackground(fake.browser, { attempts: 1, delayMs: 0 });
+  await Promise.all([
+    background.handleRuntimeMessage({ type: 'get-defaults' }),
+    background.handleRuntimeMessage({ type: 'get-task-summary' })
+  ]);
+  assert.equal(fake.maxNativeInFlight, 1);
+});
 test('supported download pauses and opens one settings tab', async () => {
   const fake = makeFakeBrowser();
   const background = createBackground(fake.browser);
@@ -154,7 +186,7 @@ test('Native host retry succeeds after Curl Downloader starts', async () => {
   const result = await background.handleRuntimeMessage({ type: 'get-defaults' });
   assert.equal(result.ok, true);
   assert.equal(result.targetDir, 'C:\\Downloads');
-  assert.equal(fake.calls.nativeConnects, 3);
+  assert.equal(fake.calls.nativeMessages.length, 3);
 });
 
 test('Native host retry stops after five attempts', async () => {
@@ -163,7 +195,7 @@ test('Native host retry stops after five attempts', async () => {
   const result = await background.handleRuntimeMessage({ type: 'get-defaults' });
   assert.equal(result.ok, false);
   assert.equal(result.code, 'native_unavailable');
-  assert.equal(fake.calls.nativeConnects, 5);
+  assert.equal(fake.calls.nativeMessages.length, 5);
 });
 
 test('pick-folder maps native directory to settings camelCase', async () => {

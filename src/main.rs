@@ -32,6 +32,7 @@ fn run_gui(minimized: bool) -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("Curl Downloader")
+            .with_visible(!minimized)
             .with_inner_size([1180.0, 720.0])
             .with_min_inner_size([860.0, 560.0]),
         ..Default::default()
