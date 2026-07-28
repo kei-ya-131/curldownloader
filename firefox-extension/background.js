@@ -42,6 +42,7 @@
   let lastBadgeSummary = null;
   let lastTaskList = [];
   let restartDelayMs = 500;
+  let restartCooldownUntil = 0;
 
   function defaultProxy() {
     return { enabled: false, protocol: 'http', host: '', port: 8080, username: '' };
@@ -170,6 +171,7 @@
     const summary = status.summarizeTasks(normalizedTasks);
     lastTaskList = normalizedTasks;
     lastBadgeSummary = summary;
+    restartCooldownUntil = 0;
     if (summary.hasActive) {
       badgeSyncRunning = true;
       restartDelayMs = 500;
@@ -184,7 +186,13 @@
     return summary;
   }
 
-  async function refreshTaskStatus(_options = {}) {
+  async function refreshTaskStatus(options = {}) {
+    const fromPopup = Boolean(options.fromPopup);
+    if (fromPopup && restartCooldownUntil > Date.now()) {
+      return lastBadgeSummary
+        ? { ok: true, tasks: lastTaskList, stale: true }
+        : nativeUnavailable('Curl Downloader 正在重試連線，請稍候。');
+    }
     if (badgeRefreshInFlight) return { ok: true, tasks: lastTaskList };
     badgeRefreshInFlight = true;
     let failedResponse = null;
@@ -197,15 +205,18 @@
       applyTaskSummary(response.tasks);
       return response;
     } catch (_error) {
+      const retryDelay = restartDelayMs;
+      restartCooldownUntil = Date.now() + retryDelay;
       if (lastBadgeSummary && lastBadgeSummary.hasActive) {
         badgeSyncRunning = true;
         applyBadge(lastBadgeSummary, true);
-        scheduleBadgeRefresh(restartDelayMs);
+        scheduleBadgeRefresh(retryDelay);
         restartDelayMs = Math.min(30000, restartDelayMs * 2);
       } else {
         badgeSyncRunning = false;
         clearBadgeTimer();
         applyBadge({ activeCount: 0, hasFailure: false, hasProxyPassword: false });
+        restartDelayMs = Math.min(30000, restartDelayMs * 2);
       }
       return failedResponse || nativeUnavailable('Curl Downloader 未啟動或尚未註冊 Native host，無法讀取任務。');
     } finally {
@@ -349,6 +360,7 @@
       }
       pendingDownloads.delete(pending.downloadId);
       restartDelayMs = 500;
+      restartCooldownUntil = 0;
       void refreshTaskStatus();
       try {
         await storage.saveDefaults(form);

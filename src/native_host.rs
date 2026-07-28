@@ -1,4 +1,7 @@
-use crate::ipc::{self, IpcRequest, IpcResponse, MAX_FRAME_BYTES, WireError};
+use crate::{
+    ipc::{self, IpcRequest, IpcResponse, MAX_FRAME_BYTES, WireError},
+    single_instance,
+};
 use std::{
     ffi::OsString,
     io::{self, Read, Write},
@@ -51,7 +54,6 @@ pub fn should_start_gui(connect_error: &io::Error) -> bool {
             connect_error.raw_os_error(),
             Some(code)
                 if code == windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND as i32
-                    || code == windows_sys::Win32::Foundation::ERROR_PIPE_BUSY as i32
                     || code == windows_sys::Win32::Foundation::ERROR_BROKEN_PIPE as i32
         )
     }
@@ -127,8 +129,16 @@ fn forward_request(request: &IpcRequest) -> io::Result<IpcResponse> {
     match ipc::call_pipe(request, timeout) {
         Ok(response) => Ok(response),
         Err(error) if should_start_gui(&error) => {
-            let executable = std::env::current_exe()?;
-            let _child = launch_gui(&executable, true)?;
+            let _start_guard = if !single_instance::is_running() {
+                let guard = single_instance::acquire_start_guard().map_err(io::Error::other)?;
+                if guard.is_some() && !single_instance::is_running() {
+                    let executable = std::env::current_exe()?;
+                    let _child = launch_gui(&executable, true)?;
+                }
+                guard
+            } else {
+                None
+            };
             ipc::call_pipe_with_retry(
                 request,
                 Duration::from_millis(100),
@@ -192,6 +202,23 @@ mod tests {
         let invalid_data = io::Error::new(io::ErrorKind::InvalidData, "bad response");
         assert!(should_start_gui(&not_found));
         assert!(!should_start_gui(&invalid_data));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn does_not_restart_gui_when_named_pipe_is_busy() {
+        let busy =
+            io::Error::from_raw_os_error(windows_sys::Win32::Foundation::ERROR_PIPE_BUSY as i32);
+        assert!(!should_start_gui(&busy));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn does_not_restart_gui_when_existing_pipe_denies_access() {
+        let denied = io::Error::from_raw_os_error(
+            windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED as i32,
+        );
+        assert!(!should_start_gui(&denied));
     }
 
     #[test]

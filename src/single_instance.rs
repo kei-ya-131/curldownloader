@@ -1,4 +1,5 @@
 pub const GUI_MUTEX_NAME: &str = r"Local\CurlDownloader-GUI-v1";
+pub const GUI_START_MUTEX_NAME: &str = r"Local\CurlDownloader-GUI-Start-v1";
 
 pub struct GuiInstanceGuard {
     #[cfg(windows)]
@@ -6,36 +7,67 @@ pub struct GuiInstanceGuard {
 }
 
 pub fn acquire() -> Result<Option<GuiInstanceGuard>, String> {
+    acquire_named(GUI_MUTEX_NAME, "GUI 單例")
+}
+
+pub fn acquire_start_guard() -> Result<Option<GuiInstanceGuard>, String> {
+    acquire_named(GUI_START_MUTEX_NAME, "GUI 啟動鎖")
+}
+
+#[cfg(windows)]
+fn acquire_named(name: &str, description: &str) -> Result<Option<GuiInstanceGuard>, String> {
+    use std::ptr;
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError},
+        System::Threading::CreateMutexW,
+    };
+
+    let name: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+    let handle = unsafe { CreateMutexW(ptr::null(), 0, name.as_ptr()) };
+    if handle.is_null() {
+        return Err(format!("無法建立{description}：Win32 {}", unsafe {
+            GetLastError()
+        }));
+    }
+    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        unsafe {
+            CloseHandle(handle);
+        }
+        return Ok(None);
+    }
+    Ok(Some(GuiInstanceGuard { handle }))
+}
+
+#[cfg(not(windows))]
+fn acquire_named(_name: &str, _description: &str) -> Result<Option<GuiInstanceGuard>, String> {
+    Ok(Some(GuiInstanceGuard {}))
+}
+
+pub fn is_running() -> bool {
     #[cfg(windows)]
     {
-        use std::ptr;
         use windows_sys::Win32::{
-            Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError},
-            System::Threading::CreateMutexW,
+            Foundation::{CloseHandle, HANDLE},
+            System::Threading::{OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE},
         };
 
         let name: Vec<u16> = GUI_MUTEX_NAME
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
-        let handle = unsafe { CreateMutexW(ptr::null(), 0, name.as_ptr()) };
+        let handle: HANDLE = unsafe { OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, 0, name.as_ptr()) };
         if handle.is_null() {
-            return Err(format!("無法建立 GUI 單例 Mutex：Win32 {}", unsafe {
-                GetLastError()
-            }));
+            return false;
         }
-        if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
-            unsafe {
-                CloseHandle(handle);
-            }
-            return Ok(None);
+        unsafe {
+            CloseHandle(handle);
         }
-        Ok(Some(GuiInstanceGuard { handle }))
+        true
     }
 
     #[cfg(not(windows))]
     {
-        Ok(Some(GuiInstanceGuard {}))
+        false
     }
 }
 
@@ -54,10 +86,20 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn acquire_returns_none_when_gui_mutex_is_already_owned() {
-        let first = acquire().unwrap();
+    fn startup_guard_is_exclusive() {
+        let first = acquire_start_guard().unwrap();
         assert!(first.is_some());
-        let second = acquire().unwrap();
+        let second = acquire_start_guard().unwrap();
+        assert!(second.is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn acquire_returns_none_when_gui_mutex_is_already_owned() {
+        let test_mutex_name = format!(r"Local\CurlDownloader-GUI-Test-{}", std::process::id());
+        let first = acquire_named(&test_mutex_name, "測試 GUI 單例").unwrap();
+        assert!(first.is_some());
+        let second = acquire_named(&test_mutex_name, "測試 GUI 單例").unwrap();
         assert!(second.is_none());
     }
 }

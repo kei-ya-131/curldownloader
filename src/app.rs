@@ -170,11 +170,15 @@ impl CurlDownloaderApp {
         let repaint_context = cc.egui_ctx.clone();
         let repaint: Arc<dyn Fn() + Send + Sync> =
             Arc::new(move || repaint_context.request_repaint());
-        let (tray, tray_receiver) = tray::TrayController::create(Arc::clone(&repaint))
-            .unwrap_or_else(|error| {
+        let mut start_minimized = start_minimized;
+        let (tray, tray_receiver) = match tray::TrayController::create(Arc::clone(&repaint)) {
+            Ok(value) => value,
+            Err(error) => {
                 eprintln!("Windows 系統匣初始化失敗：{error}");
+                start_minimized = effective_start_minimized(start_minimized, false);
                 tray::TrayController::disabled()
-            });
+            }
+        };
         let (ipc_ui_sender, ipc_ui_receiver) = std::sync::mpsc::channel();
         let ipc_thread = Some(ipc::spawn_server_with_repaint(
             engine.commands.clone(),
@@ -219,17 +223,27 @@ impl CurlDownloaderApp {
         }
     }
 
+    fn begin_shutdown(&mut self, _ctx: &egui::Context) {
+        if self.shutting_down {
+            return;
+        }
+        self.shutting_down = true;
+        self.ipc_stop.store(true, Ordering::Release);
+        let _ = self.engine.commands.send(EngineCommand::Shutdown);
+    }
     fn pump_events(&mut self, ctx: &egui::Context) -> bool {
         let mut restored = false;
         while let Ok(event) = self.tray_receiver.try_recv() {
             match event {
                 TrayEvent::ShowWindow => {
                     self.hidden_to_tray = false;
+                    set_main_window_visibility(true);
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                     restored = true;
                 }
+                TrayEvent::CloseWindow => self.begin_shutdown(ctx),
             }
         }
         while let Ok(event) = self.engine.events.try_recv() {
@@ -290,6 +304,14 @@ impl CurlDownloaderApp {
         }
         while let Ok(command) = self.ipc_ui_receiver.try_recv() {
             match command {
+                ipc::UiCommand::ShowWindow => {
+                    self.hidden_to_tray = false;
+                    set_main_window_visibility(true);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    restored = true;
+                }
                 ipc::UiCommand::ShowTask { task_id } => {
                     self.pending_show_task = Some(task_id);
                 }
@@ -301,6 +323,7 @@ impl CurlDownloaderApp {
             self.selected = Some(selected);
             self.draft = None;
             self.hidden_to_tray = false;
+            set_main_window_visibility(true);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
@@ -1066,12 +1089,107 @@ fn resolve_show_task(tasks: &[TaskSnapshot], task_id: TaskId) -> Option<TaskId> 
         .find(|task| task.id == task_id)
         .map(|task| task.id)
 }
+fn effective_start_minimized(requested: bool, tray_available: bool) -> bool {
+    requested && tray_available
+}
+
+fn window_matches_process(window_process_id: u32, target_process_id: Option<u32>) -> bool {
+    match target_process_id {
+        Some(target_process_id) => window_process_id == target_process_id,
+        None => true,
+    }
+}
+
+#[cfg(windows)]
+fn set_window_visibility_for_process(visible: bool, target_process_id: Option<u32>) {
+    use windows_sys::Win32::{
+        Foundation::{HWND, LPARAM},
+        UI::WindowsAndMessaging::{
+            EnumWindows, GW_OWNER, GetWindow, GetWindowTextW, GetWindowThreadProcessId, SW_HIDE,
+            SW_SHOW, SetForegroundWindow, ShowWindow,
+        },
+    };
+    use windows_sys::core::BOOL;
+
+    struct WindowSearch {
+        process_id: Option<u32>,
+        window: HWND,
+    }
+
+    unsafe extern "system" fn find_main_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let search = unsafe { &mut *(lparam as *mut WindowSearch) };
+        let mut process_id = 0u32;
+        unsafe {
+            GetWindowThreadProcessId(hwnd, &mut process_id);
+        }
+        let mut title = [0u16; 256];
+        let title_length = unsafe { GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32) };
+        let is_main_window = title_length > 0
+            && String::from_utf16_lossy(&title[..title_length as usize]) == "Curl Downloader";
+        if window_matches_process(process_id, search.process_id)
+            && unsafe { GetWindow(hwnd, GW_OWNER) }.is_null()
+            && is_main_window
+        {
+            search.window = hwnd;
+            return 0;
+        }
+        1
+    }
+
+    let mut search = WindowSearch {
+        process_id: target_process_id,
+        window: std::ptr::null_mut(),
+    };
+    unsafe {
+        EnumWindows(
+            Some(find_main_window),
+            (&mut search as *mut WindowSearch).cast::<()>() as LPARAM,
+        );
+        if !search.window.is_null() {
+            ShowWindow(search.window, if visible { SW_SHOW } else { SW_HIDE });
+            if visible {
+                SetForegroundWindow(search.window);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn set_main_window_visibility(visible: bool) {
+    use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+    set_window_visibility_for_process(visible, Some(unsafe { GetCurrentProcessId() }));
+}
+
+#[cfg(windows)]
+pub fn focus_existing_main_window() {
+    set_window_visibility_for_process(true, None);
+}
+
+#[cfg(not(windows))]
+fn set_main_window_visibility(_visible: bool) {}
+
+#[cfg(not(windows))]
+pub fn focus_existing_main_window() {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowCloseAction {
+    HideToTray,
+    Shutdown,
+}
+
+fn window_close_action(shutting_down: bool, tray_close_requested: bool) -> WindowCloseAction {
+    if shutting_down || tray_close_requested {
+        WindowCloseAction::Shutdown
+    } else {
+        WindowCloseAction::HideToTray
+    }
+}
 
 impl eframe::App for CurlDownloaderApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         if self.start_minimized {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            set_main_window_visibility(false);
             self.start_minimized = false;
             self.hidden_to_tray = true;
         }
@@ -1081,13 +1199,17 @@ impl eframe::App for CurlDownloaderApp {
             && ctx.input(|input| input.viewport().minimized == Some(true))
         {
             self.hidden_to_tray = true;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            set_main_window_visibility(false);
         }
-        if ctx.input(|input| input.viewport().close_requested()) && !self.shutting_down {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.shutting_down = true;
-            self.ipc_stop.store(true, Ordering::Release);
-            let _ = self.engine.commands.send(EngineCommand::Shutdown);
+        if ctx.input(|input| input.viewport().close_requested()) {
+            if matches!(
+                window_close_action(self.shutting_down, false),
+                WindowCloseAction::HideToTray
+            ) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.hidden_to_tray = true;
+                set_main_window_visibility(false);
+            }
         }
         ctx.request_repaint_after(Duration::from_millis(200));
         self.show_top_bar(ui);
@@ -1524,6 +1646,38 @@ mod tests {
         let tasks = vec![test_snapshot(7, TaskStatus::Downloading)];
         assert_eq!(resolve_show_task(&tasks, 7), Some(7));
         assert_eq!(resolve_show_task(&tasks, 999), None);
+    }
+    #[test]
+    fn tray_failure_never_leaves_startup_invisible() {
+        assert!(effective_start_minimized(true, true));
+        assert!(!effective_start_minimized(true, false));
+        assert!(!effective_start_minimized(false, false));
+    }
+
+    #[test]
+    fn duplicate_gui_launch_can_target_existing_process_window() {
+        assert!(window_matches_process(42, None));
+        assert!(window_matches_process(42, Some(42)));
+        assert!(!window_matches_process(42, Some(7)));
+    }
+    #[test]
+    fn ordinary_window_close_hides_to_tray_instead_of_shutting_down() {
+        assert_eq!(
+            window_close_action(false, false),
+            WindowCloseAction::HideToTray
+        );
+    }
+
+    #[test]
+    fn tray_close_is_the_explicit_shutdown_path() {
+        assert_eq!(
+            window_close_action(false, true),
+            WindowCloseAction::Shutdown
+        );
+        assert_eq!(
+            window_close_action(true, false),
+            WindowCloseAction::Shutdown
+        );
     }
 
     fn test_snapshot(id: TaskId, status: TaskStatus) -> TaskSnapshot {

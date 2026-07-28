@@ -103,6 +103,9 @@ pub enum IpcRequest {
     ListTasks {
         request_id: String,
     },
+    ShowWindow {
+        request_id: String,
+    },
     ShowTask {
         request_id: String,
         task_id: TaskId,
@@ -131,6 +134,7 @@ impl IpcRequest {
             | Self::GetDefaults { request_id }
             | Self::PickFolder { request_id }
             | Self::ListTasks { request_id }
+            | Self::ShowWindow { request_id }
             | Self::ShowTask { request_id, .. }
             | Self::OpenFile { request_id, .. }
             | Self::OpenFolder { request_id, .. }
@@ -193,6 +197,7 @@ impl IpcResponse {
 
 #[derive(Debug)]
 pub enum UiCommand {
+    ShowWindow,
     ShowTask { task_id: TaskId },
 }
 
@@ -427,7 +432,6 @@ fn run_windows_server(
     };
     use windows_sys::Win32::{
         Foundation::{CloseHandle, ERROR_PIPE_CONNECTED, GetLastError, INVALID_HANDLE_VALUE},
-        Security::SECURITY_ATTRIBUTES,
         Storage::FileSystem::{FILE_FLAGS_AND_ATTRIBUTES, PIPE_ACCESS_DUPLEX},
         System::Pipes::{
             ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
@@ -436,6 +440,10 @@ fn run_windows_server(
     };
 
     let pipe_name = pipe_name_wide();
+    let (security_attributes, _security_descriptor) = match named_pipe_security_attributes() {
+        Ok(value) => value,
+        Err(_) => return,
+    };
     while !stop.load(Ordering::Acquire) {
         let handle = unsafe {
             CreateNamedPipeW(
@@ -446,7 +454,7 @@ fn run_windows_server(
                 MAX_FRAME_BYTES as u32,
                 MAX_FRAME_BYTES as u32,
                 1_000,
-                ptr::null::<SECURITY_ATTRIBUTES>(),
+                &security_attributes,
             )
         };
         if handle == INVALID_HANDLE_VALUE {
@@ -491,6 +499,39 @@ fn run_windows_server(
     }
 }
 
+pub fn show_window_request() -> IpcRequest {
+    IpcRequest::ShowWindow {
+        request_id: "gui-launch".into(),
+    }
+}
+
+#[cfg(test)]
+fn request_focus_task_id(request: &IpcRequest) -> Option<TaskId> {
+    match request {
+        IpcRequest::ShowTask { task_id, .. }
+        | IpcRequest::OpenFile { task_id, .. }
+        | IpcRequest::OpenFolder { task_id, .. } => Some(*task_id),
+        _ => None,
+    }
+}
+
+#[cfg(windows)]
+fn focus_task_window(
+    task_id: TaskId,
+    snapshots: &SharedSnapshots,
+    ui_commands: &Sender<UiCommand>,
+    repaint: &Arc<dyn Fn() + Send + Sync>,
+) -> bool {
+    if !task_exists(snapshots, task_id) {
+        return false;
+    }
+    if ui_commands.send(UiCommand::ShowTask { task_id }).is_err() {
+        return false;
+    }
+    repaint();
+    true
+}
+
 #[cfg(windows)]
 fn dispatch_request(
     request: IpcRequest,
@@ -527,6 +568,18 @@ fn dispatch_request(
                 error: None,
             }
         }
+        IpcRequest::ShowWindow { request_id } => {
+            if ui_commands.send(UiCommand::ShowWindow).is_err() {
+                action_error(
+                    request_id,
+                    "gui_unavailable",
+                    "Curl Downloader GUI 未能接收操作。",
+                )
+            } else {
+                repaint();
+                action_success(request_id)
+            }
+        }
         IpcRequest::ListTasks { request_id } => IpcResponse::TaskList {
             request_id,
             tasks: snapshots
@@ -540,25 +593,30 @@ fn dispatch_request(
         } => {
             if !task_exists(snapshots, task_id) {
                 action_error(request_id, "task_not_found", "找不到下載任務。")
-            } else if ui_commands.send(UiCommand::ShowTask { task_id }).is_err() {
+            } else if !focus_task_window(task_id, snapshots, ui_commands, repaint) {
                 action_error(
                     request_id,
                     "gui_unavailable",
                     "Curl Downloader GUI 未能接收操作。",
                 )
             } else {
-                repaint();
                 action_success(request_id)
             }
         }
         IpcRequest::OpenFile {
             request_id,
             task_id,
-        } => open_task_file(request_id, task_id, snapshots),
+        } => {
+            let _ = focus_task_window(task_id, snapshots, ui_commands, repaint);
+            open_task_file(request_id, task_id, snapshots)
+        }
         IpcRequest::OpenFolder {
             request_id,
             task_id,
-        } => open_task_folder(request_id, task_id, snapshots),
+        } => {
+            let _ = focus_task_window(task_id, snapshots, ui_commands, repaint);
+            open_task_folder(request_id, task_id, snapshots)
+        }
         IpcRequest::Enqueue {
             request_id,
             url,
@@ -758,6 +816,61 @@ fn call_windows_pipe(request: &IpcRequest, timeout: Duration) -> io::Result<IpcR
 }
 
 #[cfg(windows)]
+struct NamedPipeSecurityDescriptor {
+    raw: windows_sys::Win32::Security::PSECURITY_DESCRIPTOR,
+}
+
+#[cfg(windows)]
+impl Drop for NamedPipeSecurityDescriptor {
+    fn drop(&mut self) {
+        if !self.raw.is_null() {
+            unsafe {
+                let _ = windows_sys::Win32::Foundation::LocalFree(self.raw);
+            }
+        }
+    }
+}
+
+fn named_pipe_security_descriptor_sddl() -> &'static str {
+    "D:(A;;GA;;;AU)"
+}
+
+#[cfg(windows)]
+fn named_pipe_security_attributes() -> io::Result<(
+    windows_sys::Win32::Security::SECURITY_ATTRIBUTES,
+    NamedPipeSecurityDescriptor,
+)> {
+    use std::{mem::size_of, ptr};
+    use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
+
+    let sddl: Vec<u16> = named_pipe_security_descriptor_sddl()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut raw = ptr::null_mut();
+    let mut descriptor_size = 0u32;
+    let converted = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            1,
+            &mut raw,
+            &mut descriptor_size,
+        )
+    };
+    if converted == 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let descriptor = NamedPipeSecurityDescriptor { raw };
+    let attributes = windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
+        nLength: size_of::<windows_sys::Win32::Security::SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: raw,
+        bInheritHandle: 0,
+    };
+    Ok((attributes, descriptor))
+}
+
+#[cfg(windows)]
 fn pipe_name_wide() -> Vec<u16> {
     PIPE_NAME.encode_utf16().chain(std::iter::once(0)).collect()
 }
@@ -765,6 +878,10 @@ fn pipe_name_wide() -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn named_pipe_uses_an_authenticated_user_security_descriptor() {
+        assert_eq!(named_pipe_security_descriptor_sddl(), "D:(A;;GA;;;AU)");
+    }
     use crate::model::{
         CurlSource, DownloadTask, ProxyProtocol, ProxySnapshot, RangeSupport, TaskId, TaskSnapshot,
         TaskStatus,
@@ -807,6 +924,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn file_and_folder_actions_request_the_main_window_to_front() {
+        assert_eq!(
+            request_focus_task_id(&IpcRequest::ShowTask {
+                request_id: "1".into(),
+                task_id: 7,
+            }),
+            Some(7)
+        );
+        assert_eq!(
+            request_focus_task_id(&IpcRequest::OpenFile {
+                request_id: "2".into(),
+                task_id: 8,
+            }),
+            Some(8)
+        );
+        assert_eq!(
+            request_focus_task_id(&IpcRequest::OpenFolder {
+                request_id: "3".into(),
+                task_id: 9,
+            }),
+            Some(9)
+        );
+        assert_eq!(
+            request_focus_task_id(&IpcRequest::ListTasks {
+                request_id: "4".into(),
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn duplicate_gui_launch_request_restores_main_window() {
+        let request = show_window_request();
+        let json = serde_json::to_value(request).unwrap();
+        assert_eq!(json["type"], "show_window");
+    }
     #[test]
     fn task_control_requests_use_stable_wire_names() {
         let list = serde_json::to_value(IpcRequest::ListTasks {

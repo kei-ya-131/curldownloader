@@ -150,7 +150,42 @@ test('restarts the GUI minimized after a closed-GUI pipe failure while tasks are
   assert.equal(background.isBadgeSyncRunning(), true);
   assert.deepEqual(fake.calls.badgeText.at(-1), { text: '50%/1' });
 });
-test('supported download pauses and opens one settings tab', async () => {
+test('popup refresh uses cached tasks during restart backoff instead of relaunching the GUI', async () => {
+  let unavailable = false;
+  const fake = makeFakeBrowser({
+    nativeResponse: (message) => {
+      if (unavailable) throw new Error('GUI pipe unavailable');
+      return {
+        type: 'task_list',
+        request_id: message.request_id,
+        tasks: [{ task_id: 1, status: 'downloading', downloaded: 50, total_size: 100 }]
+      };
+    }
+  });
+  const background = createBackground(fake.browser, { attempts: 1, delayMs: 0, timers: false });
+  await background.refreshTaskStatus();
+  unavailable = true;
+
+  await background.refreshTaskStatus();
+  const callsAfterFailure = fake.calls.nativeMessages.length;
+  const result = await background.handleRuntimeMessage({ type: 'get-task-summary' });
+
+  assert.equal(fake.calls.nativeMessages.length, callsAfterFailure);
+  assert.equal(result.ok, true);
+  assert.equal(result.tasks[0].task_id, 1);
+});
+test('popup refresh backs off after an initial GUI startup failure without cached tasks', async () => {
+  const fake = makeFakeBrowser({ nativeDisconnect: true });
+  const background = createBackground(fake.browser, { attempts: 1, delayMs: 0, timers: false });
+
+  const first = await background.handleRuntimeMessage({ type: 'get-task-summary' });
+  assert.equal(first.ok, false);
+  const callsAfterFailure = fake.calls.nativeMessages.length;
+  const second = await background.handleRuntimeMessage({ type: 'get-task-summary' });
+
+  assert.equal(fake.calls.nativeMessages.length, callsAfterFailure);
+  assert.equal(second.ok, false);
+});test('supported download pauses and opens one settings tab', async () => {
   const fake = makeFakeBrowser();
   const background = createBackground(fake.browser);
   await background.handleCreatedDownload({

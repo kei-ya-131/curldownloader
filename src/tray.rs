@@ -17,6 +17,7 @@ pub fn startup_visibility(start_minimized: bool) -> WindowVisibility {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayEvent {
     ShowWindow,
+    CloseWindow,
 }
 
 #[cfg(windows)]
@@ -34,7 +35,8 @@ mod windows_impl {
     };
     use windows_sys::Win32::{
         Foundation::{
-            ERROR_CLASS_ALREADY_EXISTS, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM,
+            ERROR_CLASS_ALREADY_EXISTS, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT,
+            WPARAM,
         },
         System::{LibraryLoader::GetModuleHandleW, Threading::GetCurrentThreadId},
         UI::{
@@ -43,10 +45,13 @@ mod windows_impl {
                 Shell_NotifyIconW,
             },
             WindowsAndMessaging::{
-                CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, DefWindowProcW, DestroyWindow,
-                DispatchMessageW, GWLP_USERDATA, GetMessageW, HWND_MESSAGE, LoadIconW,
-                RegisterClassW, SetWindowLongPtrW, TranslateMessage, WM_APP, WM_LBUTTONDBLCLK,
-                WM_NCCREATE, WM_NCDESTROY, WM_QUIT, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+                AppendMenuW, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CreatePopupMenu,
+                DefWindowProcW, DestroyMenu, DestroyWindow, DispatchMessageW, GWLP_USERDATA,
+                GetCursorPos, GetMessageW, HMENU, IDI_APPLICATION, LoadIconW, MF_STRING,
+                RegisterClassW, SetForegroundWindow, SetWindowLongPtrW, TPM_BOTTOMALIGN,
+                TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage,
+                WM_APP, WM_LBUTTONDBLCLK, WM_NCCREATE, WM_NCDESTROY, WM_QUIT, WM_RBUTTONUP,
+                WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
             },
         },
     };
@@ -54,6 +59,7 @@ mod windows_impl {
     const TRAY_ICON_ID: u32 = 1;
     const TRAY_ICON_RESOURCE: usize = 1;
     const TRAY_CALLBACK_MESSAGE: u32 = WM_APP + 1;
+    const TRAY_MENU_CLOSE_COMMAND: usize = 1001;
     const TRAY_CLASS_NAME: &[u16] = &[
         'C' as u16, 'u' as u16, 'r' as u16, 'l' as u16, 'D' as u16, 'o' as u16, 'w' as u16,
         'n' as u16, 'l' as u16, 'o' as u16, 'a' as u16, 'd' as u16, 'e' as u16, 'r' as u16,
@@ -68,6 +74,27 @@ mod windows_impl {
         'C' as u16, 'u' as u16, 'r' as u16, 'l' as u16, ' ' as u16, 'D' as u16, 'o' as u16,
         'w' as u16, 'n' as u16, 'l' as u16, 'o' as u16, 'a' as u16, 'd' as u16, 'e' as u16,
         'r' as u16, 0,
+    ];
+    const TRAY_MENU_CLOSE_LABEL: &[u16] = &[
+        '關' as u16,
+        '閉' as u16,
+        ' ' as u16,
+        'C' as u16,
+        'u' as u16,
+        'r' as u16,
+        'l' as u16,
+        ' ' as u16,
+        'D' as u16,
+        'o' as u16,
+        'w' as u16,
+        'n' as u16,
+        'l' as u16,
+        'o' as u16,
+        'a' as u16,
+        'd' as u16,
+        'e' as u16,
+        'r' as u16,
+        0,
     ];
 
     pub struct TrayController {
@@ -96,6 +123,44 @@ mod windows_impl {
         }
     }
 
+    fn show_tray_context_menu(hwnd: HWND, state: &TrayWindowState) {
+        let menu: HMENU = unsafe { CreatePopupMenu() };
+        if menu.is_null() {
+            return;
+        }
+
+        let command = unsafe {
+            let mut selected = 0;
+            if AppendMenuW(
+                menu,
+                MF_STRING,
+                TRAY_MENU_CLOSE_COMMAND,
+                TRAY_MENU_CLOSE_LABEL.as_ptr(),
+            ) != 0
+            {
+                let mut point = POINT::default();
+                if GetCursorPos(&mut point) != 0 {
+                    SetForegroundWindow(hwnd);
+                    selected = TrackPopupMenu(
+                        menu,
+                        TPM_RIGHTBUTTON | TPM_BOTTOMALIGN | TPM_LEFTALIGN | TPM_RETURNCMD,
+                        point.x,
+                        point.y,
+                        0,
+                        hwnd,
+                        ptr::null(),
+                    );
+                }
+            }
+            DestroyMenu(menu);
+            selected
+        };
+
+        if command == TRAY_MENU_CLOSE_COMMAND as i32 {
+            let _ = state.events.send(TrayEvent::CloseWindow);
+            (state.repaint)();
+        }
+    }
     unsafe extern "system" fn tray_window_proc(
         hwnd: HWND,
         message: u32,
@@ -115,15 +180,17 @@ mod windows_impl {
         let state = unsafe {
             windows_sys::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(hwnd, GWLP_USERDATA)
         } as *mut TrayWindowState;
-        if message == TRAY_CALLBACK_MESSAGE
-            && wparam == TRAY_ICON_ID as usize
-            && (lparam as u32) == WM_LBUTTONDBLCLK
-            && !state.is_null()
-        {
+        if message == TRAY_CALLBACK_MESSAGE && wparam == TRAY_ICON_ID as usize && !state.is_null() {
             unsafe {
                 let state = &*state;
-                let _ = state.events.send(TrayEvent::ShowWindow);
-                (state.repaint)();
+                match lparam as u32 {
+                    WM_LBUTTONDBLCLK => {
+                        let _ = state.events.send(TrayEvent::ShowWindow);
+                        (state.repaint)();
+                    }
+                    WM_RBUTTONUP => show_tray_context_menu(hwnd, state),
+                    _ => {}
+                }
             }
             return 0;
         }
@@ -170,7 +237,7 @@ mod windows_impl {
                 0,
                 0,
                 0,
-                HWND_MESSAGE,
+                ptr::null_mut(),
                 ptr::null_mut(),
                 hinstance,
                 state_ptr.cast(),
@@ -224,7 +291,12 @@ mod windows_impl {
             uCallbackMessage: TRAY_CALLBACK_MESSAGE,
             hIcon: unsafe {
                 let hinstance = GetModuleHandleW(ptr::null()) as HINSTANCE;
-                LoadIconW(hinstance, TRAY_ICON_RESOURCE as *const u16)
+                let custom_icon = LoadIconW(hinstance, TRAY_ICON_RESOURCE as *const u16);
+                if custom_icon.is_null() {
+                    LoadIconW(ptr::null_mut(), IDI_APPLICATION)
+                } else {
+                    custom_icon
+                }
             },
             ..Default::default()
         };
@@ -320,11 +392,16 @@ impl TrayController {
 
 #[cfg(test)]
 mod tests {
-    use super::{WindowVisibility, startup_visibility};
+    use super::{TrayEvent, WindowVisibility, startup_visibility};
 
     #[test]
     fn extension_startup_is_hidden_instead_of_flashing_a_window() {
         assert_eq!(startup_visibility(true), WindowVisibility::HiddenToTray);
         assert_eq!(startup_visibility(false), WindowVisibility::Visible);
+    }
+
+    #[test]
+    fn tray_close_is_a_distinct_explicit_exit_event() {
+        assert_ne!(TrayEvent::ShowWindow, TrayEvent::CloseWindow);
     }
 }
