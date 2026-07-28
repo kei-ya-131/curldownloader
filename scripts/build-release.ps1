@@ -1,4 +1,4 @@
-﻿$ErrorActionPreference = 'Stop'
+$ErrorActionPreference = 'Stop'
 
 Set-Location (Join-Path $PSScriptRoot '..')
 $target = 'x86_64-pc-windows-msvc'
@@ -12,30 +12,20 @@ if ((Get-FileHash -Algorithm SHA256 -LiteralPath 'assets/curl.exe').Hash.ToUpper
 }
 
 cargo fmt --check
-if ($LASTEXITCODE -ne 0) {
-    throw "cargo fmt failed with exit code $LASTEXITCODE."
-}
+if ($LASTEXITCODE -ne 0) { throw "cargo fmt failed with exit code $LASTEXITCODE." }
 cargo clippy --all-targets --target $target -- -D warnings
-if ($LASTEXITCODE -ne 0) {
-    throw "cargo clippy failed with exit code $LASTEXITCODE."
-}
+if ($LASTEXITCODE -ne 0) { throw "cargo clippy failed with exit code $LASTEXITCODE." }
 cargo test --target $target
-if ($LASTEXITCODE -ne 0) {
-    throw "cargo test failed with exit code $LASTEXITCODE."
-}
-cargo build --release --target $target
-if ($LASTEXITCODE -ne 0) {
-    throw "cargo build failed with exit code $LASTEXITCODE."
-}
+if ($LASTEXITCODE -ne 0) { throw "cargo test failed with exit code $LASTEXITCODE." }
+cargo build --release --target $target --bin curl-downloader
+if ($LASTEXITCODE -ne 0) { throw "cargo build curl-downloader failed with exit code $LASTEXITCODE." }
 
-if (Test-Path -LiteralPath 'dist') {
-    Remove-Item -LiteralPath 'dist' -Recurse -Force
-}
+if (Test-Path -LiteralPath 'dist') { Remove-Item -LiteralPath 'dist' -Recurse -Force }
 New-Item -ItemType Directory -Path 'dist' | Out-Null
 Copy-Item -LiteralPath "target/$target/release/curl-downloader.exe" -Destination 'dist/CurlDownloader.exe'
 
-$files = @(Get-ChildItem -LiteralPath 'dist' -File)
-if ($files.Count -ne 1 -or $files[0].Name -ne 'CurlDownloader.exe') {
-    throw 'Release must contain exactly one EXE.'
+$executables = @(Get-ChildItem -LiteralPath 'dist' -Filter '*.exe' -File)
+if ($executables.Count -ne 1 -or $executables[0].Name -ne 'CurlDownloader.exe') {
+    throw 'Release must contain exactly one CurlDownloader.exe.'
 }
 Get-FileHash -Algorithm SHA256 -LiteralPath 'dist/CurlDownloader.exe'

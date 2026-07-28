@@ -10,6 +10,7 @@ $runtimeFiles = @(
     'manifest.json',
     'core.js',
     'storage.js',
+    'status.js',
     'background.js',
     'settings.html',
     'settings.css',
@@ -32,9 +33,16 @@ try {
         }
         Copy-Item -LiteralPath $source -Destination (Join-Path $stageDirectory $file) -Force
     }
+    $sourceIcons = Join-Path $extensionRoot 'icons'
+    $stageIcons = Join-Path $stageDirectory 'icons'
+    $iconFiles = @(Get-ChildItem -LiteralPath $sourceIcons -Filter '*.png' -File -ErrorAction Stop)
+    if ($iconFiles.Count -lt 14) { throw 'Extension icon assets 不完整。' }
+    New-Item -ItemType Directory -Path $stageIcons -Force | Out-Null
+    foreach ($icon in $iconFiles) {
+        Copy-Item -LiteralPath $icon.FullName -Destination (Join-Path $stageIcons $icon.Name) -Force
+    }
     New-Item -ItemType Directory -Path $outputDirectory -Force | Out-Null
-    # CreateFromDirectory produces the same root layout as Compress-Archive, without
-    # the Windows PowerShell 5.1 file-lock race observed while archiving a stage folder.
+    # Compress-Archive-compatible root layout; ZipFile avoids the Windows PowerShell file-lock race.
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     [IO.Compression.ZipFile]::CreateFromDirectory(
         $stageDirectory,
@@ -45,10 +53,6 @@ try {
     Move-Item -LiteralPath $temporaryArchive -Destination $absoluteOutput -Force
     Write-Output "已建立 Firefox extension：$absoluteOutput"
 } finally {
-    if (Test-Path -LiteralPath $temporaryArchive) {
-        Remove-Item -LiteralPath $temporaryArchive -Force
-    }
-    if (Test-Path -LiteralPath $stageDirectory) {
-        Remove-Item -LiteralPath $stageDirectory -Recurse -Force
-    }
+    if (Test-Path -LiteralPath $temporaryArchive) { Remove-Item -LiteralPath $temporaryArchive -Force }
+    if (Test-Path -LiteralPath $stageDirectory) { Remove-Item -LiteralPath $stageDirectory -Recurse -Force }
 }

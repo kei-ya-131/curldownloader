@@ -1,4 +1,4 @@
-﻿[CmdletBinding()]
+[CmdletBinding()]
 param(
     [string]$ExecutablePath,
     [switch]$Uninstall
@@ -36,6 +36,7 @@ if (-not $Uninstall -and [string]::IsNullOrWhiteSpace($ExecutablePath)) {
         throw '找不到 CurlDownloader.exe，請以 -ExecutablePath 指定。'
     }
 }
+
 if ($Uninstall) {
     if (Test-Path -LiteralPath $registryPath) {
         $registeredPath = $null
@@ -49,9 +50,7 @@ if ($Uninstall) {
         }
         Remove-Item -LiteralPath $registryPath -Recurse -Force
     }
-    if (Test-Path -LiteralPath $manifestPath) {
-        Remove-Item -LiteralPath $manifestPath -Force
-    }
+    if (Test-Path -LiteralPath $manifestPath) { Remove-Item -LiteralPath $manifestPath -Force }
     Write-Output "已移除 $hostName Native host 註冊。"
     exit 0
 }
@@ -61,6 +60,9 @@ if (-not (Test-Path -LiteralPath $resolvedExecutable.Path -PathType Leaf)) {
     throw "ExecutablePath 不是檔案：$ExecutablePath"
 }
 $absoluteExecutable = Get-FullPath $resolvedExecutable.Path
+if ([IO.Path]::GetFileName($absoluteExecutable) -ne 'CurlDownloader.exe') {
+    throw 'Native host manifest 必須直接指向 CurlDownloader.exe。'
+}
 
 New-Item -ItemType Directory -Path $supportDirectory -Force | Out-Null
 $manifest = [ordered]@{
@@ -76,3 +78,4 @@ $json = $manifest | ConvertTo-Json -Depth 4
 New-Item -Path $registryPath -Force | Out-Null
 New-ItemProperty -LiteralPath $registryPath -Name '(default)' -Value $manifestPath -PropertyType String -Force | Out-Null
 Write-Output "已註冊 $hostName：$manifestPath"
+Write-Output "Native host path：$absoluteExecutable"
