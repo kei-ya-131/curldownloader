@@ -6,6 +6,7 @@ use crate::{
         ProxyProtocol, ProxySettings, TaskId, TaskSnapshot, TaskStatus,
     },
     storage,
+    tray::{self, TrayController, TrayEvent},
 };
 use eframe::egui;
 use std::{
@@ -87,6 +88,9 @@ pub struct CurlDownloaderApp {
     ipc_ui_receiver: Receiver<ipc::UiCommand>,
     pending_show_task: Option<TaskId>,
     start_minimized: bool,
+    hidden_to_tray: bool,
+    _tray: TrayController,
+    tray_receiver: Receiver<TrayEvent>,
     ipc_thread: Option<JoinHandle<()>>,
 }
 
@@ -163,13 +167,22 @@ impl CurlDownloaderApp {
         let ipc_stop = Arc::new(AtomicBool::new(false));
         let ipc_default_dir = Arc::new(Mutex::new(last_download_dir.clone()));
         let ipc_snapshots = Arc::new(Mutex::new(Vec::<TaskSnapshot>::new()));
+        let repaint_context = cc.egui_ctx.clone();
+        let repaint: Arc<dyn Fn() + Send + Sync> =
+            Arc::new(move || repaint_context.request_repaint());
+        let (tray, tray_receiver) = tray::TrayController::create(Arc::clone(&repaint))
+            .unwrap_or_else(|error| {
+                eprintln!("Windows 系統匣初始化失敗：{error}");
+                tray::TrayController::disabled()
+            });
         let (ipc_ui_sender, ipc_ui_receiver) = std::sync::mpsc::channel();
-        let ipc_thread = Some(ipc::spawn_server(
+        let ipc_thread = Some(ipc::spawn_server_with_repaint(
             engine.commands.clone(),
             Arc::clone(&ipc_default_dir),
             Arc::clone(&ipc_snapshots),
             ipc_ui_sender,
             Arc::clone(&ipc_stop),
+            repaint,
         ));
 
         cc.egui_ctx.set_fonts(chinese_font_definitions());
@@ -199,11 +212,26 @@ impl CurlDownloaderApp {
             ipc_ui_receiver,
             pending_show_task: None,
             start_minimized,
+            hidden_to_tray: start_minimized,
+            _tray: tray,
+            tray_receiver,
             ipc_thread,
         }
     }
 
-    fn pump_events(&mut self, ctx: &egui::Context) {
+    fn pump_events(&mut self, ctx: &egui::Context) -> bool {
+        let mut restored = false;
+        while let Ok(event) = self.tray_receiver.try_recv() {
+            match event {
+                TrayEvent::ShowWindow => {
+                    self.hidden_to_tray = false;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    restored = true;
+                }
+            }
+        }
         while let Ok(event) = self.engine.events.try_recv() {
             match event {
                 EngineEvent::Snapshot(tasks) => {
@@ -272,10 +300,14 @@ impl CurlDownloaderApp {
         {
             self.selected = Some(selected);
             self.draft = None;
+            self.hidden_to_tray = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             self.pending_show_task = None;
+            restored = true;
         }
+        restored
     }
 
     fn selected_task(&self) -> Option<TaskSnapshot> {
@@ -1039,10 +1071,18 @@ impl eframe::App for CurlDownloaderApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         if self.start_minimized {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             self.start_minimized = false;
+            self.hidden_to_tray = true;
         }
-        self.pump_events(&ctx);
+        let restored = self.pump_events(&ctx);
+        if !restored
+            && !self.hidden_to_tray
+            && ctx.input(|input| input.viewport().minimized == Some(true))
+        {
+            self.hidden_to_tray = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
         if ctx.input(|input| input.viewport().close_requested()) && !self.shutting_down {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.shutting_down = true;

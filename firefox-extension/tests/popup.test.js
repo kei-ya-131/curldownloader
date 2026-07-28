@@ -1,6 +1,9 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { formatBytes, formatProgress, statusLabel, splitTasks } = require('../popup.js');
+const { formatBytes, formatProgress, statusLabel, splitTasks, REFRESH_INTERVAL_MS } = require('../popup.js');
+test('refreshes task summaries frequently enough for fast downloads', () => {
+  assert.ok(REFRESH_INTERVAL_MS <= 250);
+});
 
 test('formats task summary values for the popup', () => {
   assert.equal(formatBytes(1_048_576), '1.00 MiB');

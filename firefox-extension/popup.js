@@ -7,6 +7,7 @@
 })(typeof globalThis === 'object' ? globalThis : this, function (browserApi) {
   'use strict';
 
+  const REFRESH_INTERVAL_MS = 200;
   const terminalStatuses = new Set(['completed', 'cancelled']);
   const statusLabels = {
     queued: '排隊中',
@@ -215,7 +216,7 @@
     }
 
     void refresh();
-    timer = setInterval(() => { void refresh(); }, 1000);
+    timer = setInterval(() => { void refresh(); }, REFRESH_INTERVAL_MS);
     const stop = () => {
       if (timer !== null) clearInterval(timer);
       timer = null;
@@ -234,5 +235,5 @@
     }
   }
 
-  return { formatBytes, formatProgress, statusLabel, splitTasks, startPopup };
+  return { formatBytes, formatProgress, statusLabel, splitTasks, startPopup, REFRESH_INTERVAL_MS };
 });

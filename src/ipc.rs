@@ -284,6 +284,24 @@ pub fn spawn_server(
     ui_commands: Sender<UiCommand>,
     stop: Arc<AtomicBool>,
 ) -> thread::JoinHandle<()> {
+    spawn_server_with_repaint(
+        commands,
+        last_download_dir,
+        snapshots,
+        ui_commands,
+        stop,
+        Arc::new(|| {}),
+    )
+}
+
+pub fn spawn_server_with_repaint(
+    commands: Sender<EngineCommand>,
+    last_download_dir: Arc<Mutex<PathBuf>>,
+    snapshots: SharedSnapshots,
+    ui_commands: Sender<UiCommand>,
+    stop: Arc<AtomicBool>,
+    repaint: Arc<dyn Fn() + Send + Sync>,
+) -> thread::JoinHandle<()> {
     #[cfg(windows)]
     {
         let waker_stop = Arc::clone(&stop);
@@ -302,14 +320,28 @@ pub fn spawn_server(
         thread::Builder::new()
             .name("native-bridge-pipe".into())
             .spawn(move || {
-                run_windows_server(commands, last_download_dir, snapshots, ui_commands, stop)
+                run_windows_server(
+                    commands,
+                    last_download_dir,
+                    snapshots,
+                    ui_commands,
+                    stop,
+                    repaint,
+                )
             })
             .expect("無法啟動 Native Messaging Named Pipe 伺服器")
     }
 
     #[cfg(not(windows))]
     {
-        let _ = (commands, last_download_dir, snapshots, ui_commands, stop);
+        let _ = (
+            commands,
+            last_download_dir,
+            snapshots,
+            ui_commands,
+            stop,
+            repaint,
+        );
         thread::Builder::new()
             .name("native-bridge-pipe".into())
             .spawn(|| {})
@@ -386,6 +418,7 @@ fn run_windows_server(
     snapshots: SharedSnapshots,
     ui_commands: Sender<UiCommand>,
     stop: Arc<AtomicBool>,
+    repaint: Arc<dyn Fn() + Send + Sync>,
 ) {
     use std::{
         fs::File,
@@ -447,6 +480,7 @@ fn run_windows_server(
                     &last_download_dir,
                     &snapshots,
                     &ui_commands,
+                    &repaint,
                 );
                 if let Ok(body) = serde_json::to_vec(&response) {
                     let _ = write_frame(&mut stream, &body);
@@ -464,6 +498,7 @@ fn dispatch_request(
     last_download_dir: &Arc<Mutex<PathBuf>>,
     snapshots: &SharedSnapshots,
     ui_commands: &Sender<UiCommand>,
+    repaint: &Arc<dyn Fn() + Send + Sync>,
 ) -> IpcResponse {
     match request {
         IpcRequest::Ping { request_id } => IpcResponse::Pong {
@@ -512,6 +547,7 @@ fn dispatch_request(
                     "Curl Downloader GUI 未能接收操作。",
                 )
             } else {
+                repaint();
                 action_success(request_id)
             }
         }
