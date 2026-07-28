@@ -5,7 +5,7 @@ use crate::{
         CurlSource, EngineCommand, EngineEvent, GlobalSettings, NewTask, PersistedState,
         ProxyProtocol, ProxySettings, TaskId, TaskSnapshot, TaskStatus,
     },
-    storage,
+    startup_policy, storage,
     tray::{self, TrayController, TrayEvent},
 };
 use eframe::egui;
@@ -88,6 +88,7 @@ pub struct CurlDownloaderApp {
     ipc_ui_receiver: Receiver<ipc::UiCommand>,
     pending_show_task: Option<TaskId>,
     start_minimized: bool,
+    manual_stop_path: PathBuf,
     hidden_to_tray: bool,
     _tray: TrayController,
     tray_receiver: Receiver<TrayEvent>,
@@ -121,6 +122,7 @@ impl CurlDownloaderApp {
                 .join("CurlDownloader")
                 .join("state.json")
         });
+        let manual_stop_path = storage::manual_stop_path(&state_path);
         let default_dir = storage::default_download_dir()
             .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default());
         let (state, fatal) = match storage::load_state(&state_path) {
@@ -216,6 +218,7 @@ impl CurlDownloaderApp {
             ipc_ui_receiver,
             pending_show_task: None,
             start_minimized,
+            manual_stop_path,
             hidden_to_tray: start_minimized,
             _tray: tray,
             tray_receiver,
@@ -227,6 +230,10 @@ impl CurlDownloaderApp {
         if self.shutting_down {
             return;
         }
+        let _ = startup_policy::record_manual_stop(
+            &self.manual_stop_path,
+            startup_policy::unix_time_ms(),
+        );
         self.shutting_down = true;
         self.ipc_stop.store(true, Ordering::Release);
         let _ = self.engine.commands.send(EngineCommand::Shutdown);

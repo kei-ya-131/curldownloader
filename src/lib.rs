@@ -11,5 +11,6 @@ pub mod model;
 pub mod native_host;
 pub mod native_registration;
 pub mod single_instance;
+pub mod startup_policy;
 pub mod storage;
 pub mod tray;

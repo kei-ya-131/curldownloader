@@ -376,6 +376,19 @@ pub fn call_pipe_with_retry(
     retry_delay: Duration,
     attempts: usize,
 ) -> io::Result<IpcResponse> {
+    call_pipe_with_retry_until(request, timeout, retry_delay, attempts, || true)
+}
+
+pub fn call_pipe_with_retry_until<F>(
+    request: &IpcRequest,
+    timeout: Duration,
+    retry_delay: Duration,
+    attempts: usize,
+    mut should_continue: F,
+) -> io::Result<IpcResponse>
+where
+    F: FnMut() -> bool,
+{
     if attempts == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -385,6 +398,12 @@ pub fn call_pipe_with_retry(
 
     let mut last_error = None;
     for attempt in 0..attempts {
+        if !should_continue() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "Curl Downloader 已由使用者關閉",
+            ));
+        }
         match call_pipe(request, timeout) {
             Ok(response) => return Ok(response),
             Err(error) if is_pipe_connection_error(&error) && attempt + 1 < attempts => {
@@ -878,6 +897,22 @@ fn pipe_name_wide() -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pipe_retry_can_be_cancelled_before_opening_another_host_connection() {
+        let request = IpcRequest::Ping {
+            request_id: "manual-stop".into(),
+        };
+        let error = call_pipe_with_retry_until(
+            &request,
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+            5,
+            || false,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+    }
+
     #[test]
     fn named_pipe_uses_an_authenticated_user_security_descriptor() {
         assert_eq!(named_pipe_security_descriptor_sddl(), "D:(A;;GA;;;AU)");

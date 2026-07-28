@@ -35,6 +35,9 @@ fn current_portable_executable() -> Option<PathBuf> {
     (environment_enabled || root.join(PORTABLE_MARKER).is_file()).then_some(executable)
 }
 
+pub fn manual_stop_path(state_path: &Path) -> PathBuf {
+    crate::startup_policy::manual_stop_path(state_path)
+}
 pub fn default_download_dir() -> io::Result<PathBuf> {
     let home = PathBuf::from(
         env::var_os("USERPROFILE")
@@ -107,6 +110,15 @@ mod tests {
             root.join("data").join("state.json")
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn manual_stop_path_shares_the_state_directory() {
+        let state = PathBuf::from(r"C:\Portable\data\state.json");
+        assert_eq!(
+            manual_stop_path(&state),
+            PathBuf::from(r"C:\Portable\data\manual-stop.json")
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use crate::{
     ipc::{self, IpcRequest, IpcResponse, MAX_FRAME_BYTES, WireError},
-    single_instance,
+    single_instance, startup_policy,
 };
 use std::{
     ffi::OsString,
@@ -123,26 +123,59 @@ fn run_native_host_io<R: Read, W: Write>(mut input: R, mut output: W) -> io::Res
     }
 }
 
+fn native_start_policy(body: &[u8]) -> startup_policy::NativeStartPolicy {
+    serde_json::from_slice(body).unwrap_or_default()
+}
+
+fn forward_error_code(error: &io::Error) -> &'static str {
+    match error.kind() {
+        io::ErrorKind::Interrupted => "manually_stopped",
+        io::ErrorKind::WouldBlock => "gui_not_running",
+        _ => "bridge_unavailable",
+    }
+}
+
 fn process_message(body: &[u8]) -> IpcResponse {
     let request_id = request_id_from_body(body);
     match serde_json::from_slice::<IpcRequest>(body) {
-        Ok(request) => match forward_request(&request) {
-            Ok(response) => response,
-            Err(error) => error_response(
-                &request_id,
-                "bridge_unavailable",
-                &redacted_error_message(&error),
-            ),
-        },
+        Ok(request) => {
+            let policy = native_start_policy(body);
+            match forward_request(&request, policy) {
+                Ok(response) => response,
+                Err(error) => error_response(
+                    &request_id,
+                    forward_error_code(&error),
+                    &redacted_error_message(&error),
+                ),
+            }
+        }
         Err(_) => error_response(&request_id, "invalid_json", "Native Messaging JSON 無效"),
     }
 }
 
-fn forward_request(request: &IpcRequest) -> io::Result<IpcResponse> {
+fn forward_request(
+    request: &IpcRequest,
+    policy: startup_policy::NativeStartPolicy,
+) -> io::Result<IpcResponse> {
     let timeout = Duration::from_millis(500);
     match ipc::call_pipe(request, timeout) {
         Ok(response) => Ok(response),
         Err(error) if should_start_gui(&error) => {
+            let state_path = crate::storage::state_path()?;
+            let stop_path = crate::storage::manual_stop_path(&state_path);
+            let stopped_at = startup_policy::read_manual_stop(&stop_path)?;
+            if !policy.permits_start(stopped_at) {
+                return Err(io::Error::new(
+                    if policy.auto_start {
+                        io::ErrorKind::Interrupted
+                    } else {
+                        io::ErrorKind::WouldBlock
+                    },
+                    "GUI 啟動不獲允許",
+                ));
+            }
+            startup_policy::clear_manual_stop(&stop_path)?;
+
             let _start_guard = if !single_instance::is_running() {
                 let guard = single_instance::acquire_start_guard().map_err(io::Error::other)?;
                 if guard.is_some() && !single_instance::is_running() {
@@ -153,11 +186,15 @@ fn forward_request(request: &IpcRequest) -> io::Result<IpcResponse> {
             } else {
                 None
             };
-            ipc::call_pipe_with_retry(
+            ipc::call_pipe_with_retry_until(
                 request,
                 Duration::from_millis(100),
                 Duration::from_millis(100),
                 50,
+                || match startup_policy::read_manual_stop(&stop_path) {
+                    Ok(stopped_at) => policy.permits_start(stopped_at),
+                    Err(_) => false,
+                },
             )
         }
         Err(error) => Err(error),
@@ -195,6 +232,8 @@ fn error_response(request_id: &str, code: &str, message: &str) -> IpcResponse {
 
 fn redacted_error_message(error: &io::Error) -> String {
     match error.kind() {
+        io::ErrorKind::Interrupted => "Curl Downloader 已由使用者關閉".into(),
+        io::ErrorKind::WouldBlock => "Curl Downloader GUI 尚未啟動".into(),
         io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused | io::ErrorKind::TimedOut => {
             "Curl Downloader GUI 未能連線".into()
         }
@@ -292,6 +331,27 @@ mod tests {
         let plan = minimized_launch_plan(Path::new(r"C:\Tools\CurlDownloader.exe"));
         assert_ne!(plan.creation_flags & CREATE_BREAKAWAY_FROM_JOB, 0);
         assert_ne!(plan.creation_flags & CREATE_NO_WINDOW, 0);
+    }
+    #[test]
+    fn native_policy_uses_snake_case_and_legacy_camel_case_fields() {
+        let snake = native_start_policy(
+            br#"{"type":"list_tasks","auto_start":true,"start_intent_unix_ms":200}"#,
+        );
+        assert!(snake.auto_start);
+        assert_eq!(snake.start_intent_unix_ms, Some(200));
+
+        let camel = native_start_policy(
+            br#"{"type":"list_tasks","autoStart":true,"startIntentUnixMs":201}"#,
+        );
+        assert_eq!(camel.start_intent_unix_ms, Some(201));
+    }
+
+    #[test]
+    fn manually_stopped_error_has_a_stable_wire_code() {
+        assert_eq!(
+            forward_error_code(&io::Error::new(io::ErrorKind::Interrupted, "stopped")),
+            "manually_stopped"
+        );
     }
     #[test]
     fn malformed_json_produces_one_redacted_response_frame() {

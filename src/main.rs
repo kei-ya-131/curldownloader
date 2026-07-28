@@ -2,7 +2,7 @@
 
 use curl_downloader::{
     app::{CurlDownloaderApp, focus_existing_main_window},
-    ipc, native_host, native_registration, single_instance,
+    ipc, native_host, native_registration, single_instance, startup_policy, storage,
 };
 
 fn main() -> eframe::Result {
@@ -46,6 +46,11 @@ fn run_gui(minimized: bool) -> eframe::Result {
             return Ok(());
         }
     };
+    if !minimized {
+        if let Ok(state_path) = storage::state_path() {
+            let _ = startup_policy::clear_manual_stop(&storage::manual_stop_path(&state_path));
+        }
+    }
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("Curl Downloader")
