@@ -25,12 +25,25 @@ pub fn is_native_host_invocation(arguments: &[OsString]) -> bool {
 pub struct LaunchPlan {
     pub program: PathBuf,
     pub args: Vec<OsString>,
+    pub creation_flags: u32,
+}
+
+#[cfg(windows)]
+fn detached_gui_creation_flags() -> u32 {
+    use windows_sys::Win32::System::Threading::{CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW};
+    CREATE_BREAKAWAY_FROM_JOB | CREATE_NO_WINDOW
+}
+
+#[cfg(not(windows))]
+fn detached_gui_creation_flags() -> u32 {
+    0
 }
 
 pub fn launch_plan(executable: &Path) -> LaunchPlan {
     LaunchPlan {
         program: executable.to_path_buf(),
         args: Vec::new(),
+        creation_flags: detached_gui_creation_flags(),
     }
 }
 
@@ -38,6 +51,7 @@ pub fn minimized_launch_plan(executable: &Path) -> LaunchPlan {
     LaunchPlan {
         program: executable.to_path_buf(),
         args: vec![OsString::from("--minimized")],
+        creation_flags: detached_gui_creation_flags(),
     }
 }
 
@@ -78,7 +92,7 @@ pub fn launch_gui(executable: &Path, minimized: bool) -> io::Result<Child> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        command.creation_flags(0x0800_0000);
+        command.creation_flags(plan.creation_flags);
     }
     command.spawn()
 }
@@ -270,6 +284,15 @@ mod tests {
         assert_eq!(plan.args, vec![OsString::from("--minimized")]);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn firefox_started_gui_breaks_away_from_native_host_job() {
+        use windows_sys::Win32::System::Threading::{CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW};
+
+        let plan = minimized_launch_plan(Path::new(r"C:\Tools\CurlDownloader.exe"));
+        assert_ne!(plan.creation_flags & CREATE_BREAKAWAY_FROM_JOB, 0);
+        assert_ne!(plan.creation_flags & CREATE_NO_WINDOW, 0);
+    }
     #[test]
     fn malformed_json_produces_one_redacted_response_frame() {
         let mut input = Vec::new();
