@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">Curl Downloader</title>
+  <desc id="desc">Cyberpunk download arrow inside a neon progress ring</desc>
+  <defs>
+    <linearGradient id="graphite" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#111827"/>
+      <stop offset="1" stop-color="#030712"/>
+    </linearGradient>
+    <linearGradient id="cyan" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#67e8f9"/>
+      <stop offset="1" stop-color="#00d9ff"/>
+    </linearGradient>
+    <filter id="glow-cyan" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="5" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="glow-magenta" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="3" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="44" fill="url(#graphite)" stroke="#263247" stroke-width="6"/>
+  <path d="M36 68h22l12-12h30" fill="none" stroke="#d946ef" stroke-width="5" stroke-linecap="round" filter="url(#glow-magenta)"/>
+  <circle cx="36" cy="68" r="5" fill="#d946ef"/>
+  <path d="M220 188h-22l-12 12h-30" fill="none" stroke="#d946ef" stroke-width="5" stroke-linecap="round" filter="url(#glow-magenta)"/>
+  <circle cx="220" cy="188" r="5" fill="#d946ef"/>
+  <circle cx="128" cy="128" r="88" fill="none" stroke="#18243a" stroke-width="14"/>
+  <path d="M128 40a88 88 0 0 1 88 88" fill="none" stroke="#d946ef" stroke-width="8" stroke-linecap="round"/>
+  <path d="M216 128a88 88 0 0 1-88 88" fill="none" stroke="#00d9ff" stroke-width="8" stroke-linecap="round" filter="url(#glow-cyan)"/>
+  <path d="M128 68v86" fill="none" stroke="url(#cyan)" stroke-width="22" stroke-linecap="round" filter="url(#glow-cyan)"/>
+  <path d="M84 132l44 48 44-48" fill="none" stroke="url(#cyan)" stroke-width="22" stroke-linecap="round" stroke-linejoin="round" filter="url(#glow-cyan)"/>
+  <path d="M84 190h88" fill="none" stroke="#67e8f9" stroke-width="9" stroke-linecap="round"/>
+</svg>

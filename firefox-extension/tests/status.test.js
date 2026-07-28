@@ -1,6 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { summarizeTasks, badgeState } = require('../status.js');
+const status = require('../status.js');
+const { summarizeTasks, badgeState } = status;
 
 test('weights overall progress by total bytes and counts active tasks', () => {
   const summary = summarizeTasks([
@@ -19,6 +20,16 @@ test('uses an indeterminate percentage when all active totals are unknown', () =
   assert.equal(badgeState(summary).text, '—/1');
 });
 
+test('selects the nearest Cyber progress icon while preserving base sizes', () => {
+  assert.deepEqual(status.iconDetails(48), { path: 'icons/progress-050.png' });
+  assert.deepEqual(status.iconDetails(null), {
+    path: {
+      16: 'icons/curl-downloader-16.png',
+      32: 'icons/curl-downloader-32.png',
+      48: 'icons/curl-downloader-48.png'
+    }
+  });
+});
 test('failed and cancelled tasks do not count as active but failures produce warning state', () => {
   const summary = summarizeTasks([
     { status: 'failed', downloaded: 10, total_size: 100 },

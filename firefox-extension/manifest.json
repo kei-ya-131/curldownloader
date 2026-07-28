@@ -18,11 +18,16 @@
   ],
   "incognito": "spanning",
   "background": {
-    "scripts": ["core.js", "storage.js", "background.js"],
+    "scripts": ["core.js", "storage.js", "status.js", "background.js"],
     "persistent": true
   },
   "browser_action": {
     "default_title": "Curl Downloader",
-    "default_popup": "popup.html"
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/curl-downloader-16.png",
+      "32": "icons/curl-downloader-32.png",
+      "48": "icons/curl-downloader-48.png"
+    }
   }
 }

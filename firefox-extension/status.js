@@ -90,5 +90,17 @@
     };
   }
 
-  return { ACTIVE_STATUSES, summarizeTasks, badgeState };
+  const BASE_ICON_PATHS = {
+    16: 'icons/curl-downloader-16.png',
+    32: 'icons/curl-downloader-32.png',
+    48: 'icons/curl-downloader-48.png'
+  };
+
+  function iconDetails(progressStep) {
+    if (!Number.isInteger(progressStep)) return { path: BASE_ICON_PATHS };
+    const percent = Math.min(100, Math.max(0, Math.round(progressStep / 10) * 10));
+    return { path: `icons/progress-${String(percent).padStart(3, '0')}.png` };
+  }
+
+  return { ACTIVE_STATUSES, summarizeTasks, badgeState, iconDetails, BASE_ICON_PATHS };
 });
