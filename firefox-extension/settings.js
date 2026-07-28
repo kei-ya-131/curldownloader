@@ -91,7 +91,7 @@
     retryButton.disabled = true;
     setStatus('正在等待 Curl Downloader…');
     try {
-      const response = await browser.runtime.sendMessage({ type: 'get-defaults' });
+      const response = await browser.runtime.sendMessage({ type: 'get-defaults', startIntentUnixMs: Date.now() });
       if (response && response.ok) {
         retryButton.hidden = true;
         return response;
@@ -128,7 +128,7 @@
     submitButton.disabled = true;
     setStatus('正在交給 Curl Downloader…');
     try {
-      const response = await browser.runtime.sendMessage({ type: 'submit-external', downloadId, form });
+      const response = await browser.runtime.sendMessage({ type: 'submit-external', downloadId, form, startIntentUnixMs: Date.now() });
       if (!response || !response.ok) {
         const message = response && response.error ? response.error : 'Native host 未能接收任務';
         if (!message.startsWith('Native host')) {
@@ -151,7 +151,7 @@
     setProxyEnabled(event.target.checked);
   });
   document.getElementById('browse').addEventListener('click', async () => {
-    const response = await browser.runtime.sendMessage({ type: 'pick-folder', downloadId });
+    const response = await browser.runtime.sendMessage({ type: 'pick-folder', downloadId, startIntentUnixMs: Date.now() });
     if (response && response.ok && response.targetDir) {
       document.getElementById('target-dir').value = response.targetDir;
     } else if (response && response.error) {

@@ -20,6 +20,16 @@
   'use strict';
   runtimeOptions = runtimeOptions || {};
   status = status || {};
+  const now = typeof runtimeOptions.now === 'function' ? runtimeOptions.now : Date.now;
+
+  function startupFields(autoStart, startIntentUnixMs) {
+    if (!autoStart) return { auto_start: false };
+    const intent = Number(startIntentUnixMs);
+    return {
+      auto_start: true,
+      start_intent_unix_ms: Number.isFinite(intent) ? intent : now()
+    };
+  }
 
   const pendingDownloads = new Map();
   const settingsTabs = new Map();
@@ -197,7 +207,7 @@
     badgeRefreshInFlight = true;
     let failedResponse = null;
     try {
-      const response = await listTasks();
+      const response = await listTasks(options);
       if (!response || !response.ok) {
         failedResponse = response;
         throw new Error(response && response.error || '無法讀取 Curl Downloader 任務。');
@@ -338,13 +348,16 @@
     }
   }
 
-  async function submitExternalDownload(downloadId, form) {
+  async function submitExternalDownload(downloadId, form, startIntentUnixMs) {
     const pending = pendingDownloads.get(Number(downloadId));
     if (!pending) return { ok: false, error: '找不到暫停中的下載。' };
     const validationError = validateForm(form);
     if (validationError) return { ok: false, error: validationError };
 
-    const request = core.buildEnqueueMessage(pending, form, 'pending');
+    const request = {
+      ...core.buildEnqueueMessage(pending, form, 'pending'),
+      ...startupFields(true, startIntentUnixMs)
+    };
     let accepted = false;
     try {
       const response = await sendNativeWithRetry(request);
@@ -383,9 +396,12 @@
     return Number.isSafeInteger(taskId) && taskId >= 0 ? taskId : null;
   }
 
-  async function listTasks() {
+  async function listTasks(options = {}) {
     try {
-      const response = await sendNativeWithRetry({ type: 'list_tasks', autoStart: true });
+      const response = await sendNativeWithRetry({
+        type: 'list_tasks',
+        ...startupFields(Boolean(options.autoStart), options.startIntentUnixMs)
+      });
       if (!response || response.type !== 'task_list' || !Array.isArray(response.tasks)) {
         return { ok: false, error: '無法讀取 Curl Downloader 任務。' };
       }
@@ -404,7 +420,7 @@
       'open-folder': 'open_folder'
     }[message.type];
     try {
-      const response = await sendNativeWithRetry({ type: nativeType, task_id: taskId });
+      const response = await sendNativeWithRetry({ type: nativeType, task_id: taskId, ...startupFields(true, message.startIntentUnixMs) });
       if (!response || response.type !== 'action_result') {
         return { ok: false, error: 'Curl Downloader 未能完成操作。' };
       }
@@ -429,7 +445,7 @@
       const pending = pendingDownloads.get(id);
       return pending ? { ok: true, download: clonePending(pending) } : { ok: false, error: '找不到下載項目。' };
     }
-    if (message.type === 'submit-external') return submitExternalDownload(id, message.form);
+    if (message.type === 'submit-external') return submitExternalDownload(id, message.form, message.startIntentUnixMs);
     if (message.type === 'restore-firefox' || message.type === 'fallback') {
       const pending = pendingDownloads.get(id);
       if (!pending) return { ok: false, error: '找不到下載項目。' };
@@ -446,7 +462,7 @@
     }
     if (message.type === 'pick-folder') {
       try {
-        const response = await sendNativeWithRetry({ type: 'pick_folder' });
+        const response = await sendNativeWithRetry({ type: 'pick_folder', ...startupFields(true, message.startIntentUnixMs) });
         if (response && response.type === 'folder') {
           return {
             ok: Boolean(response.ok),
@@ -459,13 +475,13 @@
         return nativeUnavailable('Curl Downloader 未啟動或尚未註冊 Native host，無法開啟目錄選擇器。');
       }
     }
-    if (message.type === 'get-task-summary') return refreshTaskStatus({ fromPopup: true });
+    if (message.type === 'get-task-summary') return refreshTaskStatus({ fromPopup: true, autoStart: Boolean(message.autoStart), startIntentUnixMs: message.startIntentUnixMs });
     if (message.type === 'show-task' || message.type === 'open-file' || message.type === 'open-folder') {
       return sendTaskAction(message);
     }
     if (message.type === 'get-defaults') {
       try {
-        const response = await sendNativeWithRetry({ type: 'get_defaults' });
+        const response = await sendNativeWithRetry({ type: 'get_defaults', ...startupFields(true, message.startIntentUnixMs) });
         return response && response.type === 'defaults'
           ? { ok: true, targetDir: response.target_dir || '' }
           : { ok: false, error: '無法讀取 Curl Downloader 預設目錄。' };

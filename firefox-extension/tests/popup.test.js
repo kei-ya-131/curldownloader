@@ -1,6 +1,17 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { formatBytes, formatProgress, statusLabel, splitTasks, REFRESH_INTERVAL_MS } = require('../popup.js');
+const { formatBytes, formatProgress, statusLabel, splitTasks, popupRefreshRequest, REFRESH_INTERVAL_MS } = require('../popup.js');
+test('only the first popup refresh may start Curl Downloader', () => {
+  assert.deepEqual(popupRefreshRequest(true, 123), {
+    type: 'get-task-summary',
+    autoStart: true,
+    startIntentUnixMs: 123
+  });
+  assert.deepEqual(popupRefreshRequest(false, 124), {
+    type: 'get-task-summary',
+    autoStart: false
+  });
+});
 test('refreshes task summaries frequently enough for fast downloads', () => {
   assert.ok(REFRESH_INTERVAL_MS <= 250);
 });

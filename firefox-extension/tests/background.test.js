@@ -131,6 +131,61 @@ test('serializes two Native calls so only one is in flight', async () => {
   ]);
   assert.equal(fake.maxNativeInFlight, 1);
 });
+test('background refresh cannot start the GUI but a new popup can', async () => {
+  const fake = makeFakeBrowser({
+    nativeResponse: () => ({ type: 'task_list', tasks: [] })
+  });
+  const background = createBackground(fake.browser, {
+    attempts: 1,
+    delayMs: 0,
+    timers: false,
+    now: () => 500
+  });
+
+  await background.refreshTaskStatus();
+  assert.equal(fake.calls.nativeMessages[0].auto_start, false);
+  assert.equal(fake.calls.nativeMessages[0].start_intent_unix_ms, undefined);
+
+  await background.handleRuntimeMessage({
+    type: 'get-task-summary',
+    autoStart: true,
+    startIntentUnixMs: 499
+  });
+  assert.equal(fake.calls.nativeMessages[1].auto_start, true);
+  assert.equal(fake.calls.nativeMessages[1].start_intent_unix_ms, 499);
+});
+
+test('new download is always an explicit GUI start intent', async () => {
+  const fake = makeFakeBrowser({
+    nativeResponse: (message) => message.type === 'enqueue'
+      ? { type: 'enqueue_result', ok: true, task_id: 8 }
+      : { type: 'task_list', tasks: [] }
+  });
+  const background = createBackground(fake.browser, {
+    attempts: 1,
+    delayMs: 0,
+    timers: false,
+    now: () => 700
+  });
+  await background.handleCreatedDownload({
+    id: 3,
+    url: 'https://example.test/a.zip',
+    filename: 'a.zip'
+  });
+  await background.handleRuntimeMessage({
+    type: 'submit-external',
+    downloadId: 3,
+    startIntentUnixMs: 700,
+    form: {
+      filename: 'a.zip',
+      targetDir: 'C:\\Downloads',
+      proxy: { enabled: false }
+    }
+  });
+  const enqueue = fake.calls.nativeMessages.find((message) => message.type === 'enqueue');
+  assert.equal(enqueue.auto_start, true);
+  assert.equal(enqueue.start_intent_unix_ms, 700);
+});
 test('stops background badge polling when the task list has no active tasks', async () => {
   const fake = makeFakeBrowser({ nativeResponse: () => ({ type: 'task_list', tasks: [] }) });
   const background = createBackground(fake.browser, { attempts: 1, delayMs: 0, timers: false });
@@ -146,7 +201,7 @@ test('restarts the GUI minimized after a closed-GUI pipe failure while tasks are
   ] }) });
   const background = createBackground(fake.browser, { attempts: 1, delayMs: 0, timers: false });
   await background.refreshTaskStatus();
-  assert.equal(fake.calls.nativeMessages[0].autoStart, true);
+  assert.equal(fake.calls.nativeMessages[0].auto_start, false);
   assert.equal(background.isBadgeSyncRunning(), true);
   assert.deepEqual(fake.calls.badgeText.at(-1), { text: '50%/1' });
 });
