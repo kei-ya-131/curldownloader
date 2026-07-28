@@ -21,7 +21,11 @@ function makeFakeBrowser({
     download: [],
     tabs: [],
     notifications: [],
-    nativeMessages: []
+    nativeMessages: [],
+    badgeText: [],
+    badgeColor: [],
+    badgeTitles: [],
+    badgeIcons: []
   };
   let nextTabId = 10;
   let nextDownloadId = 100;
@@ -53,6 +57,12 @@ function makeFakeBrowser({
         calls.tabs.push(tab);
         return tab;
       }
+    },
+    browserAction: {
+      async setBadgeText(details) { calls.badgeText.push(details); },
+      async setBadgeBackgroundColor(details) { calls.badgeColor.push(details); },
+      async setTitle(details) { calls.badgeTitles.push(details); },
+      async setIcon(details) { calls.badgeIcons.push(details); }
     },
     runtime: {
       sendNativeMessage: async (_hostName, message) => {
@@ -120,6 +130,25 @@ test('serializes two Native calls so only one is in flight', async () => {
     background.handleRuntimeMessage({ type: 'get-task-summary' })
   ]);
   assert.equal(fake.maxNativeInFlight, 1);
+});
+test('stops background badge polling when the task list has no active tasks', async () => {
+  const fake = makeFakeBrowser({ nativeResponse: () => ({ type: 'task_list', tasks: [] }) });
+  const background = createBackground(fake.browser, { attempts: 1, delayMs: 0, timers: false });
+  const result = await background.handleRuntimeMessage({ type: 'get-task-summary' });
+  assert.equal(result.ok, true);
+  assert.equal(background.isBadgeSyncRunning(), false);
+  assert.deepEqual(fake.calls.badgeText.at(-1), { text: '' });
+});
+
+test('restarts the GUI minimized after a closed-GUI pipe failure while tasks are active', async () => {
+  const fake = makeFakeBrowser({ nativeResponse: () => ({ type: 'task_list', tasks: [
+    { task_id: 1, status: 'downloading', downloaded: 50, total_size: 100 }
+  ] }) });
+  const background = createBackground(fake.browser, { attempts: 1, delayMs: 0, timers: false });
+  await background.refreshTaskStatus();
+  assert.equal(fake.calls.nativeMessages[0].autoStart, true);
+  assert.equal(background.isBadgeSyncRunning(), true);
+  assert.deepEqual(fake.calls.badgeText.at(-1), { text: '50%/1' });
 });
 test('supported download pauses and opens one settings tab', async () => {
   const fake = makeFakeBrowser();

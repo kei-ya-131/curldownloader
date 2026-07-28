@@ -4,6 +4,7 @@
       browserApi,
       require('./core.js'),
       require('./storage.js'),
+      require('./status.js'),
       options
     );
   } else {
@@ -11,12 +12,14 @@
       root.browser,
       root.CurlExtensionCore,
       root.CurlExtensionStorage,
+      root.CurlExtensionStatus,
       {}
     );
   }
-})(typeof globalThis === 'object' ? globalThis : this, function (browserApi, core, storage, runtimeOptions) {
+})(typeof globalThis === 'object' ? globalThis : this, function (browserApi, core, storage, status, runtimeOptions) {
   'use strict';
   runtimeOptions = runtimeOptions || {};
+  status = status || {};
 
   const pendingDownloads = new Map();
   const settingsTabs = new Map();
@@ -28,6 +31,17 @@
     attempts: Number.isInteger(runtimeOptions.attempts) ? Math.max(1, runtimeOptions.attempts) : 5,
     delayMs: Number.isFinite(runtimeOptions.delayMs) ? Math.max(0, runtimeOptions.delayMs) : 2000
   };
+  const badgeRefreshIntervalMs = Number.isFinite(runtimeOptions.badgeRefreshIntervalMs)
+    ? Math.max(50, runtimeOptions.badgeRefreshIntervalMs)
+    : 500;
+  const badgeTimersEnabled = runtimeOptions.timers !== false;
+  const browserActionApi = browserApi && (browserApi.browserAction || browserApi.action);
+  let badgeSyncTimer = null;
+  let badgeRefreshInFlight = false;
+  let badgeSyncRunning = false;
+  let lastBadgeSummary = null;
+  let lastTaskList = [];
+  let restartDelayMs = 500;
 
   function defaultProxy() {
     return { enabled: false, protocol: 'http', host: '', port: 8080, username: '' };
@@ -111,6 +125,93 @@
     throw lastError || new Error('Native host unavailable');
   }
 
+  function callBrowserAction(method, details) {
+    if (!browserActionApi || typeof browserActionApi[method] !== 'function') return;
+    try {
+      const result = browserActionApi[method](details);
+      if (result && typeof result.catch === 'function') result.catch(() => undefined);
+    } catch (_error) {
+      // BrowserAction updates are best effort and must not interrupt downloads.
+    }
+  }
+
+  function clearBadgeTimer() {
+    if (badgeSyncTimer !== null) clearTimeout(badgeSyncTimer);
+    badgeSyncTimer = null;
+  }
+
+  function scheduleBadgeRefresh(delayMs = badgeRefreshIntervalMs) {
+    clearBadgeTimer();
+    if (!badgeTimersEnabled || !badgeSyncRunning) return;
+    badgeSyncTimer = setTimeout(() => {
+      badgeSyncTimer = null;
+      void refreshTaskStatus();
+    }, Math.max(0, delayMs));
+    if (typeof badgeSyncTimer.unref === 'function') badgeSyncTimer.unref();
+  }
+
+  function applyBadge(summary, warning = false) {
+    if (!status.badgeState) return;
+    const state = status.badgeState(summary);
+    const color = warning ? '#d946ef' : state.color;
+    const title = warning
+      ? `${state.title}，正在重新連線`
+      : state.title;
+    callBrowserAction('setBadgeText', { text: state.text });
+    callBrowserAction('setBadgeBackgroundColor', { color });
+    callBrowserAction('setTitle', { title });
+    if (status.iconDetails) {
+      callBrowserAction('setIcon', status.iconDetails(state.progressStep));
+    }
+  }
+
+  function applyTaskSummary(tasks) {
+    const normalizedTasks = Array.isArray(tasks) ? tasks : [];
+    const summary = status.summarizeTasks(normalizedTasks);
+    lastTaskList = normalizedTasks;
+    lastBadgeSummary = summary;
+    if (summary.hasActive) {
+      badgeSyncRunning = true;
+      restartDelayMs = 500;
+      applyBadge(summary);
+      scheduleBadgeRefresh();
+    } else {
+      badgeSyncRunning = false;
+      clearBadgeTimer();
+      restartDelayMs = 500;
+      applyBadge(summary);
+    }
+    return summary;
+  }
+
+  async function refreshTaskStatus(_options = {}) {
+    if (badgeRefreshInFlight) return { ok: true, tasks: lastTaskList };
+    badgeRefreshInFlight = true;
+    let failedResponse = null;
+    try {
+      const response = await listTasks();
+      if (!response || !response.ok) {
+        failedResponse = response;
+        throw new Error(response && response.error || '無法讀取 Curl Downloader 任務。');
+      }
+      applyTaskSummary(response.tasks);
+      return response;
+    } catch (_error) {
+      if (lastBadgeSummary && lastBadgeSummary.hasActive) {
+        badgeSyncRunning = true;
+        applyBadge(lastBadgeSummary, true);
+        scheduleBadgeRefresh(restartDelayMs);
+        restartDelayMs = Math.min(30000, restartDelayMs * 2);
+      } else {
+        badgeSyncRunning = false;
+        clearBadgeTimer();
+        applyBadge({ activeCount: 0, hasFailure: false, hasProxyPassword: false });
+      }
+      return failedResponse || nativeUnavailable('Curl Downloader 未啟動或尚未註冊 Native host，無法讀取任務。');
+    } finally {
+      badgeRefreshInFlight = false;
+    }
+  }
   function nativeUnavailable(error) {
     return {
       ok: false,
@@ -247,6 +348,8 @@
         await notifyFailure('Curl Downloader 已接收任務，但 Firefox 原下載未能清理。');
       }
       pendingDownloads.delete(pending.downloadId);
+      restartDelayMs = 500;
+      void refreshTaskStatus();
       try {
         await storage.saveDefaults(form);
       } catch (_error) {
@@ -270,7 +373,7 @@
 
   async function listTasks() {
     try {
-      const response = await sendNativeWithRetry({ type: 'list_tasks' });
+      const response = await sendNativeWithRetry({ type: 'list_tasks', autoStart: true });
       if (!response || response.type !== 'task_list' || !Array.isArray(response.tasks)) {
         return { ok: false, error: '無法讀取 Curl Downloader 任務。' };
       }
@@ -344,7 +447,7 @@
         return nativeUnavailable('Curl Downloader 未啟動或尚未註冊 Native host，無法開啟目錄選擇器。');
       }
     }
-    if (message.type === 'get-task-summary') return listTasks();
+    if (message.type === 'get-task-summary') return refreshTaskStatus({ fromPopup: true });
     if (message.type === 'show-task' || message.type === 'open-file' || message.type === 'open-folder') {
       return sendTaskAction(message);
     }
@@ -384,6 +487,8 @@
     restoreFirefoxDownload,
     submitExternalDownload,
     handleRuntimeMessage,
-    sendNativeWithRetry
+    sendNativeWithRetry,
+    refreshTaskStatus,
+    isBadgeSyncRunning: () => badgeSyncRunning
   };
 });
