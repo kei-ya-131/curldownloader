@@ -131,7 +131,7 @@ test('serializes two Native calls so only one is in flight', async () => {
   ]);
   assert.equal(fake.maxNativeInFlight, 1);
 });
-test('background refresh cannot start the GUI but a new popup can', async () => {
+test('passive popup and badge queries never carry a start intent', async () => {
   const fake = makeFakeBrowser({
     nativeResponse: () => ({ type: 'task_list', tasks: [] })
   });
@@ -139,20 +139,38 @@ test('background refresh cannot start the GUI but a new popup can', async () => 
     attempts: 1,
     delayMs: 0,
     timers: false,
-    now: () => 500
+    now: () => 900
   });
-
+  await background.handleRuntimeMessage({ type: 'get-task-summary' });
   await background.refreshTaskStatus();
-  assert.equal(fake.calls.nativeMessages[0].auto_start, false);
-  assert.equal(fake.calls.nativeMessages[0].start_intent_unix_ms, undefined);
+  assert.equal(fake.calls.nativeMessages.every((message) =>
+    message.auto_start === false &&
+    message.start_intent_unix_ms === undefined
+  ), true);
+});
 
-  await background.handleRuntimeMessage({
-    type: 'get-task-summary',
-    autoStart: true,
-    startIntentUnixMs: 499
+test('initial defaults are passive but explicit retry may start the exe', async () => {
+  const fake = makeFakeBrowser({
+    nativeResponse: (message) => ({
+      type: 'defaults',
+      request_id: message.request_id,
+      target_dir: 'C:\\Downloads'
+    })
   });
+  const background = createBackground(fake.browser, {
+    attempts: 1,
+    delayMs: 0,
+    now: () => 1000
+  });
+  await background.handleRuntimeMessage({ type: 'get-defaults', autoStart: false });
+  await background.handleRuntimeMessage({
+    type: 'get-defaults',
+    autoStart: true,
+    startIntentUnixMs: 1000
+  });
+  assert.equal(fake.calls.nativeMessages[0].auto_start, false);
   assert.equal(fake.calls.nativeMessages[1].auto_start, true);
-  assert.equal(fake.calls.nativeMessages[1].start_intent_unix_ms, 499);
+  assert.equal(fake.calls.nativeMessages[1].start_intent_unix_ms, 1000);
 });
 
 test('new download is always an explicit GUI start intent', async () => {

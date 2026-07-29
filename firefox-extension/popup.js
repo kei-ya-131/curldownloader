@@ -61,17 +61,8 @@
     return { active, completed };
   }
 
-  function popupRefreshRequest(firstRefresh, now) {
-    return firstRefresh
-      ? {
-          type: 'get-task-summary',
-          autoStart: true,
-          startIntentUnixMs: now
-        }
-      : {
-          type: 'get-task-summary',
-          autoStart: false
-        };
+  function popupRefreshRequest() {
+    return { type: 'get-task-summary', autoStart: false };
   }
   function formatDuration(seconds) {
     const value = Math.max(0, Math.round(numberOrZero(seconds)));
@@ -192,7 +183,6 @@
     const completedCount = documentApi.getElementById('completed-count');
     let refreshInFlight = false;
     let timer = null;
-    let firstRefresh = true;
 
     function showError(message) {
       error.textContent = message || 'Curl Downloader 操作失敗。';
@@ -209,8 +199,7 @@
       if (refreshInFlight) return;
       refreshInFlight = true;
       try {
-        const request = popupRefreshRequest(firstRefresh, Date.now());
-      firstRefresh = false;
+        const request = popupRefreshRequest();
       const response = await api.runtime.sendMessage(request);
         if (!response || !response.ok) throw new Error(response && response.error || '未能讀取任務。');
         const groups = splitTasks(response.tasks);

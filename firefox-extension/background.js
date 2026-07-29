@@ -400,7 +400,7 @@
     try {
       const response = await sendNativeWithRetry({
         type: 'list_tasks',
-        ...startupFields(Boolean(options.autoStart), options.startIntentUnixMs)
+        ...startupFields(false)
       });
       if (!response || response.type !== 'task_list' || !Array.isArray(response.tasks)) {
         return { ok: false, error: '無法讀取 Curl Downloader 任務。' };
@@ -475,13 +475,13 @@
         return nativeUnavailable('Curl Downloader 未啟動或尚未註冊 Native host，無法開啟目錄選擇器。');
       }
     }
-    if (message.type === 'get-task-summary') return refreshTaskStatus({ fromPopup: true, autoStart: Boolean(message.autoStart), startIntentUnixMs: message.startIntentUnixMs });
+    if (message.type === 'get-task-summary') return refreshTaskStatus({ fromPopup: true });
     if (message.type === 'show-task' || message.type === 'open-file' || message.type === 'open-folder') {
       return sendTaskAction(message);
     }
     if (message.type === 'get-defaults') {
       try {
-        const response = await sendNativeWithRetry({ type: 'get_defaults', ...startupFields(true, message.startIntentUnixMs) });
+        const response = await sendNativeWithRetry({ type: 'get_defaults', ...startupFields(Boolean(message.autoStart), message.startIntentUnixMs) });
         return response && response.type === 'defaults'
           ? { ok: true, targetDir: response.target_dir || '' }
           : { ok: false, error: '無法讀取 Curl Downloader 預設目錄。' };

@@ -91,7 +91,7 @@
     retryButton.disabled = true;
     setStatus('正在等待 Curl Downloader…');
     try {
-      const response = await browser.runtime.sendMessage({ type: 'get-defaults', startIntentUnixMs: Date.now() });
+      const response = await browser.runtime.sendMessage({ type: 'get-defaults', autoStart: Boolean(manual), startIntentUnixMs: manual ? Date.now() : undefined });
       if (response && response.ok) {
         retryButton.hidden = true;
         return response;
