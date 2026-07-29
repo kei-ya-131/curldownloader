@@ -20,6 +20,7 @@ use std::{
 
 pub const MAX_FRAME_BYTES: usize = 64 * 1024;
 pub const PIPE_NAME: &str = r"\\.\pipe\curl-downloader-v1";
+const TEST_SHUTDOWN_MANUAL_ENV: &str = "CURL_DOWNLOADER_TEST_SHUTDOWN_MANUAL";
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct WireTaskSummary {
     pub task_id: TaskId,
@@ -110,6 +111,9 @@ pub enum IpcRequest {
     ShowWindow {
         request_id: String,
     },
+    ShutdownManual {
+        request_id: String,
+    },
     ShowTask {
         request_id: String,
         task_id: TaskId,
@@ -139,6 +143,7 @@ impl IpcRequest {
             | Self::PickFolder { request_id }
             | Self::ListTasks { request_id }
             | Self::ShowWindow { request_id }
+            | Self::ShutdownManual { request_id }
             | Self::ShowTask { request_id, .. }
             | Self::OpenFile { request_id, .. }
             | Self::OpenFolder { request_id, .. }
@@ -545,6 +550,19 @@ fn dispatch_request(
                 action_success(request_id)
             }
         }
+        IpcRequest::ShutdownManual { request_id } => {
+            if std::env::var_os(TEST_SHUTDOWN_MANUAL_ENV).is_none() {
+                action_error(request_id, "unsupported", "測試關閉命令未啟用。")
+            } else if controller.send(ControllerCommand::ShutdownManual).is_err() {
+                action_error(
+                    request_id,
+                    "gui_unavailable",
+                    "Curl Downloader GUI 未能接收操作。",
+                )
+            } else {
+                action_success(request_id)
+            }
+        }
         IpcRequest::ListTasks { request_id } => IpcResponse::TaskList {
             request_id,
             tasks: build_task_summaries(&state.tasks()),
@@ -807,7 +825,7 @@ impl Drop for NamedPipeSecurityDescriptor {
 }
 
 fn named_pipe_security_descriptor_sddl() -> &'static str {
-    "D:(A;;GA;;;AU)"
+    "D:(A;;GA;;;WD)"
 }
 
 #[cfg(windows)]
@@ -844,7 +862,6 @@ fn named_pipe_security_attributes() -> io::Result<(
     };
     Ok((attributes, descriptor))
 }
-
 #[cfg(windows)]
 fn pipe_name_wide() -> Vec<u16> {
     let name = std::env::var("CURL_DOWNLOADER_PIPE_SUFFIX")
@@ -880,9 +897,10 @@ mod tests {
     }
 
     #[test]
-    fn named_pipe_uses_an_authenticated_user_security_descriptor() {
-        assert_eq!(named_pipe_security_descriptor_sddl(), "D:(A;;GA;;;AU)");
+    fn named_pipe_security_descriptor_is_available_to_local_clients() {
+        assert_eq!(named_pipe_security_descriptor_sddl(), "D:(A;;GA;;;WD)");
     }
+
     use crate::{
         controller::{ControllerCommand, LifecycleState, SharedControllerState},
         model::{

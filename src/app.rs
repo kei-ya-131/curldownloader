@@ -175,7 +175,11 @@ impl CurlDownloaderApp {
                 tray::TrayController::disabled()
             }
         };
-        let window_control: Arc<dyn MainWindowControl> = EguiMainWindow::new(cc.egui_ctx.clone());
+        let window_control: Arc<dyn MainWindowControl> = if start_minimized {
+            EguiMainWindow::new_minimized(cc.egui_ctx.clone())
+        } else {
+            EguiMainWindow::new(cc.egui_ctx.clone())
+        };
         let initial_lifecycle = if start_minimized {
             LifecycleState::RunningHidden
         } else {
@@ -1096,6 +1100,9 @@ impl eframe::App for CurlDownloaderApp {
                 .send(ControllerCommand::WindowHidden);
         }
         let restored = self.apply_controller_events(&ctx);
+        if self.hidden_to_tray && !restored {
+            self.window_control.hide();
+        }
         if !restored
             && !self.hidden_to_tray
             && ctx.input(|input| input.viewport().minimized == Some(true))

@@ -1,8 +1,8 @@
 #![windows_subsystem = "windows"]
 
 use curl_downloader::{
-    app::CurlDownloaderApp, ipc, native_host, native_registration, single_instance, startup_policy,
-    storage,
+    app::CurlDownloaderApp, ipc, native_host, native_registration, session_shutdown,
+    single_instance, startup_policy, storage,
 };
 
 fn main() -> eframe::Result {
@@ -21,8 +21,8 @@ fn main() -> eframe::Result {
     )
 }
 
-fn initial_viewport_visible(_minimized: bool) -> bool {
-    true
+fn initial_viewport_visible(minimized: bool) -> bool {
+    !minimized
 }
 fn should_register_native(arguments: &[std::ffi::OsString]) -> bool {
     !arguments
@@ -55,6 +55,7 @@ fn run_gui(minimized: bool, register_native: bool) -> eframe::Result {
             return Ok(());
         }
     };
+    let _ = session_shutdown::reset_for_gui_start();
     if !minimized && let Ok(state_path) = storage::state_path() {
         let _ = startup_policy::clear_manual_stop(&storage::manual_stop_path(&state_path));
     }
@@ -91,7 +92,7 @@ mod tests {
 
     #[test]
     fn minimized_gui_starts_a_viewport_before_hiding_to_tray() {
-        assert!(initial_viewport_visible(true));
+        assert!(!initial_viewport_visible(true));
         assert!(initial_viewport_visible(false));
     }
 }

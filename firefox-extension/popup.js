@@ -62,7 +62,7 @@
   }
 
   function popupRefreshRequest() {
-    return { type: 'get-task-summary', autoStart: false };
+    return { type: 'get-task-summary', autoStart: true };
   }
   function formatDuration(seconds) {
     const value = Math.max(0, Math.round(numberOrZero(seconds)));
@@ -183,6 +183,18 @@
     const completedCount = documentApi.getElementById('completed-count');
     let refreshInFlight = false;
     let timer = null;
+    let stopped = false;
+
+    function notifyLifecycle(type) {
+      try {
+        const result = api.runtime.sendMessage({ type });
+        if (result && typeof result.catch === 'function') result.catch(() => undefined);
+      } catch (_error) {
+        // Popup teardown must not surface a rejected lifecycle notification.
+      }
+    }
+
+    notifyLifecycle('popup-open');
 
     function showError(message) {
       error.textContent = message || 'Curl Downloader 操作失敗。';
@@ -223,12 +235,16 @@
     timer = setInterval(() => { void refresh(); }, REFRESH_INTERVAL_MS);
     const stop = () => {
       if (timer !== null) clearInterval(timer);
+      if (stopped) return;
+      stopped = true;
       timer = null;
+      notifyLifecycle('popup-close');
     };
     if (typeof window !== 'undefined' && window.addEventListener) {
       window.addEventListener('pagehide', stop, { once: true });
     }
     return { refresh, stop };
+      window.addEventListener('unload', stop, { once: true });
   }
 
   if (typeof document !== 'undefined') {

@@ -1,6 +1,6 @@
 use crate::{
     ipc::{self, IpcRequest, IpcResponse, MAX_FRAME_BYTES, WireError},
-    single_instance, startup_policy,
+    session_shutdown, single_instance, startup_policy,
 };
 use std::{
     ffi::OsString,
@@ -100,10 +100,23 @@ pub fn launch_gui(executable: &Path, minimized: bool) -> io::Result<Child> {
 pub fn run_native_host() -> Result<(), String> {
     let stdin = io::stdin();
     let stdout = io::stdout();
-    run_native_host_io(stdin.lock(), stdout.lock()).map_err(|error| error.to_string())
+    run_native_host_io_with_hook(stdin.lock(), stdout.lock(), |_| {
+        let _ = session_shutdown::spawn_native_exit_monitor();
+    })
+    .map_err(|error| error.to_string())
 }
 
-fn run_native_host_io<R: Read, W: Write>(mut input: R, mut output: W) -> io::Result<()> {
+#[cfg(test)]
+fn run_native_host_io<R: Read, W: Write>(input: R, output: W) -> io::Result<()> {
+    run_native_host_io_with_hook(input, output, |_| {})
+}
+
+fn run_native_host_io_with_hook<R: Read, W: Write, F: FnMut(&IpcResponse)>(
+    mut input: R,
+    mut output: W,
+    mut after_response: F,
+) -> io::Result<()> {
+    let mut hook_called = false;
     loop {
         let body = match ipc::read_frame(&mut input, MAX_FRAME_BYTES) {
             Ok(body) => body,
@@ -120,6 +133,14 @@ fn run_native_host_io<R: Read, W: Write>(mut input: R, mut output: W) -> io::Res
         };
         let response = process_message(&body);
         write_response(&mut output, &response)?;
+        let manually_stopped = matches!(
+            &response,
+            IpcResponse::Error { error, .. } if error.code == "manually_stopped"
+        );
+        if !hook_called && !manually_stopped {
+            after_response(&response);
+            hook_called = true;
+        }
     }
 }
 
@@ -127,6 +148,13 @@ fn native_start_policy(body: &[u8]) -> startup_policy::NativeStartPolicy {
     serde_json::from_slice(body).unwrap_or_default()
 }
 
+fn denied_start_error_kind(stopped_at: Option<u64>) -> io::ErrorKind {
+    if stopped_at.is_some() {
+        io::ErrorKind::Interrupted
+    } else {
+        io::ErrorKind::WouldBlock
+    }
+}
 fn forward_error_code(error: &io::Error) -> &'static str {
     match error.kind() {
         io::ErrorKind::Interrupted => "manually_stopped",
@@ -166,11 +194,7 @@ fn forward_request(
             let stopped_at = startup_policy::read_manual_stop(&stop_path)?;
             if !policy.permits_start(stopped_at) {
                 return Err(io::Error::new(
-                    if policy.auto_start {
-                        io::ErrorKind::Interrupted
-                    } else {
-                        io::ErrorKind::WouldBlock
-                    },
+                    denied_start_error_kind(stopped_at),
                     "GUI 啟動不獲允許",
                 ));
             }
@@ -347,11 +371,33 @@ mod tests {
     }
 
     #[test]
+    fn native_host_response_hook_runs_once_after_first_non_manual_response() {
+        let mut input = Vec::new();
+        crate::ipc::write_frame(&mut input, br#"{"type":"ping","request_id":"request-1"}"#)
+            .unwrap();
+        crate::ipc::write_frame(&mut input, br#"{"type":"ping","request_id":"request-2"}"#)
+            .unwrap();
+        let mut output = Vec::new();
+        let mut calls = 0;
+        run_native_host_io_with_hook(input.as_slice(), &mut output, |_response| calls += 1)
+            .unwrap();
+        assert_eq!(calls, 1);
+    }
+    #[test]
     fn manually_stopped_error_has_a_stable_wire_code() {
         assert_eq!(
             forward_error_code(&io::Error::new(io::ErrorKind::Interrupted, "stopped")),
             "manually_stopped"
         );
+    }
+
+    #[test]
+    fn denied_start_reports_manual_stop_only_when_marker_exists() {
+        assert_eq!(
+            denied_start_error_kind(Some(100)),
+            io::ErrorKind::Interrupted
+        );
+        assert_eq!(denied_start_error_kind(None), io::ErrorKind::WouldBlock);
     }
     #[test]
     fn malformed_json_produces_one_redacted_response_frame() {

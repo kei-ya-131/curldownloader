@@ -48,7 +48,7 @@ mod windows_impl {
                 RegisterClassW, SetForegroundWindow, SetWindowLongPtrW, TPM_BOTTOMALIGN,
                 TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage,
                 WM_APP, WM_LBUTTONDBLCLK, WM_NCCREATE, WM_NCDESTROY, WM_QUIT, WM_RBUTTONUP,
-                WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+                WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
             },
         },
     };
@@ -222,7 +222,7 @@ mod windows_impl {
                 WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
                 TRAY_CLASS_NAME.as_ptr(),
                 TRAY_WINDOW_TITLE.as_ptr(),
-                0,
+                WS_POPUP,
                 0,
                 0,
                 0,
@@ -241,16 +241,28 @@ mod windows_impl {
             return;
         }
 
-        let mut icon = tray_icon_data(hwnd);
-        if unsafe { Shell_NotifyIconW(NIM_ADD, &icon) } == 0 {
+        let icon = tray_icon_data(hwnd);
+        let mut added = false;
+        for _ in 0..20 {
+            if unsafe { Shell_NotifyIconW(NIM_ADD, &icon) } != 0 {
+                added = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        if !added {
+            let error = unsafe { GetLastError() };
             unsafe {
                 DestroyWindow(hwnd);
                 drop(Box::from_raw(state_ptr));
             }
-            let _ = ready.send(Err("Shell_NotifyIconW(NIM_ADD) 失敗".into()));
+            let _ = ready.send(Err(format!(
+                "Shell_NotifyIconW(NIM_ADD) 失敗：{} size={}",
+                error, icon.cbSize
+            )));
             return;
         }
-        icon.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
+
         let _ = ready.send(Ok(thread_id));
 
         let mut message = windows_sys::Win32::UI::WindowsAndMessaging::MSG::default();

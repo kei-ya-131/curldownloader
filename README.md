@@ -45,7 +45,7 @@ Firefox extension 會攔截 HTTP/HTTPS 下載，先暫停原生下載並開啟�
 2. 在 Firefox `about:addons` 使用「從檔案安裝附加元件」載入 `curl-downloader.xpi`，並按需要允許私人視窗。
 3. 若設定頁顯示 Native host 未啟動或尚未註冊，啟動 `CurlDownloader.exe` 後按「重試 Curl Downloader」。
 
-Native Messaging 使用 Firefox 的一次性 `sendNativeMessage`；請求完成後 host process 即結束，不會長期鎖定 GUI EXE。若有進行中的下載而 GUI 被手動關閉，插件下一次同步會自動以 `--minimized` 重啟同一份 EXE；沒有活動任務時不會自行重啟。
+Native Messaging 會在需要時建立一條可重用的 `connectNative` 長連線；有下載或 popup 開啟時快速同步，閒置後自動釋放連線。若 GUI 被系統匣右鍵手動關閉，插件會收到「已手動關閉」狀態，不會反覆重啟；下一次明確下載或重試操作才會重新啟動同一份 EXE。
 
 插件圖示會顯示 Cyber 進度環及 Badge，例如 `68%/3` 代表三個進行中任務的加權整體進度；總大小未知時顯示 `—/3`。有活動任務時約每 500ms 同步；popup 開啟時約每 200ms 更新，沒有活動任務且 popup 關閉時停止背景同步。
 
@@ -76,7 +76,7 @@ powershell -ExecutionPolicy Bypass -File scripts\package-portable.ps1 `
   -OutputDirectory "$PWD\dist\CurlDownloaderPortable"
 ```
 
-portable 目錄包含單一 `CurlDownloader.exe`、Firefox XPI、註冊腳本、啟動腳本及 `portable.flag`；狀態會保存到 portable 目錄內的 `data\state.json`。Firefox Native Messaging 官方發現機制要求 HKCU registry key，這是 Firefox 平台限制；extension 本身不會直接寫 Registry。
+portable 目錄只包含 `CurlDownloader.exe`、`curl-downloader.xpi` 及 `portable.flag`，不會附帶第二個 Native host EXE、註冊腳本或啟動腳本；狀態會保存到 portable 目錄內的 `data\state.json`。雙擊同一份 EXE 即可啟動 GUI／系統匣，GUI 會自動在 HKCU 建立 Native Messaging manifest。Firefox Native Messaging 的 per-user HKCU 發現機制是平台要求；extension 本身不會直接寫 Registry。
 
 ## Data locations
 

@@ -1,6 +1,6 @@
 use crate::{
     model::{EngineCommand, EngineEvent, TaskId, TaskSnapshot},
-    startup_policy,
+    session_shutdown, startup_policy,
     tray::{TrayController, TrayEvent},
     window_control::MainWindowControl,
 };
@@ -281,7 +281,9 @@ fn run_controller(
         }
         while let Ok(event) = tray_events.try_recv() {
             match event {
-                TrayEvent::ShowWindow => show_window(&state, &window, &app_events, None),
+                TrayEvent::ShowWindow => {
+                    show_window(&state, &window, &app_events, None);
+                }
                 TrayEvent::CloseWindow => begin_shutdown(
                     true,
                     &state,
@@ -406,6 +408,7 @@ fn begin_shutdown(
         let _ =
             startup_policy::record_manual_stop(manual_stop_path, startup_policy::unix_time_ms());
     }
+    let _ = session_shutdown::signal_manual_shutdown();
     ipc_stop.store(true, Ordering::Release);
     let _ = engine_commands.send(EngineCommand::Shutdown);
     *shutdown_deadline = Some(Instant::now());

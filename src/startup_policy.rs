@@ -99,6 +99,22 @@ mod tests {
     }
 
     #[test]
+    fn passive_start_can_launch_idle_gui_but_never_override_manual_stop() {
+        let passive = NativeStartPolicy {
+            auto_start: true,
+            start_intent_unix_ms: None,
+        };
+        assert!(passive.permits_start(None));
+        assert!(!passive.permits_start(Some(100)));
+
+        let explicit = NativeStartPolicy {
+            auto_start: true,
+            start_intent_unix_ms: Some(101),
+        };
+        assert!(explicit.permits_start(Some(100)));
+    }
+
+    #[test]
     fn manual_stop_file_contains_only_the_stop_time() {
         let root = std::env::temp_dir().join(format!(
             "curl-downloader-stop-policy-{}",

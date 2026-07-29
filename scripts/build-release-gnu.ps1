@@ -1,4 +1,4 @@
-﻿$ErrorActionPreference = 'Stop'
+$ErrorActionPreference = 'Stop'
 
 Set-Location (Join-Path $PSScriptRoot '..')
 $toolchain = 'stable-x86_64-pc-windows-gnu'
@@ -7,8 +7,19 @@ $curlHash = '8D28C1093E0B6345917D2C1710C67F78F61834D76EF983EA9FB631C75E20312F'
 
 function Invoke-CargoChecked {
     param([string[]]$Arguments)
-    & rustup run $toolchain cargo @Arguments
-    if ($LASTEXITCODE -ne 0) { throw "cargo $($Arguments -join ' ') failed with exit code $LASTEXITCODE." }
+    $previousToolchain = [Environment]::GetEnvironmentVariable('RUSTUP_TOOLCHAIN', 'Process')
+    $env:RUSTUP_TOOLCHAIN = $toolchain
+    try {
+        & cargo @Arguments
+        $exitCode = $LASTEXITCODE
+    } finally {
+        if ($null -eq $previousToolchain) {
+            Remove-Item Env:RUSTUP_TOOLCHAIN -ErrorAction SilentlyContinue
+        } else {
+            $env:RUSTUP_TOOLCHAIN = $previousToolchain
+        }
+    }
+    if ($exitCode -ne 0) { throw "cargo $($Arguments -join ' ') failed with exit code $exitCode." }
 }
 
 & rustup run $toolchain rustc --version

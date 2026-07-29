@@ -5,6 +5,7 @@
       require('./core.js'),
       require('./storage.js'),
       require('./status.js'),
+      require('./native-session.js'),
       options
     );
   } else {
@@ -13,14 +14,20 @@
       root.CurlExtensionCore,
       root.CurlExtensionStorage,
       root.CurlExtensionStatus,
+      root.CurlDownloaderNativeSession,
       {}
     );
   }
-})(typeof globalThis === 'object' ? globalThis : this, function (browserApi, core, storage, status, runtimeOptions) {
+})(typeof globalThis === 'object' ? globalThis : this, function (browserApi, core, storage, status, nativeSessionFactory, runtimeOptions) {
   'use strict';
   runtimeOptions = runtimeOptions || {};
   status = status || {};
   const now = typeof runtimeOptions.now === 'function' ? runtimeOptions.now : Date.now;
+  const nativeSession = runtimeOptions.nativeSession || (
+    typeof nativeSessionFactory === 'function'
+      ? nativeSessionFactory(browserApi, { idleMs: runtimeOptions.nativeIdleMs })
+      : null
+  );
 
   function startupFields(autoStart, startIntentUnixMs) {
     if (!autoStart) return { auto_start: false };
@@ -31,12 +38,14 @@
     };
   }
 
+  function passiveStartupFields() {
+    return { auto_start: true };
+  }
+
   const pendingDownloads = new Map();
   const settingsTabs = new Map();
   const managedFallbackIds = new Set();
   const managedFallbackUrls = new Map();
-  let nativeQueue = Promise.resolve();
-  let requestSequence = 0;
   const nativeRetryOptions = {
     attempts: Number.isInteger(runtimeOptions.attempts) ? Math.max(1, runtimeOptions.attempts) : 5,
     delayMs: Number.isFinite(runtimeOptions.delayMs) ? Math.max(0, runtimeOptions.delayMs) : 2000
@@ -53,6 +62,7 @@
   let lastTaskList = [];
   let restartDelayMs = 500;
   let restartCooldownUntil = 0;
+  let popupOpen = false;
 
   function defaultProxy() {
     return { enabled: false, protocol: 'http', host: '', port: 8080, username: '' };
@@ -104,16 +114,8 @@
   }
 
   function sendNative(message) {
-    const requestId = `firefox-${Date.now()}-${requestSequence++}`;
-    const request = { ...message, request_id: requestId };
-    const operation = nativeQueue.then(() => {
-      if (!browserApi.runtime || typeof browserApi.runtime.sendNativeMessage !== 'function') {
-        throw new Error('Firefox 不支援一次性 Native Messaging');
-      }
-      return browserApi.runtime.sendNativeMessage('curl_downloader', request);
-    });
-    nativeQueue = operation.catch(() => undefined);
-    return operation;
+    if (!nativeSession) throw new Error('Firefox 不支援持續 Native Messaging');
+    return nativeSession.send(message);
   }
   async function sendNativeWithRetry(message, options = nativeRetryOptions) {
     const attempts = Number.isInteger(options.attempts)
@@ -151,6 +153,11 @@
     badgeSyncTimer = null;
   }
 
+  function updateNativeKeepAlive(hasActive = Boolean(lastBadgeSummary && lastBadgeSummary.hasActive)) {
+    if (nativeSession && typeof nativeSession.setKeepAlive === 'function') {
+      nativeSession.setKeepAlive(popupOpen || Boolean(hasActive));
+    }
+  }
   function scheduleBadgeRefresh(delayMs = badgeRefreshIntervalMs) {
     clearBadgeTimer();
     if (!badgeTimersEnabled || !badgeSyncRunning) return;
@@ -193,12 +200,13 @@
       restartDelayMs = 500;
       applyBadge(summary);
     }
+    updateNativeKeepAlive(summary.hasActive);
     return summary;
   }
 
   async function refreshTaskStatus(options = {}) {
     const fromPopup = Boolean(options.fromPopup);
-    if (fromPopup && restartCooldownUntil > Date.now()) {
+    if (fromPopup && restartCooldownUntil > now()) {
       return lastBadgeSummary
         ? { ok: true, tasks: lastTaskList, stale: true }
         : nativeUnavailable('Curl Downloader 正在重試連線，請稍候。');
@@ -215,8 +223,18 @@
       applyTaskSummary(response.tasks);
       return response;
     } catch (_error) {
+      if (failedResponse && failedResponse.code === 'manually_stopped') {
+        badgeSyncRunning = false;
+        clearBadgeTimer();
+        applyBadge({ activeCount: 0, hasFailure: false, hasProxyPassword: false });
+        updateNativeKeepAlive(false);
+        if (nativeSession && typeof nativeSession.close === 'function') {
+          nativeSession.close('Curl Downloader manually stopped');
+        }
+        return failedResponse;
+      }
       const retryDelay = restartDelayMs;
-      restartCooldownUntil = Date.now() + retryDelay;
+      restartCooldownUntil = now() + retryDelay;
       if (lastBadgeSummary && lastBadgeSummary.hasActive) {
         badgeSyncRunning = true;
         applyBadge(lastBadgeSummary, true);
@@ -400,9 +418,17 @@
     try {
       const response = await sendNativeWithRetry({
         type: 'list_tasks',
-        ...startupFields(false)
+        ...passiveStartupFields()
       });
       if (!response || response.type !== 'task_list' || !Array.isArray(response.tasks)) {
+      if (response && response.type === 'error') {
+        const nativeError = response.error || {};
+        return {
+          ok: false,
+          code: nativeError.code || 'native_unavailable',
+          error: nativeError.message || 'Curl Downloader Native host 無法完成請求。'
+        };
+      }
         return { ok: false, error: '無法讀取 Curl Downloader 任務。' };
       }
       return { ok: true, tasks: response.tasks };
@@ -476,6 +502,16 @@
       }
     }
     if (message.type === 'get-task-summary') return refreshTaskStatus({ fromPopup: true });
+    if (message.type === 'popup-open') {
+      popupOpen = true;
+      updateNativeKeepAlive();
+      return { ok: true };
+    }
+    if (message.type === 'popup-close') {
+      popupOpen = false;
+      updateNativeKeepAlive();
+      return { ok: true };
+    }
     if (message.type === 'show-task' || message.type === 'open-file' || message.type === 'open-folder') {
       return sendTaskAction(message);
     }

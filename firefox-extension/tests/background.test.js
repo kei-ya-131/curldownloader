@@ -6,6 +6,7 @@ function makeFakeBrowser({
   resumeFails = false,
   nativeDisconnect = false,
   nativeFailuresBeforeSuccess = 0,
+  nativeDelayMs = 0,
   nativeResponse = null
 } = {}) {
   const events = {
@@ -22,6 +23,8 @@ function makeFakeBrowser({
     tabs: [],
     notifications: [],
     nativeMessages: [],
+    nativeConnects: 0,
+    nativeDisconnects: 0,
     badgeText: [],
     badgeColor: [],
     badgeTitles: [],
@@ -65,15 +68,51 @@ function makeFakeBrowser({
       async setIcon(details) { calls.badgeIcons.push(details); }
     },
     runtime: {
-      sendNativeMessage: async (_hostName, message) => {
-        calls.nativeMessages.push(message);
-        if (nativeDisconnect) throw new Error('Native host disconnected');
-        if (calls.nativeMessages.length <= nativeFailuresBeforeSuccess) {
-          throw new Error('No such native application');
-        }
-        return nativeResponse
-          ? nativeResponse(message)
-          : { type: 'defaults', request_id: message.request_id, target_dir: '' };
+      connectNative: () => {
+        calls.nativeConnects += 1;
+        let messageListener = null;
+        let disconnectListener = null;
+        let disconnected = false;
+        const disconnect = () => {
+          if (disconnected) return;
+          disconnected = true;
+          calls.nativeDisconnects += 1;
+          if (disconnectListener) disconnectListener();
+        };
+        return {
+          onMessage: { addListener(listener) { messageListener = listener; } },
+          onDisconnect: { addListener(listener) { disconnectListener = listener; } },
+          postMessage(message) {
+            calls.nativeMessages.push(message);
+            const attempt = calls.nativeMessages.length;
+            const deliver = () => {
+              if (nativeDisconnect || attempt <= nativeFailuresBeforeSuccess) {
+                disconnect();
+                return;
+              }
+              let response;
+              try {
+                response = nativeResponse
+                  ? nativeResponse(message)
+                  : { type: 'defaults', request_id: message.request_id, target_dir: '' };
+              } catch (_error) {
+                disconnect();
+                return;
+              }
+              if (response && response.request_id === undefined) {
+                response.request_id = message.request_id;
+              }
+              if (messageListener && !disconnected) messageListener(response);
+            };
+            if (nativeDelayMs > 0) {
+              const timer = setTimeout(deliver, nativeDelayMs);
+              if (typeof timer.unref === 'function') timer.unref();
+            } else {
+              queueMicrotask(deliver);
+            }
+          },
+          disconnect,
+        };
       },
       onMessage: { addListener(listener) { events.message = listener; } },
       sendMessage: async () => ({ ok: true })
@@ -90,27 +129,18 @@ function makeFakeBrowser({
 }
 
 function makeDelayedNativeBrowser() {
-  const fake = makeFakeBrowser({ nativeResponse: (message) => ({
-    type: message.type === 'get_defaults' ? 'defaults' : 'task_list',
-    request_id: message.request_id,
-    target_dir: 'C:\\Downloads',
-    tasks: []
-  }) });
-  let inFlight = 0;
-  fake.maxNativeInFlight = 0;
-  const original = fake.browser.runtime.sendNativeMessage;
-  fake.browser.runtime.sendNativeMessage = async (...args) => {
-    inFlight += 1;
-    fake.maxNativeInFlight = Math.max(fake.maxNativeInFlight, inFlight);
-    await new Promise((resolve) => setImmediate(resolve));
-    const result = await original(...args);
-    inFlight -= 1;
-    return result;
-  };
-  return fake;
+  return makeFakeBrowser({
+    nativeDelayMs: 1,
+    nativeResponse: (message) => ({
+      type: message.type === 'get_defaults' ? 'defaults' : 'task_list',
+      request_id: message.request_id,
+      target_dir: 'C:\\Downloads',
+      tasks: []
+    })
+  });
 }
 
-test('uses one-shot Native Messaging and never creates a persistent port', async () => {
+test('reuses one native port for multiple background requests', async () => {
   const fake = makeFakeBrowser({
     nativeResponse: (message) => ({
       type: 'defaults', request_id: message.request_id, target_dir: 'C:\\Downloads'
@@ -120,16 +150,18 @@ test('uses one-shot Native Messaging and never creates a persistent port', async
   const result = await background.handleRuntimeMessage({ type: 'get-defaults' });
   assert.equal(result.ok, true);
   assert.equal(fake.calls.nativeMessages.length, 1);
+  await background.handleRuntimeMessage({ type: 'get-defaults' });
+  assert.equal(fake.calls.nativeConnects, 1);
 });
 
-test('serializes two Native calls so only one is in flight', async () => {
+test('shares one native port across concurrent calls', async () => {
   const fake = makeDelayedNativeBrowser();
   const background = createBackground(fake.browser, { attempts: 1, delayMs: 0 });
   await Promise.all([
     background.handleRuntimeMessage({ type: 'get-defaults' }),
     background.handleRuntimeMessage({ type: 'get-task-summary' })
   ]);
-  assert.equal(fake.maxNativeInFlight, 1);
+  assert.equal(fake.calls.nativeConnects, 1);
 });
 test('passive popup and badge queries never carry a start intent', async () => {
   const fake = makeFakeBrowser({
@@ -144,7 +176,7 @@ test('passive popup and badge queries never carry a start intent', async () => {
   await background.handleRuntimeMessage({ type: 'get-task-summary' });
   await background.refreshTaskStatus();
   assert.equal(fake.calls.nativeMessages.every((message) =>
-    message.auto_start === false &&
+    message.auto_start === true &&
     message.start_intent_unix_ms === undefined
   ), true);
 });
@@ -219,7 +251,8 @@ test('restarts the GUI minimized after a closed-GUI pipe failure while tasks are
   ] }) });
   const background = createBackground(fake.browser, { attempts: 1, delayMs: 0, timers: false });
   await background.refreshTaskStatus();
-  assert.equal(fake.calls.nativeMessages[0].auto_start, false);
+  assert.equal(fake.calls.nativeMessages[0].auto_start, true);
+  assert.equal(fake.calls.nativeMessages[0].start_intent_unix_ms, undefined);
   assert.equal(background.isBadgeSyncRunning(), true);
   assert.deepEqual(fake.calls.badgeText.at(-1), { text: '50%/1' });
 });
@@ -429,4 +462,48 @@ test('task control errors stay in popup flow without Firefox fallback', async ()
   assert.deepEqual(result, { ok: false, error: '檔案尚未完成。' });
   assert.deepEqual(fake.calls.resume, []);
   assert.deepEqual(fake.calls.download, []);
+});
+test('popup lifecycle keeps one native session alive only while open', async () => {
+  const fake = makeFakeBrowser();
+  const keepAliveCalls = [];
+  const session = {
+    setKeepAlive(value) { keepAliveCalls.push(Boolean(value)); },
+    send: async () => ({ type: 'task_list', request_id: 'session', tasks: [] }),
+    close() {}
+  };
+  const background = createBackground(fake.browser, {
+    nativeSession: session,
+    timers: false
+  });
+
+  const opened = await background.handleRuntimeMessage({ type: 'popup-open' });
+  const closed = await background.handleRuntimeMessage({ type: 'popup-close' });
+
+  assert.deepEqual(opened, { ok: true });
+  assert.deepEqual(closed, { ok: true });
+  assert.deepEqual(keepAliveCalls, [true, false]);
+});
+
+test('manually stopped native host stops polling and closes its session', async () => {
+  const fake = makeFakeBrowser();
+  let closeCalls = 0;
+  const session = {
+    setKeepAlive() {},
+    send: async () => ({
+      type: 'error',
+      request_id: 'manual-stop',
+      error: { code: 'manually_stopped', message: 'Curl Downloader 已由使用者關閉' }
+    }),
+    close() { closeCalls += 1; }
+  };
+  const background = createBackground(fake.browser, { nativeSession: session, timers: false });
+
+  const result = await background.handleRuntimeMessage({ type: 'get-task-summary' });
+  assert.deepEqual(result, {
+    ok: false,
+    code: 'manually_stopped',
+    error: 'Curl Downloader 已由使用者關閉'
+  });
+  assert.equal(background.isBadgeSyncRunning(), false);
+  assert.equal(closeCalls, 1);
 });

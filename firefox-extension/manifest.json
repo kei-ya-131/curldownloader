@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "Curl Downloader Bridge",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "在下載前將 HTTP/HTTPS 下載交給本機 Curl Downloader。",
   "icons": {
     "16": "icons/curl-downloader-16.png",
@@ -22,7 +22,7 @@
   ],
   "incognito": "spanning",
   "background": {
-    "scripts": ["core.js", "storage.js", "status.js", "background.js"],
+    "scripts": ["core.js", "storage.js", "status.js", "native-session.js", "background.js"],
     "persistent": true
   },
   "browser_action": {

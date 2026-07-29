@@ -1,10 +1,10 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { formatBytes, formatProgress, statusLabel, splitTasks, popupRefreshRequest, REFRESH_INTERVAL_MS } = require('../popup.js');
-test('opening and refreshing the popup never starts a manually stopped exe', () => {
+test('opening and refreshing the popup may start an idle exe without an explicit intent', () => {
   assert.deepEqual(popupRefreshRequest(), {
     type: 'get-task-summary',
-    autoStart: false
+    autoStart: true
   });
 });
 test('refreshes task summaries frequently enough for fast downloads', () => {
