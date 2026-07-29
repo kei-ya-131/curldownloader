@@ -28,6 +28,17 @@ Windows 下載只會在背景啟動隱藏的 curl 子程序，不會顯示 CMD �
 
 Firefox extension 會攔截 HTTP/HTTPS 下載，先暫停原生下載並開啟設定頁。設定頁可調整下載名稱、Windows 絕對目錄、Proxy 類型／主機／連接埠／帳號及本次密碼；「使用 Firefox」會恢復原生下載，「取消」會取消並清理原生下載。
 
+### 程式生命週期
+
+插件第一次需要主程式時，會啟動同一份 `CurlDownloader.exe`，以最小化及系統匣常駐方式運行；整個系統只維持一個 Curl Downloader 主程序。
+
+- 最小化或按主視窗的一般關閉按鈕：只會隱藏到系統匣，下載及 Native Messaging 背景控制器繼續運作。
+- 雙擊系統匣圖示：還原並把現有 GUI 帶到最前面，不會建立第二份 EXE。
+- 系統匣右鍵選擇「關閉」：先保存下載進度及續傳資料，再終止主程序。
+- popup、Badge 及狀態查詢屬於被動操作，不會因手動關閉而自動重啟 EXE。
+- 新下載、重試 Native host、選擇目錄、開啟檔案／資料夾或顯示任務，屬於明確操作，可以重新啟動同一份 EXE。
+- 手動再次雙擊 EXE：只會顯示已存在的程序，不會多開。
+
 正常使用流程（包括 Portable Firefox ESR）：
 
 1. 首次使用前直接啟動 `CurlDownloader.exe` 一次。GUI 啟動時會自動在 `HKCU\Software\Mozilla\NativeMessagingHosts\curl_downloader` 建立或更新 manifest，`path` 直接指向目前的 `CurlDownloader.exe`；不需要手動開啟 regedit。
