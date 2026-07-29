@@ -1,5 +1,9 @@
-use crate::model::{
-    ConfiguredTask, EngineCommand, ProxyProtocol, ProxySettings, TaskId, TaskSnapshot, TaskStatus,
+use crate::{
+    controller::{ControllerCommand, SharedControllerState},
+    model::{
+        ConfiguredTask, EngineCommand, ProxyProtocol, ProxySettings, TaskId, TaskSnapshot,
+        TaskStatus,
+    },
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -195,13 +199,6 @@ impl IpcResponse {
     }
 }
 
-#[derive(Debug)]
-pub enum UiCommand {
-    ShowWindow,
-    ShowTask { task_id: TaskId },
-}
-
-pub type SharedSnapshots = Arc<Mutex<Vec<TaskSnapshot>>>;
 #[derive(Debug, Deserialize, Serialize)]
 pub struct WireError {
     pub code: String,
@@ -285,27 +282,9 @@ pub fn write_frame<W: Write>(writer: &mut W, body: &[u8]) -> io::Result<()> {
 pub fn spawn_server(
     commands: Sender<EngineCommand>,
     last_download_dir: Arc<Mutex<PathBuf>>,
-    snapshots: SharedSnapshots,
-    ui_commands: Sender<UiCommand>,
+    state: SharedControllerState,
+    controller: Sender<ControllerCommand>,
     stop: Arc<AtomicBool>,
-) -> thread::JoinHandle<()> {
-    spawn_server_with_repaint(
-        commands,
-        last_download_dir,
-        snapshots,
-        ui_commands,
-        stop,
-        Arc::new(|| {}),
-    )
-}
-
-pub fn spawn_server_with_repaint(
-    commands: Sender<EngineCommand>,
-    last_download_dir: Arc<Mutex<PathBuf>>,
-    snapshots: SharedSnapshots,
-    ui_commands: Sender<UiCommand>,
-    stop: Arc<AtomicBool>,
-    repaint: Arc<dyn Fn() + Send + Sync>,
 ) -> thread::JoinHandle<()> {
     #[cfg(windows)]
     {
@@ -324,36 +303,19 @@ pub fn spawn_server_with_repaint(
 
         thread::Builder::new()
             .name("native-bridge-pipe".into())
-            .spawn(move || {
-                run_windows_server(
-                    commands,
-                    last_download_dir,
-                    snapshots,
-                    ui_commands,
-                    stop,
-                    repaint,
-                )
-            })
+            .spawn(move || run_windows_server(commands, last_download_dir, state, controller, stop))
             .expect("無法啟動 Native Messaging Named Pipe 伺服器")
     }
 
     #[cfg(not(windows))]
     {
-        let _ = (
-            commands,
-            last_download_dir,
-            snapshots,
-            ui_commands,
-            stop,
-            repaint,
-        );
+        let _ = (commands, last_download_dir, state, controller, stop);
         thread::Builder::new()
             .name("native-bridge-pipe".into())
             .spawn(|| {})
             .expect("無法啟動 Native Messaging 佔位伺服器")
     }
 }
-
 pub fn call_pipe(request: &IpcRequest, timeout: Duration) -> io::Result<IpcResponse> {
     #[cfg(windows)]
     {
@@ -439,10 +401,9 @@ fn is_pipe_connection_error(error: &io::Error) -> bool {
 fn run_windows_server(
     commands: Sender<EngineCommand>,
     last_download_dir: Arc<Mutex<PathBuf>>,
-    snapshots: SharedSnapshots,
-    ui_commands: Sender<UiCommand>,
+    state: SharedControllerState,
+    controller: Sender<ControllerCommand>,
     stop: Arc<AtomicBool>,
-    repaint: Arc<dyn Fn() + Send + Sync>,
 ) {
     use std::{
         fs::File,
@@ -501,14 +462,8 @@ fn run_windows_server(
         let mut stream = unsafe { File::from_raw_handle(handle as RawHandle) };
         if let Ok(body) = read_frame(&mut stream, MAX_FRAME_BYTES) {
             if let Ok(request) = serde_json::from_slice::<IpcRequest>(&body) {
-                let response = dispatch_request(
-                    request,
-                    &commands,
-                    &last_download_dir,
-                    &snapshots,
-                    &ui_commands,
-                    &repaint,
-                );
+                let response =
+                    dispatch_request(request, &commands, &last_download_dir, &state, &controller);
                 if let Ok(body) = serde_json::to_vec(&response) {
                     let _ = write_frame(&mut stream, &body);
                 }
@@ -534,31 +489,23 @@ fn request_focus_task_id(request: &IpcRequest) -> Option<TaskId> {
     }
 }
 
-#[cfg(windows)]
-fn focus_task_window(
+fn request_show_task(
     task_id: TaskId,
-    snapshots: &SharedSnapshots,
-    ui_commands: &Sender<UiCommand>,
-    repaint: &Arc<dyn Fn() + Send + Sync>,
+    state: &SharedControllerState,
+    controller: &Sender<ControllerCommand>,
 ) -> bool {
-    if !task_exists(snapshots, task_id) {
-        return false;
-    }
-    if ui_commands.send(UiCommand::ShowTask { task_id }).is_err() {
-        return false;
-    }
-    repaint();
-    true
+    state.task_exists(task_id)
+        && controller
+            .send(ControllerCommand::ShowTask { task_id })
+            .is_ok()
 }
 
-#[cfg(windows)]
 fn dispatch_request(
     request: IpcRequest,
     commands: &Sender<EngineCommand>,
     last_download_dir: &Arc<Mutex<PathBuf>>,
-    snapshots: &SharedSnapshots,
-    ui_commands: &Sender<UiCommand>,
-    repaint: &Arc<dyn Fn() + Send + Sync>,
+    state: &SharedControllerState,
+    controller: &Sender<ControllerCommand>,
 ) -> IpcResponse {
     match request {
         IpcRequest::Ping { request_id } => IpcResponse::Pong {
@@ -588,36 +535,34 @@ fn dispatch_request(
             }
         }
         IpcRequest::ShowWindow { request_id } => {
-            if ui_commands.send(UiCommand::ShowWindow).is_err() {
+            if controller.send(ControllerCommand::ShowWindow).is_err() {
                 action_error(
                     request_id,
                     "gui_unavailable",
                     "Curl Downloader GUI 未能接收操作。",
                 )
             } else {
-                repaint();
                 action_success(request_id)
             }
         }
         IpcRequest::ListTasks { request_id } => IpcResponse::TaskList {
             request_id,
-            tasks: snapshots
-                .lock()
-                .map(|tasks| build_task_summaries(&tasks))
-                .unwrap_or_default(),
+            tasks: build_task_summaries(&state.tasks()),
         },
         IpcRequest::ShowTask {
             request_id,
             task_id,
         } => {
-            if !task_exists(snapshots, task_id) {
-                action_error(request_id, "task_not_found", "找不到下載任務。")
-            } else if !focus_task_window(task_id, snapshots, ui_commands, repaint) {
-                action_error(
-                    request_id,
-                    "gui_unavailable",
-                    "Curl Downloader GUI 未能接收操作。",
-                )
+            if !request_show_task(task_id, state, controller) {
+                if state.task_exists(task_id) {
+                    action_error(
+                        request_id,
+                        "gui_unavailable",
+                        "Curl Downloader GUI 未能接收操作。",
+                    )
+                } else {
+                    action_error(request_id, "task_not_found", "找不到下載任務。")
+                }
             } else {
                 action_success(request_id)
             }
@@ -626,15 +571,33 @@ fn dispatch_request(
             request_id,
             task_id,
         } => {
-            let _ = focus_task_window(task_id, snapshots, ui_commands, repaint);
-            open_task_file(request_id, task_id, snapshots)
+            if !state.task_exists(task_id) {
+                action_error(request_id, "task_not_found", "找不到下載任務。")
+            } else if !request_show_task(task_id, state, controller) {
+                action_error(
+                    request_id,
+                    "gui_unavailable",
+                    "Curl Downloader GUI 未能接收操作。",
+                )
+            } else {
+                open_task_file(request_id, task_id, state)
+            }
         }
         IpcRequest::OpenFolder {
             request_id,
             task_id,
         } => {
-            let _ = focus_task_window(task_id, snapshots, ui_commands, repaint);
-            open_task_folder(request_id, task_id, snapshots)
+            if !state.task_exists(task_id) {
+                action_error(request_id, "task_not_found", "找不到下載任務。")
+            } else if !request_show_task(task_id, state, controller) {
+                action_error(
+                    request_id,
+                    "gui_unavailable",
+                    "Curl Downloader GUI 未能接收操作。",
+                )
+            } else {
+                open_task_folder(request_id, task_id, state)
+            }
         }
         IpcRequest::Enqueue {
             request_id,
@@ -677,7 +640,7 @@ fn dispatch_request(
             match response_rx.recv_timeout(Duration::from_secs(5)) {
                 Ok(Ok(task_id)) => {
                     if let Ok(mut default_dir) = last_download_dir.lock() {
-                        *default_dir = target_dir.clone();
+                        *default_dir = target_dir;
                     }
                     IpcResponse::EnqueueResult {
                         request_id,
@@ -693,21 +656,22 @@ fn dispatch_request(
     }
 }
 
-#[cfg(windows)]
-fn task_exists(snapshots: &SharedSnapshots, task_id: TaskId) -> bool {
-    snapshots
-        .lock()
-        .map(|tasks| tasks.iter().any(|task| task.id == task_id))
-        .unwrap_or(false)
+#[cfg(test)]
+fn dispatch_request_for_test(
+    request: IpcRequest,
+    state: &SharedControllerState,
+    controller: &Sender<ControllerCommand>,
+) -> IpcResponse {
+    let (commands, _receiver) = std::sync::mpsc::channel();
+    let last_download_dir = Arc::new(Mutex::new(PathBuf::from(r"C:\Downloads")));
+    dispatch_request(request, &commands, &last_download_dir, state, controller)
 }
-
-#[cfg(windows)]
-fn open_task_file(request_id: String, task_id: TaskId, snapshots: &SharedSnapshots) -> IpcResponse {
-    let Some(task) = snapshots
-        .lock()
-        .ok()
-        .and_then(|tasks| tasks.iter().find(|task| task.id == task_id).cloned())
-    else {
+fn open_task_file(
+    request_id: String,
+    task_id: TaskId,
+    state: &SharedControllerState,
+) -> IpcResponse {
+    let Some(task) = state.tasks().into_iter().find(|task| task.id == task_id) else {
         return action_error(request_id, "task_not_found", "找不到下載任務。");
     };
     if task.status != TaskStatus::Completed {
@@ -723,17 +687,12 @@ fn open_task_file(request_id: String, task_id: TaskId, snapshots: &SharedSnapsho
     }
 }
 
-#[cfg(windows)]
 fn open_task_folder(
     request_id: String,
     task_id: TaskId,
-    snapshots: &SharedSnapshots,
+    state: &SharedControllerState,
 ) -> IpcResponse {
-    let Some(task) = snapshots
-        .lock()
-        .ok()
-        .and_then(|tasks| tasks.iter().find(|task| task.id == task_id).cloned())
-    else {
+    let Some(task) = state.tasks().into_iter().find(|task| task.id == task_id) else {
         return action_error(request_id, "task_not_found", "找不到下載任務。");
     };
     if !task.target_dir.is_dir() {
@@ -748,7 +707,6 @@ fn open_task_folder(
     }
 }
 
-#[cfg(windows)]
 fn action_success(request_id: String) -> IpcResponse {
     IpcResponse::ActionResult {
         request_id,
@@ -757,7 +715,6 @@ fn action_success(request_id: String) -> IpcResponse {
     }
 }
 
-#[cfg(windows)]
 fn action_error(request_id: String, code: &str, message: &str) -> IpcResponse {
     IpcResponse::ActionResult {
         request_id,
@@ -768,7 +725,6 @@ fn action_error(request_id: String, code: &str, message: &str) -> IpcResponse {
         }),
     }
 }
-#[cfg(windows)]
 fn enqueue_error(request_id: String, code: &str, message: &str) -> IpcResponse {
     IpcResponse::EnqueueResult {
         request_id,
@@ -917,11 +873,13 @@ mod tests {
     fn named_pipe_uses_an_authenticated_user_security_descriptor() {
         assert_eq!(named_pipe_security_descriptor_sddl(), "D:(A;;GA;;;AU)");
     }
-    use crate::model::{
-        CurlSource, DownloadTask, ProxyProtocol, ProxySnapshot, RangeSupport, TaskId, TaskSnapshot,
-        TaskStatus,
+    use crate::{
+        controller::{ControllerCommand, LifecycleState, SharedControllerState},
+        model::{
+            CurlSource, DownloadTask, ProxyProtocol, ProxySnapshot, RangeSupport, TaskId,
+            TaskSnapshot, TaskStatus,
+        },
     };
-
     #[test]
     fn frame_round_trip_handles_partial_reader() {
         let body = br#"{"type":"ping","request_id":"1"}"#;
@@ -988,6 +946,40 @@ mod tests {
             }),
             None
         );
+    }
+
+    #[test]
+    fn show_and_task_actions_route_to_the_background_controller() {
+        let (controller_tx, controller_rx) = std::sync::mpsc::channel();
+        let state = SharedControllerState::new(LifecycleState::RunningHidden);
+        state.replace_tasks(vec![test_snapshot(7, TaskStatus::Completed, 1, Some(2))]);
+
+        let show = dispatch_request_for_test(
+            IpcRequest::ShowWindow {
+                request_id: "show".into(),
+            },
+            &state,
+            &controller_tx,
+        );
+        assert!(matches!(show, IpcResponse::ActionResult { ok: true, .. }));
+        assert!(matches!(
+            controller_rx.recv().unwrap(),
+            ControllerCommand::ShowWindow
+        ));
+
+        let task = dispatch_request_for_test(
+            IpcRequest::ShowTask {
+                request_id: "task".into(),
+                task_id: 7,
+            },
+            &state,
+            &controller_tx,
+        );
+        assert!(matches!(task, IpcResponse::ActionResult { ok: true, .. }));
+        assert!(matches!(
+            controller_rx.recv().unwrap(),
+            ControllerCommand::ShowTask { task_id: 7 }
+        ));
     }
 
     #[test]

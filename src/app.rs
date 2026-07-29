@@ -1,14 +1,14 @@
 pub use crate::window_control::focus_existing_main_window;
-use crate::window_control::set_main_window_visibility;
 use crate::{
-    download::{EngineHandle, spawn_engine},
+    controller::{self, AppEvent, ControllerCommand, ControllerHandle, LifecycleState},
+    download::spawn_engine,
     ipc,
     model::{
-        CurlSource, EngineCommand, EngineEvent, GlobalSettings, NewTask, PersistedState,
-        ProxyProtocol, ProxySettings, TaskId, TaskSnapshot, TaskStatus,
+        CurlSource, EngineCommand, GlobalSettings, NewTask, PersistedState, ProxyProtocol,
+        ProxySettings, TaskId, TaskSnapshot, TaskStatus,
     },
-    startup_policy, storage,
-    tray::{self, TrayController, TrayEvent},
+    storage, tray,
+    window_control::{MainWindowControl, ProcessMainWindow},
 };
 use eframe::egui;
 use std::{
@@ -17,12 +17,11 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
-        mpsc::Receiver,
+        mpsc::{Receiver, Sender},
     },
     thread::JoinHandle,
     time::Duration,
 };
-
 pub const CHINESE_FONT_NAME: &str = "NotoSansTC-VF";
 const CHINESE_FONT_BYTES: &[u8] = include_bytes!("../assets/NotoSansTC-VF.ttf");
 
@@ -66,7 +65,11 @@ pub fn format_eta(seconds: Option<u64>) -> String {
 }
 
 pub struct CurlDownloaderApp {
-    engine: EngineHandle,
+    engine_commands: Sender<EngineCommand>,
+    controller: ControllerHandle,
+    controller_state: controller::SharedControllerState,
+    controller_events: Receiver<AppEvent>,
+    window_control: Arc<dyn MainWindowControl>,
     tasks: Vec<TaskSnapshot>,
     selected: Option<TaskId>,
     checked_tasks: HashSet<TaskId>,
@@ -83,20 +86,12 @@ pub struct CurlDownloaderApp {
     draft: Option<TaskDraft>,
     last_download_dir: PathBuf,
     max_processes: u8,
-    shutting_down: bool,
     ipc_stop: Arc<AtomicBool>,
     ipc_default_dir: Arc<Mutex<PathBuf>>,
-    ipc_snapshots: ipc::SharedSnapshots,
-    ipc_ui_receiver: Receiver<ipc::UiCommand>,
-    pending_show_task: Option<TaskId>,
     start_minimized: bool,
-    manual_stop_path: PathBuf,
     hidden_to_tray: bool,
-    _tray: TrayController,
-    tray_receiver: Receiver<TrayEvent>,
     ipc_thread: Option<JoinHandle<()>>,
 }
-
 #[derive(Clone)]
 struct TaskDraft {
     id: TaskId,
@@ -168,14 +163,11 @@ impl CurlDownloaderApp {
         let last_download_dir = state.settings.last_download_dir.clone();
         let engine = spawn_engine(state_path, state)
             .unwrap_or_else(|error| panic!("無法啟動下載引擎：{error}"));
+        let (engine_commands, engine_events) = engine.into_channels();
         let ipc_stop = Arc::new(AtomicBool::new(false));
         let ipc_default_dir = Arc::new(Mutex::new(last_download_dir.clone()));
-        let ipc_snapshots = Arc::new(Mutex::new(Vec::<TaskSnapshot>::new()));
-        let repaint_context = cc.egui_ctx.clone();
-        let repaint: Arc<dyn Fn() + Send + Sync> =
-            Arc::new(move || repaint_context.request_repaint());
         let mut start_minimized = start_minimized;
-        let (tray, tray_receiver) = match tray::TrayController::create(Arc::clone(&repaint)) {
+        let (tray, tray_receiver) = match tray::TrayController::create() {
             Ok(value) => value,
             Err(error) => {
                 eprintln!("Windows 系統匣初始化失敗：{error}");
@@ -183,22 +175,45 @@ impl CurlDownloaderApp {
                 tray::TrayController::disabled()
             }
         };
-        let (ipc_ui_sender, ipc_ui_receiver) = std::sync::mpsc::channel();
-        let ipc_thread = Some(ipc::spawn_server_with_repaint(
-            engine.commands.clone(),
-            Arc::clone(&ipc_default_dir),
-            Arc::clone(&ipc_snapshots),
-            ipc_ui_sender,
+        let window_control: Arc<dyn MainWindowControl> = ProcessMainWindow::current();
+        let initial_lifecycle = if start_minimized {
+            LifecycleState::RunningHidden
+        } else {
+            LifecycleState::RunningVisible
+        };
+        let mut controller = controller::spawn_controller(
+            initial_lifecycle,
+            engine_commands.clone(),
+            engine_events,
+            tray,
+            tray_receiver,
+            Arc::clone(&window_control),
+            manual_stop_path.clone(),
             Arc::clone(&ipc_stop),
-            repaint,
+        )
+        .unwrap_or_else(|error| panic!("無法啟動背景控制器：{error}"));
+        let controller_state = controller.state();
+        let _ = controller_state.wait_ready(Duration::from_secs(2));
+        let controller_events = controller.take_app_events();
+        let ipc_thread = Some(ipc::spawn_server(
+            engine_commands.clone(),
+            Arc::clone(&ipc_default_dir),
+            controller_state.clone(),
+            controller.commands(),
+            Arc::clone(&ipc_stop),
         ));
 
         cc.egui_ctx.set_fonts(chinese_font_definitions());
         cc.egui_ctx.set_theme(egui::ThemePreference::System);
+        let tasks = controller_state.tasks();
         Self {
-            engine,
-            tasks: Vec::new(),
-            selected: None,
+            engine_commands,
+            controller,
+            controller_state,
+            controller_events,
+            window_control,
+            tasks: tasks.clone(),
+            selected: tasks.first().map(|task| task.id),
             checked_tasks: HashSet::new(),
             url_input: String::new(),
             queue_search: String::new(),
@@ -213,135 +228,89 @@ impl CurlDownloaderApp {
             draft: None,
             last_download_dir,
             max_processes,
-            shutting_down: false,
             ipc_stop,
             ipc_default_dir,
-            ipc_snapshots,
-            ipc_ui_receiver,
-            pending_show_task: None,
             start_minimized,
-            manual_stop_path,
             hidden_to_tray: start_minimized,
-            _tray: tray,
-            tray_receiver,
             ipc_thread,
         }
     }
 
-    fn begin_shutdown(&mut self, _ctx: &egui::Context) {
-        if self.shutting_down {
-            return;
-        }
-        let _ = startup_policy::record_manual_stop(
-            &self.manual_stop_path,
-            startup_policy::unix_time_ms(),
-        );
-        self.shutting_down = true;
-        self.ipc_stop.store(true, Ordering::Release);
-        let _ = self.engine.commands.send(EngineCommand::Shutdown);
-    }
-    fn pump_events(&mut self, ctx: &egui::Context) -> bool {
+    fn apply_controller_events(&mut self, ctx: &egui::Context) -> bool {
         let mut restored = false;
-        while let Ok(event) = self.tray_receiver.try_recv() {
+        while let Ok(event) = self.controller_events.try_recv() {
             match event {
-                TrayEvent::ShowWindow => {
-                    self.hidden_to_tray = false;
-                    set_main_window_visibility(true);
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                    restored = true;
+                AppEvent::SnapshotChanged => self.apply_tasks(self.controller_state.tasks()),
+                AppEvent::ShowWindow => {
+                    restored = self.restore_window(ctx) || restored;
                 }
-                TrayEvent::CloseWindow => self.begin_shutdown(ctx),
-            }
-        }
-        while let Ok(event) = self.engine.events.try_recv() {
-            match event {
-                EngineEvent::Snapshot(tasks) => {
-                    if let Ok(mut snapshots) = self.ipc_snapshots.lock() {
-                        *snapshots = tasks.clone();
-                    }
-                    self.tasks = tasks;
-                    let draft_proxy_is_stale = self
-                        .draft
-                        .as_ref()
-                        .and_then(|draft| {
-                            self.tasks
-                                .iter()
-                                .find(|task| task.id == draft.id)
-                                .map(|task| !draft_proxy_matches_snapshot(draft, task))
-                        })
-                        .unwrap_or(false);
-                    if draft_proxy_is_stale {
+                AppEvent::ShowTask { task_id } => {
+                    self.apply_tasks(self.controller_state.tasks());
+                    if let Some(selected) = resolve_show_task(&self.tasks, task_id) {
+                        self.selected = Some(selected);
                         self.draft = None;
                     }
-                    if self.selected.is_none() {
-                        self.selected = self.tasks.first().map(|task| task.id);
-                    }
-                    if let Some(selected) = self.selected {
-                        if !self.tasks.iter().any(|task| task.id == selected) {
-                            self.selected = self.tasks.first().map(|task| task.id);
-                            self.draft = None;
-                        }
-                    }
-                    self.checked_tasks.retain(|id| {
-                        self.tasks
-                            .iter()
-                            .any(|task| task.id == *id && can_edit_proxy_in_bulk(task.status))
-                    });
-                    if self
-                        .selected
-                        .and_then(|id| self.tasks.iter().find(|task| task.id == id))
-                        .is_some_and(|task| {
-                            matches!(task.status, TaskStatus::Completed | TaskStatus::Cancelled)
-                        })
-                    {
-                        if let Some(draft) = self.draft.as_mut() {
-                            draft.proxy.clear_password();
-                            draft.password_input.clear();
-                        }
-                    }
+                    restored = self.restore_window(ctx) || restored;
                 }
-                EngineEvent::BatchProxyApplied { applied, skipped } => {
+                AppEvent::BatchProxyApplied { applied, skipped } => {
                     self.batch_proxy_message = Some(format_batch_proxy_result(applied, skipped));
                 }
-                EngineEvent::Fatal(message) => self.fatal = Some(message),
-                EngineEvent::ShutdownComplete => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
+                AppEvent::Fatal(message) => self.fatal = Some(message),
             }
-        }
-        while let Ok(command) = self.ipc_ui_receiver.try_recv() {
-            match command {
-                ipc::UiCommand::ShowWindow => {
-                    self.hidden_to_tray = false;
-                    set_main_window_visibility(true);
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                    restored = true;
-                }
-                ipc::UiCommand::ShowTask { task_id } => {
-                    self.pending_show_task = Some(task_id);
-                }
-            }
-        }
-        if let Some(task_id) = self.pending_show_task
-            && let Some(selected) = resolve_show_task(&self.tasks, task_id)
-        {
-            self.selected = Some(selected);
-            self.draft = None;
-            self.hidden_to_tray = false;
-            set_main_window_visibility(true);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-            self.pending_show_task = None;
-            restored = true;
         }
         restored
     }
 
+    fn apply_tasks(&mut self, tasks: Vec<TaskSnapshot>) {
+        self.tasks = tasks;
+        let draft_proxy_is_stale = self
+            .draft
+            .as_ref()
+            .and_then(|draft| {
+                self.tasks
+                    .iter()
+                    .find(|task| task.id == draft.id)
+                    .map(|task| !draft_proxy_matches_snapshot(draft, task))
+            })
+            .unwrap_or(false);
+        if draft_proxy_is_stale {
+            self.draft = None;
+        }
+        if self.selected.is_none() {
+            self.selected = self.tasks.first().map(|task| task.id);
+        }
+        if let Some(selected) = self.selected {
+            if !self.tasks.iter().any(|task| task.id == selected) {
+                self.selected = self.tasks.first().map(|task| task.id);
+                self.draft = None;
+            }
+        }
+        self.checked_tasks.retain(|id| {
+            self.tasks
+                .iter()
+                .any(|task| task.id == *id && can_edit_proxy_in_bulk(task.status))
+        });
+        if self
+            .selected
+            .and_then(|id| self.tasks.iter().find(|task| task.id == id))
+            .is_some_and(|task| {
+                matches!(task.status, TaskStatus::Completed | TaskStatus::Cancelled)
+            })
+        {
+            if let Some(draft) = self.draft.as_mut() {
+                draft.proxy.clear_password();
+                draft.password_input.clear();
+            }
+        }
+    }
+
+    fn restore_window(&mut self, ctx: &egui::Context) -> bool {
+        self.hidden_to_tray = false;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        true
+    }
     fn selected_task(&self) -> Option<TaskSnapshot> {
         self.selected
             .and_then(|id| self.tasks.iter().find(|task| task.id == id).cloned())
@@ -390,8 +359,7 @@ impl CurlDownloaderApp {
         }
         let ids = self.checked_tasks.iter().copied().collect::<Vec<_>>();
         let _ = self
-            .engine
-            .commands
+            .engine_commands
             .send(EngineCommand::UpdateProxy { ids, proxy });
         self.batch_proxy_dialog = false;
         self.batch_proxy = None;
@@ -426,7 +394,7 @@ impl CurlDownloaderApp {
         if !draft.password_input.is_empty() {
             let _ = proxy.set_password(draft.password_input.clone());
         }
-        let _ = self.engine.commands.send(EngineCommand::UpdateDraft {
+        let _ = self.engine_commands.send(EngineCommand::UpdateDraft {
             id: draft.id,
             url: draft.url.clone(),
             filename: draft.filename.clone(),
@@ -452,7 +420,7 @@ impl CurlDownloaderApp {
             self.input_error = Some("只支援 HTTP 或 HTTPS 網址".into());
             return;
         }
-        let _ = self.engine.commands.send(EngineCommand::Add(NewTask {
+        let _ = self.engine_commands.send(EngineCommand::Add(NewTask {
             url: value,
             target_dir: self.last_download_dir.clone(),
         }));
@@ -475,7 +443,7 @@ impl CurlDownloaderApp {
                 target_dir: self.last_download_dir.clone(),
             })
             .collect();
-        let _ = self.engine.commands.send(EngineCommand::AddBatch(tasks));
+        let _ = self.engine_commands.send(EngineCommand::AddBatch(tasks));
         self.batch_input.clear();
         self.batch_error = None;
         self.show_batch_dialog = false;
@@ -517,18 +485,17 @@ impl CurlDownloaderApp {
                         .changed()
                     {
                         let _ = self
-                            .engine
-                            .commands
+                            .engine_commands
                             .send(EngineCommand::SetMaxProcesses(self.max_processes));
                     }
                     if ui.button("▶ 開始全部").clicked() {
                         if let Some(draft) = self.draft.clone() {
                             self.send_draft(&draft);
                         }
-                        let _ = self.engine.commands.send(EngineCommand::StartAll);
+                        let _ = self.engine_commands.send(EngineCommand::StartAll);
                     }
                     if ui.button("Ⅱ 暫停全部").clicked() {
-                        let _ = self.engine.commands.send(EngineCommand::PauseAll);
+                        let _ = self.engine_commands.send(EngineCommand::PauseAll);
                     }
                     ui.separator();
                     if ui.button("全選可編輯").clicked() {
@@ -554,7 +521,7 @@ impl CurlDownloaderApp {
                         .on_hover_text("清除已完成及已取消的任務記錄，不會刪除已下載檔案")
                         .clicked()
                     {
-                        let _ = self.engine.commands.send(EngineCommand::ClearHistory);
+                        let _ = self.engine_commands.send(EngineCommand::ClearHistory);
                     }
                 });
                 if let Some(error) = &self.input_error {
@@ -566,7 +533,7 @@ impl CurlDownloaderApp {
                 if let Some(message) = &self.fatal {
                     ui.colored_label(ui.visuals().warn_fg_color, message);
                 }
-                if self.shutting_down {
+                if self.controller_state.lifecycle() == LifecycleState::ShuttingDown {
                     ui.colored_label(ui.visuals().hyperlink_color, "正在安全停止下載…");
                 }
             });
@@ -794,17 +761,17 @@ impl CurlDownloaderApp {
                 ) && ui.button("開始").clicked()
                 {
                     self.flush_draft(task.id);
-                    let _ = self.engine.commands.send(EngineCommand::Start(task.id));
+                    let _ = self.engine_commands.send(EngineCommand::Start(task.id));
                 }
                 if matches!(task.status, TaskStatus::Probing | TaskStatus::Downloading)
                     && ui.button("暫停").clicked()
                 {
-                    let _ = self.engine.commands.send(EngineCommand::Pause(task.id));
+                    let _ = self.engine_commands.send(EngineCommand::Pause(task.id));
                 }
                 if !matches!(task.status, TaskStatus::Completed | TaskStatus::Cancelled)
                     && ui.button("取消").clicked()
                 {
-                    let _ = self.engine.commands.send(EngineCommand::Cancel(task.id));
+                    let _ = self.engine_commands.send(EngineCommand::Cancel(task.id));
                 }
                 if task.status == TaskStatus::Completed
                     && ui
@@ -817,7 +784,7 @@ impl CurlDownloaderApp {
                 if matches!(task.status, TaskStatus::Completed | TaskStatus::Cancelled)
                     && ui.button("清除記錄").clicked()
                 {
-                    let _ = self.engine.commands.send(EngineCommand::Remove(task.id));
+                    let _ = self.engine_commands.send(EngineCommand::Remove(task.id));
                 }
             });
         });
@@ -1074,12 +1041,11 @@ impl CurlDownloaderApp {
                                 *shared_dir = path.clone();
                             }
                             let _ = self
-                                .engine
-                                .commands
+                                .engine_commands
                                 .send(EngineCommand::SetLastDownloadDir(path));
                         }
                         if let Some((id, password)) = pending_password {
-                            let _ = self.engine.commands.send(EngineCommand::SetProxyPassword {
+                            let _ = self.engine_commands.send(EngineCommand::SetProxyPassword {
                                 id,
                                 password: zeroize::Zeroizing::new(password),
                             });
@@ -1120,26 +1086,48 @@ impl eframe::App for CurlDownloaderApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         if self.start_minimized {
-            set_main_window_visibility(false);
+            self.window_control.hide();
             self.start_minimized = false;
             self.hidden_to_tray = true;
+            let _ = self
+                .controller
+                .commands()
+                .send(ControllerCommand::WindowHidden);
         }
-        let restored = self.pump_events(&ctx);
+        let restored = self.apply_controller_events(&ctx);
         if !restored
             && !self.hidden_to_tray
             && ctx.input(|input| input.viewport().minimized == Some(true))
         {
             self.hidden_to_tray = true;
-            set_main_window_visibility(false);
+            self.window_control.hide();
+            let _ = self
+                .controller
+                .commands()
+                .send(ControllerCommand::WindowHidden);
+        }
+        let lifecycle = self.controller_state.lifecycle();
+        if lifecycle == LifecycleState::Stopped {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         if ctx.input(|input| input.viewport().close_requested()) {
             if matches!(
-                window_close_action(self.shutting_down, false),
+                window_close_action(
+                    matches!(
+                        lifecycle,
+                        LifecycleState::ShuttingDown | LifecycleState::Stopped
+                    ),
+                    false,
+                ),
                 WindowCloseAction::HideToTray
             ) {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 self.hidden_to_tray = true;
-                set_main_window_visibility(false);
+                self.window_control.hide();
+                let _ = self
+                    .controller
+                    .commands()
+                    .send(ControllerCommand::WindowHidden);
             }
         }
         ctx.request_repaint_after(Duration::from_millis(200));
@@ -1155,9 +1143,10 @@ impl Drop for CurlDownloaderApp {
         if let Some(server) = self.ipc_thread.take() {
             let _ = server.join();
         }
+        self.controller.shutdown_internal();
+        self.controller.join();
     }
 }
-
 fn card_frame(ui: &egui::Ui) -> egui::Frame {
     let visuals = ui.visuals();
     egui::Frame::group(ui.style())

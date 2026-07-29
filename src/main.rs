@@ -14,14 +14,25 @@ fn main() -> eframe::Result {
         return Ok(());
     }
 
-    run_gui(arguments.iter().any(|argument| argument == "--minimized"))
+    let register_native = should_register_native(&arguments);
+    run_gui(
+        arguments.iter().any(|argument| argument == "--minimized"),
+        register_native,
+    )
 }
 
 fn initial_viewport_visible(_minimized: bool) -> bool {
     true
 }
-fn run_gui(minimized: bool) -> eframe::Result {
-    if let Ok(executable) = std::env::current_exe()
+fn should_register_native(arguments: &[std::ffi::OsString]) -> bool {
+    !arguments
+        .iter()
+        .any(|argument| argument == "--skip-native-registration")
+}
+
+fn run_gui(minimized: bool, register_native: bool) -> eframe::Result {
+    if register_native
+        && let Ok(executable) = std::env::current_exe()
         && let Err(error) = native_registration::ensure_registered(&executable)
     {
         eprintln!("Firefox Native host 自動註冊失敗：{error}");
@@ -66,7 +77,19 @@ fn run_gui(minimized: bool) -> eframe::Result {
 
 #[cfg(test)]
 mod tests {
-    use super::initial_viewport_visible;
+    use super::{initial_viewport_visible, should_register_native};
+
+    #[test]
+    fn lifecycle_probe_can_skip_native_registration() {
+        let arguments = vec![
+            std::ffi::OsString::from("--minimized"),
+            std::ffi::OsString::from("--skip-native-registration"),
+        ];
+        assert!(!should_register_native(&arguments));
+        assert!(should_register_native(&[std::ffi::OsString::from(
+            "--minimized"
+        )]));
+    }
 
     #[test]
     fn minimized_gui_starts_a_viewport_before_hiding_to_tray() {

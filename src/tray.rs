@@ -26,10 +26,7 @@ mod windows_impl {
     use std::{
         mem::size_of,
         ptr,
-        sync::{
-            Arc,
-            mpsc::{Receiver, Sender, SyncSender, sync_channel},
-        },
+        sync::mpsc::{Receiver, Sender, SyncSender, sync_channel},
         thread::{self, JoinHandle},
         time::Duration,
     };
@@ -104,7 +101,6 @@ mod windows_impl {
 
     struct TrayWindowState {
         events: Sender<TrayEvent>,
-        repaint: Arc<dyn Fn() + Send + Sync>,
     }
 
     impl TrayController {
@@ -158,7 +154,6 @@ mod windows_impl {
 
         if command == TRAY_MENU_CLOSE_COMMAND as i32 {
             let _ = state.events.send(TrayEvent::CloseWindow);
-            (state.repaint)();
         }
     }
     unsafe extern "system" fn tray_window_proc(
@@ -186,7 +181,6 @@ mod windows_impl {
                 match lparam as u32 {
                     WM_LBUTTONDBLCLK => {
                         let _ = state.events.send(TrayEvent::ShowWindow);
-                        (state.repaint)();
                     }
                     WM_RBUTTONUP => show_tray_context_menu(hwnd, state),
                     _ => {}
@@ -203,11 +197,7 @@ mod windows_impl {
         unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
     }
 
-    fn run_tray_thread(
-        events: Sender<TrayEvent>,
-        repaint: Arc<dyn Fn() + Send + Sync>,
-        ready: SyncSender<Result<u32, String>>,
-    ) {
+    fn run_tray_thread(events: Sender<TrayEvent>, ready: SyncSender<Result<u32, String>>) {
         let thread_id = unsafe { GetCurrentThreadId() };
         let hinstance = unsafe { GetModuleHandleW(ptr::null()) } as HINSTANCE;
         let class = WNDCLASSW {
@@ -225,7 +215,7 @@ mod windows_impl {
             return;
         }
 
-        let state = Box::new(TrayWindowState { events, repaint });
+        let state = Box::new(TrayWindowState { events });
         let state_ptr = Box::into_raw(state);
         let hwnd = unsafe {
             windows_sys::Win32::UI::WindowsAndMessaging::CreateWindowExW(
@@ -322,14 +312,12 @@ mod windows_impl {
         }
     }
 
-    pub fn create(
-        repaint: Arc<dyn Fn() + Send + Sync>,
-    ) -> Result<(TrayController, Receiver<TrayEvent>), String> {
+    pub fn create() -> Result<(TrayController, Receiver<TrayEvent>), String> {
         let (events, receiver) = std::sync::mpsc::channel();
         let (ready_sender, ready_receiver) = sync_channel(1);
         let thread = thread::Builder::new()
             .name("curl-downloader-tray".into())
-            .spawn(move || run_tray_thread(events, repaint, ready_sender))
+            .spawn(move || run_tray_thread(events, ready_sender))
             .map_err(|error| format!("無法啟動系統匣執行緒：{error}"))?;
         let thread_id = ready_receiver
             .recv_timeout(Duration::from_secs(2))
@@ -359,9 +347,7 @@ mod windows_impl {
         fn drop(&mut self) {}
     }
 
-    pub fn create(
-        _repaint: std::sync::Arc<dyn Fn() + Send + Sync>,
-    ) -> Result<(TrayController, Receiver<TrayEvent>), String> {
+    pub fn create() -> Result<(TrayController, Receiver<TrayEvent>), String> {
         let (_sender, receiver) = std::sync::mpsc::channel();
         Ok((TrayController::disabled(), receiver))
     }
@@ -382,10 +368,8 @@ impl TrayController {
         )
     }
 
-    pub fn create(
-        repaint: std::sync::Arc<dyn Fn() + Send + Sync>,
-    ) -> Result<(Self, Receiver<TrayEvent>), String> {
-        let (inner, receiver) = windows_impl::create(repaint)?;
+    pub fn create() -> Result<(Self, Receiver<TrayEvent>), String> {
+        let (inner, receiver) = windows_impl::create()?;
         Ok((Self { _inner: inner }, receiver))
     }
 }

@@ -1,6 +1,7 @@
 mod support;
 
 use curl_downloader::{
+    controller::{ControllerCommand, LifecycleState, SharedControllerState},
     ipc::{IpcRequest, IpcResponse, WireProxy},
     model::TaskStatus,
 };
@@ -24,13 +25,13 @@ fn pipe_enqueue_reaches_the_single_download_engine() {
     let mut harness = support::EngineHarness::new(1);
     let stop = Arc::new(AtomicBool::new(false));
     let defaults = Arc::new(Mutex::new(harness.download_dir().to_path_buf()));
-    let snapshots = Arc::new(Mutex::new(Vec::new()));
-    let (ui_sender, _ui_receiver) = std::sync::mpsc::channel();
+    let state = SharedControllerState::new(LifecycleState::RunningHidden);
+    let (controller_tx, _controller_rx) = std::sync::mpsc::channel::<ControllerCommand>();
     let pipe = curl_downloader::ipc::spawn_server(
         harness.engine.commands.clone(),
         Arc::clone(&defaults),
-        snapshots,
-        ui_sender,
+        state,
+        controller_tx,
         Arc::clone(&stop),
     );
     let target = harness.download_dir().join("bridge-target");
