@@ -1,4 +1,4 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 
 Set-Location (Join-Path $PSScriptRoot '..')
 $toolchain = 'stable-x86_64-pc-windows-gnu'
@@ -25,9 +25,11 @@ Invoke-CargoChecked @('build', '--ignore-rust-version', '--release', '--target',
 New-Item -ItemType Directory -Path 'dist' -Force | Out-Null
 Copy-Item -LiteralPath "target/$target/release/curl-downloader.exe" -Destination 'dist/CurlDownloader.exe'
 
-& powershell -NoProfile -ExecutionPolicy Bypass `
-    -File 'scripts/test-minimized-background-controller.ps1' `
-    -ExecutablePath 'dist/CurlDownloader.exe'
+$scriptHost = (Get-Command pwsh -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Source)
+if ([string]::IsNullOrWhiteSpace($scriptHost)) {
+    $scriptHost = (Get-Command powershell).Source
+}
+& $scriptHost -NoProfile -ExecutionPolicy Bypass -File 'scripts/test-minimized-background-controller.ps1' -ExecutablePath 'dist/CurlDownloader.exe'
 if ($LASTEXITCODE -ne 0) {
     throw 'Minimized background controller smoke test failed.'
 }
