@@ -37,6 +37,10 @@ impl EngineHandle {
             .map(|line| line.clone())
             .unwrap_or_default()
     }
+
+    pub fn into_channels(self) -> (Sender<EngineCommand>, Receiver<EngineEvent>) {
+        (self.commands, self.events)
+    }
 }
 
 #[derive(Default)]
@@ -430,6 +434,8 @@ impl Engine {
                 let _ = self.persist();
             }
             EngineCommand::Shutdown => {
+                self.refresh_progress();
+                let _ = self.persist();
                 self.shutting_down = true;
                 self.queue.clear();
                 self.pending_start.clear();

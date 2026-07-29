@@ -1,9 +1,19 @@
-use crate::model::{TaskId, TaskSnapshot};
-use std::sync::{
-    Arc, Condvar, Mutex,
-    atomic::{AtomicU8, Ordering},
+use crate::{
+    model::{EngineCommand, EngineEvent, TaskId, TaskSnapshot},
+    startup_policy,
+    tray::{TrayController, TrayEvent},
+    window_control::MainWindowControl,
 };
-use std::time::Duration;
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, AtomicU8, Ordering},
+        mpsc::{self, Receiver, Sender},
+    },
+    thread::{self, JoinHandle},
+    time::{Duration, Instant},
+};
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -116,6 +126,264 @@ impl SharedControllerState {
         *ready
     }
 }
+
+#[derive(Debug)]
+pub enum ControllerCommand {
+    ShowWindow,
+    ShowTask { task_id: TaskId },
+    WindowHidden,
+    WindowVisible,
+    ShutdownManual,
+    ShutdownInternal,
+}
+
+#[derive(Debug)]
+pub enum AppEvent {
+    SnapshotChanged,
+    ShowWindow,
+    ShowTask { task_id: TaskId },
+    BatchProxyApplied { applied: usize, skipped: usize },
+    Fatal(String),
+}
+
+pub struct ControllerHandle {
+    command_sender: Sender<ControllerCommand>,
+    state: SharedControllerState,
+    app_events: Option<Receiver<AppEvent>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl ControllerHandle {
+    pub fn commands(&self) -> Sender<ControllerCommand> {
+        self.command_sender.clone()
+    }
+
+    pub fn state(&self) -> SharedControllerState {
+        self.state.clone()
+    }
+
+    pub fn take_app_events(&mut self) -> Receiver<AppEvent> {
+        self.app_events
+            .take()
+            .expect("背景控制器 UI event receiver 已被取用")
+    }
+
+    pub fn shutdown_internal(&self) {
+        let _ = self
+            .command_sender
+            .send(ControllerCommand::ShutdownInternal);
+    }
+
+    pub fn join(&mut self) {
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for ControllerHandle {
+    fn drop(&mut self) {
+        self.shutdown_internal();
+        self.join();
+    }
+}
+
+pub fn spawn_controller(
+    initial_lifecycle: LifecycleState,
+    engine_commands: Sender<EngineCommand>,
+    engine_events: Receiver<EngineEvent>,
+    tray: TrayController,
+    tray_events: Receiver<TrayEvent>,
+    window: Arc<dyn MainWindowControl>,
+    manual_stop_path: PathBuf,
+    ipc_stop: Arc<AtomicBool>,
+) -> Result<ControllerHandle, String> {
+    let state = SharedControllerState::new(initial_lifecycle);
+    let (command_sender, command_receiver) = mpsc::channel();
+    let (app_event_sender, app_event_receiver) = mpsc::channel();
+    let thread_state = state.clone();
+    let thread_command_sender = engine_commands.clone();
+    let thread = thread::Builder::new()
+        .name("curl-downloader-controller".into())
+        .spawn(move || {
+            run_controller(
+                thread_state,
+                command_receiver,
+                engine_events,
+                thread_command_sender,
+                tray,
+                tray_events,
+                window,
+                manual_stop_path,
+                ipc_stop,
+                app_event_sender,
+            )
+        })
+        .map_err(|error| format!("無法啟動背景控制器：{error}"))?;
+    Ok(ControllerHandle {
+        command_sender,
+        state,
+        app_events: Some(app_event_receiver),
+        thread: Some(thread),
+    })
+}
+
+fn run_controller(
+    state: SharedControllerState,
+    command_receiver: Receiver<ControllerCommand>,
+    engine_events: Receiver<EngineEvent>,
+    engine_commands: Sender<EngineCommand>,
+    _tray: TrayController,
+    tray_events: Receiver<TrayEvent>,
+    window: Arc<dyn MainWindowControl>,
+    manual_stop_path: PathBuf,
+    ipc_stop: Arc<AtomicBool>,
+    app_events: Sender<AppEvent>,
+) {
+    let mut shutdown_deadline = None;
+    loop {
+        while let Ok(command) = command_receiver.try_recv() {
+            handle_command(
+                command,
+                &state,
+                &engine_commands,
+                &window,
+                &manual_stop_path,
+                &ipc_stop,
+                &app_events,
+                &mut shutdown_deadline,
+            );
+        }
+        while let Ok(event) = tray_events.try_recv() {
+            match event {
+                TrayEvent::ShowWindow => show_window(&state, &window, &app_events, None),
+                TrayEvent::CloseWindow => begin_shutdown(
+                    true,
+                    &state,
+                    &engine_commands,
+                    &manual_stop_path,
+                    &ipc_stop,
+                    &mut shutdown_deadline,
+                ),
+            }
+        }
+
+        match engine_events.recv_timeout(Duration::from_millis(25)) {
+            Ok(EngineEvent::Snapshot(tasks)) => {
+                state.replace_tasks(tasks);
+                state.mark_ready();
+                let _ = app_events.send(AppEvent::SnapshotChanged);
+            }
+            Ok(EngineEvent::BatchProxyApplied { applied, skipped }) => {
+                let _ = app_events.send(AppEvent::BatchProxyApplied { applied, skipped });
+            }
+            Ok(EngineEvent::Fatal(message)) => {
+                let _ = app_events.send(AppEvent::Fatal(message));
+            }
+            Ok(EngineEvent::ShutdownComplete) => {
+                state.set_lifecycle(LifecycleState::Stopped);
+                window.request_close();
+                break;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+
+        if shutdown_deadline.is_some_and(|deadline| deadline.elapsed() >= Duration::from_secs(10)) {
+            state.set_lifecycle(LifecycleState::Stopped);
+            window.request_close();
+            break;
+        }
+    }
+}
+
+fn handle_command(
+    command: ControllerCommand,
+    state: &SharedControllerState,
+    engine_commands: &Sender<EngineCommand>,
+    window: &Arc<dyn MainWindowControl>,
+    manual_stop_path: &PathBuf,
+    ipc_stop: &Arc<AtomicBool>,
+    app_events: &Sender<AppEvent>,
+    shutdown_deadline: &mut Option<Instant>,
+) {
+    match command {
+        ControllerCommand::ShowWindow => show_window(state, window, app_events, None),
+        ControllerCommand::ShowTask { task_id } if state.task_exists(task_id) => {
+            show_window(state, window, app_events, Some(task_id))
+        }
+        ControllerCommand::ShowTask { .. } => {}
+        ControllerCommand::WindowHidden => {
+            if state.lifecycle() == LifecycleState::RunningVisible {
+                state.set_lifecycle(LifecycleState::RunningHidden);
+            }
+        }
+        ControllerCommand::WindowVisible => {
+            if matches!(
+                state.lifecycle(),
+                LifecycleState::RunningHidden | LifecycleState::Starting
+            ) {
+                state.set_lifecycle(LifecycleState::RunningVisible);
+            }
+        }
+        ControllerCommand::ShutdownManual => begin_shutdown(
+            true,
+            state,
+            engine_commands,
+            manual_stop_path,
+            ipc_stop,
+            shutdown_deadline,
+        ),
+        ControllerCommand::ShutdownInternal => begin_shutdown(
+            false,
+            state,
+            engine_commands,
+            manual_stop_path,
+            ipc_stop,
+            shutdown_deadline,
+        ),
+    }
+}
+
+fn show_window(
+    state: &SharedControllerState,
+    window: &Arc<dyn MainWindowControl>,
+    app_events: &Sender<AppEvent>,
+    task_id: Option<TaskId>,
+) {
+    if matches!(
+        state.lifecycle(),
+        LifecycleState::ShuttingDown | LifecycleState::Stopped
+    ) {
+        return;
+    }
+    state.set_lifecycle(LifecycleState::RunningVisible);
+    window.show_and_focus();
+    let event = task_id.map_or(AppEvent::ShowWindow, |task_id| AppEvent::ShowTask {
+        task_id,
+    });
+    let _ = app_events.send(event);
+}
+
+fn begin_shutdown(
+    manual: bool,
+    state: &SharedControllerState,
+    engine_commands: &Sender<EngineCommand>,
+    manual_stop_path: &PathBuf,
+    ipc_stop: &Arc<AtomicBool>,
+    shutdown_deadline: &mut Option<Instant>,
+) {
+    if !state.begin_shutdown() {
+        return;
+    }
+    if manual {
+        let _ =
+            startup_policy::record_manual_stop(manual_stop_path, startup_policy::unix_time_ms());
+    }
+    ipc_stop.store(true, Ordering::Release);
+    let _ = engine_commands.send(EngineCommand::Shutdown);
+    *shutdown_deadline = Some(Instant::now());
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,5 +446,245 @@ mod tests {
         assert!(!state.wait_ready(Duration::from_millis(1)));
         state.mark_ready();
         assert!(state.wait_ready(Duration::from_millis(1)));
+    }
+}
+
+#[cfg(test)]
+mod runtime_tests {
+    use super::{
+        ControllerCommand, ControllerHandle, LifecycleState, SharedControllerState,
+        spawn_controller,
+    };
+    use crate::{
+        model::{
+            CurlSource, EngineCommand, EngineEvent, ProxyProtocol, ProxySnapshot, RangeSupport,
+            TaskSnapshot, TaskStatus,
+        },
+        startup_policy,
+        tray::{TrayController, TrayEvent},
+        window_control::MainWindowControl,
+    };
+    use std::{
+        path::PathBuf,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            mpsc::{self, Receiver, Sender},
+        },
+        thread,
+        time::{Duration, Instant},
+    };
+
+    #[derive(Default)]
+    struct RecordingWindow {
+        shown: AtomicUsize,
+        closed: AtomicUsize,
+    }
+
+    impl MainWindowControl for RecordingWindow {
+        fn show_and_focus(&self) {
+            self.shown.fetch_add(1, Ordering::AcqRel);
+        }
+
+        fn hide(&self) {}
+
+        fn request_close(&self) {
+            self.closed.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    struct ControllerFixture {
+        handle: ControllerHandle,
+        commands: Sender<ControllerCommand>,
+        engine_events: Sender<EngineEvent>,
+        engine_commands: Receiver<EngineCommand>,
+        tray_events: Sender<TrayEvent>,
+        state: SharedControllerState,
+        window: Arc<RecordingWindow>,
+        manual_stop_path: PathBuf,
+        ipc_stop: Arc<AtomicBool>,
+    }
+
+    impl ControllerFixture {
+        fn hidden() -> Self {
+            let (engine_commands, engine_commands_receiver) = mpsc::channel();
+            let (engine_events_sender, engine_events_receiver) = mpsc::channel();
+            let (tray, _tray_events_receiver) = TrayController::disabled();
+            let (tray_events_sender, tray_events_receiver_for_controller) = mpsc::channel();
+            let window = Arc::new(RecordingWindow::default());
+            let ipc_stop = Arc::new(AtomicBool::new(false));
+            let manual_stop_path = std::env::temp_dir().join(format!(
+                "curl-downloader-controller-test-{}-{}.json",
+                std::process::id(),
+                startup_policy::unix_time_ms()
+            ));
+            let handle = spawn_controller(
+                LifecycleState::RunningHidden,
+                engine_commands,
+                engine_events_receiver,
+                tray,
+                tray_events_receiver_for_controller,
+                window.clone(),
+                manual_stop_path.clone(),
+                ipc_stop.clone(),
+            )
+            .expect("controller should start");
+            let commands = handle.commands();
+            let state = handle.state();
+            Self {
+                handle,
+                commands,
+                engine_events: engine_events_sender,
+                engine_commands: engine_commands_receiver,
+                tray_events: tray_events_sender,
+                state,
+                window,
+                manual_stop_path,
+                ipc_stop,
+            }
+        }
+
+        fn snapshot(&self, id: u64, status: TaskStatus) -> TaskSnapshot {
+            TaskSnapshot {
+                id,
+                original_url: "https://example.test/file.bin".into(),
+                effective_url: None,
+                filename: "file.bin".into(),
+                target_dir: PathBuf::from(r"C:\Downloads"),
+                status,
+                requested_segments: 1,
+                actual_segments: 1,
+                downloaded: u64::from(status == TaskStatus::Completed),
+                total_size: Some(1),
+                range_support: RangeSupport::Unknown,
+                current_bps: 0.0,
+                average_bps: 0.0,
+                eta_seconds: None,
+                active_millis: 0,
+                created_unix_ms: 1,
+                completed_unix_ms: (status == TaskStatus::Completed).then_some(2),
+                proxy: ProxySnapshot {
+                    enabled: false,
+                    protocol: ProxyProtocol::Http,
+                    host: String::new(),
+                    port: 8080,
+                    username: String::new(),
+                    requires_password: false,
+                },
+                error: None,
+                curl_source: CurlSource::NotStarted,
+            }
+        }
+
+        fn wait_for(&self, condition: impl Fn() -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !condition() {
+                assert!(Instant::now() < deadline, "controller condition timed out");
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+
+    impl Drop for ControllerFixture {
+        fn drop(&mut self) {
+            let _ = self.engine_events.send(EngineEvent::ShutdownComplete);
+            self.handle.join();
+            let _ = startup_policy::clear_manual_stop(&self.manual_stop_path);
+        }
+    }
+
+    #[test]
+    fn hidden_controller_publishes_engine_snapshots_immediately() {
+        let fixture = ControllerFixture::hidden();
+        fixture
+            .engine_events
+            .send(EngineEvent::Snapshot(vec![
+                fixture.snapshot(9, TaskStatus::Completed),
+            ]))
+            .unwrap();
+        fixture.wait_for(|| fixture.state.task_exists(9));
+        assert_eq!(fixture.window.shown.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn show_command_uses_win32_control_without_waiting_for_ui() {
+        let fixture = ControllerFixture::hidden();
+        fixture
+            .commands
+            .send(ControllerCommand::ShowWindow)
+            .unwrap();
+        fixture.wait_for(|| fixture.window.shown.load(Ordering::Acquire) == 1);
+        assert_eq!(fixture.state.lifecycle(), LifecycleState::RunningVisible);
+    }
+
+    #[test]
+    fn tray_close_records_one_manual_shutdown() {
+        let fixture = ControllerFixture::hidden();
+        fixture.tray_events.send(TrayEvent::CloseWindow).unwrap();
+        fixture.tray_events.send(TrayEvent::CloseWindow).unwrap();
+        assert!(matches!(
+            fixture
+                .engine_commands
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap(),
+            EngineCommand::Shutdown
+        ));
+        assert!(
+            fixture
+                .engine_commands
+                .recv_timeout(Duration::from_millis(50))
+                .is_err()
+        );
+        fixture.wait_for(|| fixture.state.lifecycle() == LifecycleState::ShuttingDown);
+        assert!(
+            startup_policy::read_manual_stop(&fixture.manual_stop_path)
+                .unwrap()
+                .is_some()
+        );
+        assert!(fixture.ipc_stop.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn shutdown_command_stops_engine_and_records_manual_stop() {
+        let fixture = ControllerFixture::hidden();
+        fixture
+            .commands
+            .send(ControllerCommand::ShutdownManual)
+            .unwrap();
+        let engine_command = fixture
+            .engine_commands
+            .recv_timeout(Duration::from_secs(2))
+            .expect("engine should receive shutdown");
+        assert!(matches!(engine_command, EngineCommand::Shutdown));
+        fixture.wait_for(|| fixture.state.lifecycle() == LifecycleState::ShuttingDown);
+        fixture.wait_for(|| fixture.ipc_stop.load(Ordering::Acquire));
+        assert!(
+            startup_policy::read_manual_stop(&fixture.manual_stop_path)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn engine_shutdown_completion_closes_window_once() {
+        let fixture = ControllerFixture::hidden();
+        fixture
+            .commands
+            .send(ControllerCommand::ShutdownManual)
+            .unwrap();
+        assert!(matches!(
+            fixture
+                .engine_commands
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap(),
+            EngineCommand::Shutdown
+        ));
+        fixture
+            .engine_events
+            .send(EngineEvent::ShutdownComplete)
+            .unwrap();
+        fixture.wait_for(|| fixture.state.lifecycle() == LifecycleState::Stopped);
+        fixture.wait_for(|| fixture.window.closed.load(Ordering::Acquire) == 1);
+        assert_eq!(fixture.window.closed.load(Ordering::Acquire), 1);
     }
 }

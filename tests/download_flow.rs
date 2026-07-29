@@ -214,6 +214,14 @@ fn shutdown_then_restart_resumes_without_redownloading_prefix() {
     let state_path = harness.shutdown_keep_files();
     let before = support::part_lengths(harness.download_dir(), id);
     assert!(before.iter().any(|length| *length > 0));
+    let persisted = curl_downloader::storage::load_state(&state_path).unwrap();
+    let stopped = persisted.tasks.iter().find(|task| task.id == id).unwrap();
+    assert_eq!(stopped.status, TaskStatus::Paused);
+    assert!(
+        support::part_lengths(harness.download_dir(), id)
+            .iter()
+            .any(|length| *length > 0)
+    );
 
     let mut restarted =
         support::EngineHarness::from_state(state_path, harness.download_dir().to_path_buf());
