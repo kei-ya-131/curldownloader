@@ -22,9 +22,15 @@ Invoke-CargoChecked @('clippy', '--ignore-rust-version', '--all-targets', '--tar
 Invoke-CargoChecked @('test', '--ignore-rust-version', '--target', $target, '--', '--test-threads=1')
 Invoke-CargoChecked @('build', '--ignore-rust-version', '--release', '--target', $target, '--bin', 'curl-downloader')
 
-if (Test-Path -LiteralPath 'dist') { Remove-Item -LiteralPath 'dist' -Recurse -Force }
-New-Item -ItemType Directory -Path 'dist' | Out-Null
+New-Item -ItemType Directory -Path 'dist' -Force | Out-Null
 Copy-Item -LiteralPath "target/$target/release/curl-downloader.exe" -Destination 'dist/CurlDownloader.exe'
+
+& powershell -NoProfile -ExecutionPolicy Bypass `
+    -File 'scripts/test-minimized-background-controller.ps1' `
+    -ExecutablePath 'dist/CurlDownloader.exe'
+if ($LASTEXITCODE -ne 0) {
+    throw 'Minimized background controller smoke test failed.'
+}
 
 $executables = @(Get-ChildItem -LiteralPath 'dist' -Filter '*.exe' -File)
 if ($executables.Count -ne 1 -or $executables[0].Name -ne 'CurlDownloader.exe') {

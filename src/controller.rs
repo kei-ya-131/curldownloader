@@ -5,7 +5,7 @@ use crate::{
     window_control::MainWindowControl,
 };
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicU8, Ordering},
@@ -188,6 +188,7 @@ impl Drop for ControllerHandle {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_controller(
     initial_lifecycle: LifecycleState,
     engine_commands: Sender<EngineCommand>,
@@ -228,6 +229,7 @@ pub fn spawn_controller(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_controller(
     state: SharedControllerState,
     command_receiver: Receiver<ControllerCommand>,
@@ -297,12 +299,13 @@ fn run_controller(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_command(
     command: ControllerCommand,
     state: &SharedControllerState,
     engine_commands: &Sender<EngineCommand>,
     window: &Arc<dyn MainWindowControl>,
-    manual_stop_path: &PathBuf,
+    manual_stop_path: &Path,
     ipc_stop: &Arc<AtomicBool>,
     app_events: &Sender<AppEvent>,
     shutdown_deadline: &mut Option<Instant>,
@@ -369,7 +372,7 @@ fn begin_shutdown(
     manual: bool,
     state: &SharedControllerState,
     engine_commands: &Sender<EngineCommand>,
-    manual_stop_path: &PathBuf,
+    manual_stop_path: &Path,
     ipc_stop: &Arc<AtomicBool>,
     shutdown_deadline: &mut Option<Instant>,
 ) {

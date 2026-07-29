@@ -847,7 +847,17 @@ fn named_pipe_security_attributes() -> io::Result<(
 
 #[cfg(windows)]
 fn pipe_name_wide() -> Vec<u16> {
-    PIPE_NAME.encode_utf16().chain(std::iter::once(0)).collect()
+    let name = std::env::var("CURL_DOWNLOADER_PIPE_SUFFIX")
+        .ok()
+        .filter(|suffix| {
+            !suffix.is_empty()
+                && suffix
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '-')
+        })
+        .map(|suffix| format!("{PIPE_NAME}-{suffix}"))
+        .unwrap_or_else(|| PIPE_NAME.to_owned());
+    name.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 #[cfg(test)]

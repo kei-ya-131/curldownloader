@@ -27,6 +27,8 @@ fn pipe_enqueue_reaches_the_single_download_engine() {
     let defaults = Arc::new(Mutex::new(harness.download_dir().to_path_buf()));
     let state = SharedControllerState::new(LifecycleState::RunningHidden);
     let (controller_tx, _controller_rx) = std::sync::mpsc::channel::<ControllerCommand>();
+    let pipe_suffix = format!("test-{}", std::process::id());
+    unsafe { std::env::set_var("CURL_DOWNLOADER_PIPE_SUFFIX", &pipe_suffix) };
     let pipe = curl_downloader::ipc::spawn_server(
         harness.engine.commands.clone(),
         Arc::clone(&defaults),
@@ -63,4 +65,5 @@ fn pipe_enqueue_reaches_the_single_download_engine() {
 
     stop.store(true, Ordering::Release);
     let _ = pipe.join();
+    unsafe { std::env::remove_var("CURL_DOWNLOADER_PIPE_SUFFIX") };
 }
