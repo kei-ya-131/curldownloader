@@ -3,6 +3,7 @@
 #![allow(clippy::field_reassign_with_default)]
 
 pub mod app;
+pub mod controller;
 pub mod curl;
 pub mod download;
 pub mod filename;
@@ -14,3 +15,4 @@ pub mod single_instance;
 pub mod startup_policy;
 pub mod storage;
 pub mod tray;
+pub mod window_control;

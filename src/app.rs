@@ -1,3 +1,5 @@
+pub use crate::window_control::focus_existing_main_window;
+use crate::window_control::set_main_window_visibility;
 use crate::{
     download::{EngineHandle, spawn_engine},
     ipc,
@@ -1100,84 +1102,6 @@ fn effective_start_minimized(requested: bool, tray_available: bool) -> bool {
     requested && tray_available
 }
 
-fn window_matches_process(window_process_id: u32, target_process_id: Option<u32>) -> bool {
-    match target_process_id {
-        Some(target_process_id) => window_process_id == target_process_id,
-        None => true,
-    }
-}
-
-#[cfg(windows)]
-fn set_window_visibility_for_process(visible: bool, target_process_id: Option<u32>) {
-    use windows_sys::Win32::{
-        Foundation::{HWND, LPARAM},
-        UI::WindowsAndMessaging::{
-            EnumWindows, GW_OWNER, GetWindow, GetWindowTextW, GetWindowThreadProcessId, SW_HIDE,
-            SW_SHOW, SetForegroundWindow, ShowWindow,
-        },
-    };
-    use windows_sys::core::BOOL;
-
-    struct WindowSearch {
-        process_id: Option<u32>,
-        window: HWND,
-    }
-
-    unsafe extern "system" fn find_main_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
-        let search = unsafe { &mut *(lparam as *mut WindowSearch) };
-        let mut process_id = 0u32;
-        unsafe {
-            GetWindowThreadProcessId(hwnd, &mut process_id);
-        }
-        let mut title = [0u16; 256];
-        let title_length = unsafe { GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32) };
-        let is_main_window = title_length > 0
-            && String::from_utf16_lossy(&title[..title_length as usize]) == "Curl Downloader";
-        if window_matches_process(process_id, search.process_id)
-            && unsafe { GetWindow(hwnd, GW_OWNER) }.is_null()
-            && is_main_window
-        {
-            search.window = hwnd;
-            return 0;
-        }
-        1
-    }
-
-    let mut search = WindowSearch {
-        process_id: target_process_id,
-        window: std::ptr::null_mut(),
-    };
-    unsafe {
-        EnumWindows(
-            Some(find_main_window),
-            (&mut search as *mut WindowSearch).cast::<()>() as LPARAM,
-        );
-        if !search.window.is_null() {
-            ShowWindow(search.window, if visible { SW_SHOW } else { SW_HIDE });
-            if visible {
-                SetForegroundWindow(search.window);
-            }
-        }
-    }
-}
-
-#[cfg(windows)]
-fn set_main_window_visibility(visible: bool) {
-    use windows_sys::Win32::System::Threading::GetCurrentProcessId;
-    set_window_visibility_for_process(visible, Some(unsafe { GetCurrentProcessId() }));
-}
-
-#[cfg(windows)]
-pub fn focus_existing_main_window() {
-    set_window_visibility_for_process(true, None);
-}
-
-#[cfg(not(windows))]
-fn set_main_window_visibility(_visible: bool) {}
-
-#[cfg(not(windows))]
-pub fn focus_existing_main_window() {}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WindowCloseAction {
     HideToTray,
@@ -1659,13 +1583,6 @@ mod tests {
         assert!(effective_start_minimized(true, true));
         assert!(!effective_start_minimized(true, false));
         assert!(!effective_start_minimized(false, false));
-    }
-
-    #[test]
-    fn duplicate_gui_launch_can_target_existing_process_window() {
-        assert!(window_matches_process(42, None));
-        assert!(window_matches_process(42, Some(42)));
-        assert!(!window_matches_process(42, Some(7)));
     }
     #[test]
     fn ordinary_window_close_hides_to_tray_instead_of_shutting_down() {
