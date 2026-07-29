@@ -1,3 +1,64 @@
+use eframe::egui;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WindowDirective {
+    Visible(bool),
+    Minimized(bool),
+    Focus,
+    Close,
+}
+
+pub fn show_directives() -> [WindowDirective; 3] {
+    [
+        WindowDirective::Visible(true),
+        WindowDirective::Minimized(false),
+        WindowDirective::Focus,
+    ]
+}
+
+pub fn hide_directives() -> [WindowDirective; 1] {
+    [WindowDirective::Visible(false)]
+}
+
+pub fn close_directives() -> [WindowDirective; 1] {
+    [WindowDirective::Close]
+}
+
+fn apply_directives(context: &egui::Context, directives: &[WindowDirective]) {
+    for directive in directives {
+        let command = match directive {
+            WindowDirective::Visible(value) => egui::ViewportCommand::Visible(*value),
+            WindowDirective::Minimized(value) => egui::ViewportCommand::Minimized(*value),
+            WindowDirective::Focus => egui::ViewportCommand::Focus,
+            WindowDirective::Close => egui::ViewportCommand::Close,
+        };
+        context.send_viewport_cmd(command);
+    }
+    context.request_repaint();
+}
+
+pub struct EguiMainWindow {
+    context: egui::Context,
+}
+
+impl EguiMainWindow {
+    pub fn new(context: egui::Context) -> Arc<Self> {
+        Arc::new(Self { context })
+    }
+}
+
+impl MainWindowControl for EguiMainWindow {
+    fn show_and_focus(&self) {
+        apply_directives(&self.context, &show_directives());
+    }
+
+    fn hide(&self) {
+        apply_directives(&self.context, &hide_directives());
+    }
+
+    fn request_close(&self) {
+        apply_directives(&self.context, &close_directives());
+    }
+}
 use std::sync::Arc;
 
 pub trait MainWindowControl: Send + Sync {

@@ -8,7 +8,7 @@ use crate::{
         ProxySettings, TaskId, TaskSnapshot, TaskStatus,
     },
     storage, tray,
-    window_control::{MainWindowControl, ProcessMainWindow},
+    window_control::{EguiMainWindow, MainWindowControl},
 };
 use eframe::egui;
 use std::{
@@ -175,7 +175,7 @@ impl CurlDownloaderApp {
                 tray::TrayController::disabled()
             }
         };
-        let window_control: Arc<dyn MainWindowControl> = ProcessMainWindow::current();
+        let window_control: Arc<dyn MainWindowControl> = EguiMainWindow::new(cc.egui_ctx.clone());
         let initial_lifecycle = if start_minimized {
             LifecycleState::RunningHidden
         } else {
@@ -193,7 +193,6 @@ impl CurlDownloaderApp {
         )
         .unwrap_or_else(|error| panic!("無法啟動背景控制器：{error}"));
         let controller_state = controller.state();
-        let _ = controller_state.wait_ready(Duration::from_secs(2));
         let controller_events = controller.take_app_events();
         let ipc_thread = Some(ipc::spawn_server(
             engine_commands.clone(),
@@ -202,6 +201,8 @@ impl CurlDownloaderApp {
             controller.commands(),
             Arc::clone(&ipc_stop),
         ));
+        controller_state.mark_ui_ready();
+        let _ = controller_state.wait_ready(Duration::from_secs(2));
 
         cc.egui_ctx.set_fonts(chinese_font_definitions());
         cc.egui_ctx.set_theme(egui::ThemePreference::System);

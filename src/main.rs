@@ -1,8 +1,8 @@
 #![windows_subsystem = "windows"]
 
 use curl_downloader::{
-    app::{CurlDownloaderApp, focus_existing_main_window},
-    ipc, native_host, native_registration, single_instance, startup_policy, storage,
+    app::CurlDownloaderApp, ipc, native_host, native_registration, single_instance, startup_policy,
+    storage,
 };
 
 fn main() -> eframe::Result {
@@ -41,7 +41,6 @@ fn run_gui(minimized: bool, register_native: bool) -> eframe::Result {
     let _instance = match single_instance::acquire() {
         Ok(Some(instance)) => instance,
         Ok(None) => {
-            focus_existing_main_window();
             let request = ipc::show_window_request();
             let _ = ipc::call_pipe_with_retry(
                 &request,
@@ -49,7 +48,6 @@ fn run_gui(minimized: bool, register_native: bool) -> eframe::Result {
                 std::time::Duration::from_millis(50),
                 40,
             );
-            focus_existing_main_window();
             return Ok(());
         }
         Err(error) => {

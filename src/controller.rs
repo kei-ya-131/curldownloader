@@ -38,11 +38,17 @@ impl LifecycleState {
     }
 }
 
+#[derive(Default)]
+struct ReadyState {
+    engine: bool,
+    ui: bool,
+}
+
 #[derive(Clone)]
 pub struct SharedControllerState {
     tasks: Arc<Mutex<Vec<TaskSnapshot>>>,
     lifecycle: Arc<AtomicU8>,
-    ready: Arc<(Mutex<bool>, Condvar)>,
+    ready: Arc<(Mutex<ReadyState>, Condvar)>,
 }
 
 impl SharedControllerState {
@@ -50,7 +56,7 @@ impl SharedControllerState {
         Self {
             tasks: Arc::new(Mutex::new(Vec::new())),
             lifecycle: Arc::new(AtomicU8::new(initial as u8)),
-            ready: Arc::new((Mutex::new(false), Condvar::new())),
+            ready: Arc::new((Mutex::new(ReadyState::default()), Condvar::new())),
         }
     }
 
@@ -104,10 +110,27 @@ impl SharedControllerState {
         false
     }
 
+    pub fn mark_engine_ready(&self) {
+        let (lock, condition) = &*self.ready;
+        if let Ok(mut ready) = lock.lock() {
+            ready.engine = true;
+            condition.notify_all();
+        }
+    }
+
+    pub fn mark_ui_ready(&self) {
+        let (lock, condition) = &*self.ready;
+        if let Ok(mut ready) = lock.lock() {
+            ready.ui = true;
+            condition.notify_all();
+        }
+    }
+
     pub fn mark_ready(&self) {
         let (lock, condition) = &*self.ready;
         if let Ok(mut ready) = lock.lock() {
-            *ready = true;
+            ready.engine = true;
+            ready.ui = true;
             condition.notify_all();
         }
     }
@@ -117,13 +140,13 @@ impl SharedControllerState {
         let Ok(ready) = lock.lock() else {
             return false;
         };
-        if *ready {
+        if ready.engine && ready.ui {
             return true;
         }
         let Ok((ready, _)) = condition.wait_timeout(ready, timeout) else {
             return false;
         };
-        *ready
+        ready.engine && ready.ui
     }
 }
 
@@ -273,7 +296,7 @@ fn run_controller(
         match engine_events.recv_timeout(Duration::from_millis(25)) {
             Ok(EngineEvent::Snapshot(tasks)) => {
                 state.replace_tasks(tasks);
-                state.mark_ready();
+                state.mark_engine_ready();
                 let _ = app_events.send(AppEvent::SnapshotChanged);
             }
             Ok(EngineEvent::BatchProxyApplied { applied, skipped }) => {
