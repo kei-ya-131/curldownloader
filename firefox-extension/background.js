@@ -206,7 +206,9 @@
 
   async function refreshTaskStatus(options = {}) {
     const fromPopup = Boolean(options.fromPopup);
-    if (fromPopup && restartCooldownUntil > now()) {
+    const startIntentUnixMs = Number(options.startIntentUnixMs);
+    const hasExplicitStartIntent = Number.isFinite(startIntentUnixMs) && startIntentUnixMs > 0;
+    if (fromPopup && !hasExplicitStartIntent && restartCooldownUntil > now()) {
       return lastBadgeSummary
         ? { ok: true, tasks: lastTaskList, stale: true }
         : nativeUnavailable('Curl Downloader 正在重試連線，請稍候。');
@@ -215,7 +217,7 @@
     badgeRefreshInFlight = true;
     let failedResponse = null;
     try {
-      const response = await listTasks(options);
+      const response = await listTasks({ startIntentUnixMs });
       if (!response || !response.ok) {
         failedResponse = response;
         throw new Error(response && response.error || '無法讀取 Curl Downloader 任務。');
@@ -415,20 +417,24 @@
   }
 
   async function listTasks(options = {}) {
+    const intent = Number(options.startIntentUnixMs);
+    const startup = Number.isFinite(intent) && intent > 0
+      ? startupFields(true, intent)
+      : passiveStartupFields();
     try {
       const response = await sendNativeWithRetry({
         type: 'list_tasks',
-        ...passiveStartupFields()
+        ...startup
       });
       if (!response || response.type !== 'task_list' || !Array.isArray(response.tasks)) {
-      if (response && response.type === 'error') {
-        const nativeError = response.error || {};
-        return {
-          ok: false,
-          code: nativeError.code || 'native_unavailable',
-          error: nativeError.message || 'Curl Downloader Native host 無法完成請求。'
-        };
-      }
+        if (response && response.type === 'error') {
+          const nativeError = response.error || {};
+          return {
+            ok: false,
+            code: nativeError.code || 'native_unavailable',
+            error: nativeError.message || 'Curl Downloader Native host 無法完成請求。'
+          };
+        }
         return { ok: false, error: '無法讀取 Curl Downloader 任務。' };
       }
       return { ok: true, tasks: response.tasks };
@@ -446,7 +452,7 @@
       'open-folder': 'open_folder'
     }[message.type];
     try {
-      const response = await sendNativeWithRetry({ type: nativeType, task_id: taskId, ...startupFields(true, message.startIntentUnixMs) });
+      const response = await sendNativeWithRetry({ type: nativeType, task_id: taskId, ...passiveStartupFields() });
       if (!response || response.type !== 'action_result') {
         return { ok: false, error: 'Curl Downloader 未能完成操作。' };
       }
@@ -501,7 +507,9 @@
         return nativeUnavailable('Curl Downloader 未啟動或尚未註冊 Native host，無法開啟目錄選擇器。');
       }
     }
-    if (message.type === 'get-task-summary') return refreshTaskStatus({ fromPopup: true });
+    if (message.type === 'get-task-summary') {
+      return refreshTaskStatus({ fromPopup: true, startIntentUnixMs: message.startIntentUnixMs });
+    }
     if (message.type === 'popup-open') {
       popupOpen = true;
       updateNativeKeepAlive();

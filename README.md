@@ -36,7 +36,7 @@ Firefox extension 會攔截 HTTP/HTTPS 下載，先暫停原生下載並開啟�
 - 雙擊系統匣圖示：還原並把現有 GUI 帶到最前面，不會建立第二份 EXE。
 - 系統匣右鍵選擇「關閉」：先保存下載進度及續傳資料，再終止主程序。
 - popup、Badge 及狀態查詢屬於被動操作，不會因手動關閉而自動重啟 EXE。
-- 新下載、重試 Native host、選擇目錄、開啟檔案／資料夾或顯示任務，屬於明確操作，可以重新啟動同一份 EXE。
+- 新下載、重試 Native host 或選擇目錄，屬於明確啟動操作，可以重新啟動同一份 EXE；開啟檔案／資料夾及查看任務則保持被動，不會越過手動關閉。
 - 手動再次雙擊 EXE：只會顯示已存在的程序，不會多開。
 
 正常使用流程（包括 Portable Firefox ESR）：
@@ -45,7 +45,7 @@ Firefox extension 會攔截 HTTP/HTTPS 下載，先暫停原生下載並開啟�
 2. 在 Firefox `about:addons` 使用「從檔案安裝附加元件」載入 `curl-downloader.xpi`，並按需要允許私人視窗。
 3. 若設定頁顯示 Native host 未啟動或尚未註冊，啟動 `CurlDownloader.exe` 後按「重試 Curl Downloader」。
 
-Native Messaging 會在需要時建立一條可重用的 `connectNative` 長連線；有下載或 popup 開啟時快速同步，閒置後自動釋放連線。若 GUI 被系統匣右鍵手動關閉，插件會收到「已手動關閉」狀態，不會反覆重啟；下一次明確下載或重試操作才會重新啟動同一份 EXE。
+Native Messaging 會在需要時建立一條可重用的 `connectNative` 長連線；有下載或 popup 開啟時快速同步，閒置後自動釋放連線。設定頁首次載入及重新點擊插件圖示會以系統匣模式啟動同一份 EXE。若 GUI 被系統匣右鍵手動關閉，插件會收到「已手動關閉」狀態；目前開啟的 popup 只會保持關閉狀態，關閉 popup 後再次點擊插件才會重新啟動。
 
 插件圖示會顯示 Cyber 進度環及 Badge，例如 `68%/3` 代表三個進行中任務的加權整體進度；總大小未知時顯示 `—/3`。有活動任務時約每 500ms 同步；popup 開啟時約每 200ms 更新，沒有活動任務且 popup 關閉時停止背景同步。
 

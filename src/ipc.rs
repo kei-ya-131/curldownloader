@@ -8,7 +8,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::{
     io::{self, Read, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -487,9 +487,7 @@ pub fn show_window_request() -> IpcRequest {
 #[cfg(test)]
 fn request_focus_task_id(request: &IpcRequest) -> Option<TaskId> {
     match request {
-        IpcRequest::ShowTask { task_id, .. }
-        | IpcRequest::OpenFile { task_id, .. }
-        | IpcRequest::OpenFolder { task_id, .. } => Some(*task_id),
+        IpcRequest::ShowTask { task_id, .. } => Some(*task_id),
         _ => None,
     }
 }
@@ -588,35 +586,11 @@ fn dispatch_request(
         IpcRequest::OpenFile {
             request_id,
             task_id,
-        } => {
-            if !state.task_exists(task_id) {
-                action_error(request_id, "task_not_found", "找不到下載任務。")
-            } else if !request_show_task(task_id, state, controller) {
-                action_error(
-                    request_id,
-                    "gui_unavailable",
-                    "Curl Downloader GUI 未能接收操作。",
-                )
-            } else {
-                open_task_file(request_id, task_id, state)
-            }
-        }
+        } => open_task_file(request_id, task_id, state),
         IpcRequest::OpenFolder {
             request_id,
             task_id,
-        } => {
-            if !state.task_exists(task_id) {
-                action_error(request_id, "task_not_found", "找不到下載任務。")
-            } else if !request_show_task(task_id, state, controller) {
-                action_error(
-                    request_id,
-                    "gui_unavailable",
-                    "Curl Downloader GUI 未能接收操作。",
-                )
-            } else {
-                open_task_folder(request_id, task_id, state)
-            }
-        }
+        } => open_task_folder(request_id, task_id, state),
         IpcRequest::Enqueue {
             request_id,
             url,
@@ -699,12 +673,50 @@ fn open_task_file(
     if !path.is_file() {
         return action_error(request_id, "file_unavailable", "下載檔案不存在。");
     }
-    match std::process::Command::new("explorer.exe").arg(path).spawn() {
-        Ok(_) => action_success(request_id),
+    match open_path_with_shell(&path) {
+        Ok(()) => action_success(request_id),
         Err(_) => action_error(request_id, "open_file_failed", "無法開啟下載檔案。"),
     }
 }
 
+#[cfg(windows)]
+fn open_path_with_shell(path: &Path) -> io::Result<()> {
+    use std::{ffi::OsStr, os::windows::ffi::OsStrExt, ptr};
+    use windows_sys::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL};
+
+    let operation: Vec<u16> = OsStr::new("open")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let target: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let result = unsafe {
+        ShellExecuteW(
+            ptr::null_mut(),
+            operation.as_ptr(),
+            target.as_ptr(),
+            ptr::null(),
+            ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    if (result as isize) > 32 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(windows))]
+fn open_path_with_shell(path: &Path) -> io::Result<()> {
+    std::process::Command::new("explorer.exe")
+        .arg(path)
+        .spawn()
+        .map(|_| ())
+}
 fn open_task_folder(
     request_id: String,
     task_id: TaskId,
@@ -716,11 +728,8 @@ fn open_task_folder(
     if !task.target_dir.is_dir() {
         return action_error(request_id, "folder_unavailable", "目標下載資料夾不存在。");
     }
-    match std::process::Command::new("explorer.exe")
-        .arg(task.target_dir)
-        .spawn()
-    {
-        Ok(_) => action_success(request_id),
+    match open_path_with_shell(&task.target_dir) {
+        Ok(()) => action_success(request_id),
         Err(_) => action_error(request_id, "open_folder_failed", "無法開啟目標下載資料夾。"),
     }
 }
@@ -946,7 +955,7 @@ mod tests {
     }
 
     #[test]
-    fn file_and_folder_actions_request_the_main_window_to_front() {
+    fn only_task_cards_request_the_main_window_to_front() {
         assert_eq!(
             request_focus_task_id(&IpcRequest::ShowTask {
                 request_id: "1".into(),
@@ -959,14 +968,14 @@ mod tests {
                 request_id: "2".into(),
                 task_id: 8,
             }),
-            Some(8)
+            None
         );
         assert_eq!(
             request_focus_task_id(&IpcRequest::OpenFolder {
                 request_id: "3".into(),
                 task_id: 9,
             }),
-            Some(9)
+            None
         );
         assert_eq!(
             request_focus_task_id(&IpcRequest::ListTasks {
@@ -974,6 +983,27 @@ mod tests {
             }),
             None
         );
+    }
+
+    #[test]
+    fn open_actions_do_not_restore_gui_before_shell_operation() {
+        let (controller_tx, controller_rx) = std::sync::mpsc::channel();
+        let state = SharedControllerState::new(LifecycleState::RunningHidden);
+        state.replace_tasks(vec![test_snapshot(7, TaskStatus::Completed, 1, Some(2))]);
+
+        let response = dispatch_request_for_test(
+            IpcRequest::OpenFile {
+                request_id: "open".into(),
+                task_id: 7,
+            },
+            &state,
+            &controller_tx,
+        );
+        assert!(matches!(
+            response,
+            IpcResponse::ActionResult { ok: false, .. }
+        ));
+        assert!(controller_rx.try_recv().is_err());
     }
 
     #[test]

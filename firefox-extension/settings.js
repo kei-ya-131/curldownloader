@@ -183,7 +183,7 @@
         throw new Error('找不到下載項目。');
       }
       const defaults = await CurlExtensionStorage.loadDefaults();
-      const nativeDefaults = await loadNativeDefaults(false);
+      const nativeDefaults = await loadNativeDefaults(true);
       fillForm({
         ...pending.download,
         targetDir: pending.download.targetDir || (nativeDefaults && nativeDefaults.targetDir) || ''

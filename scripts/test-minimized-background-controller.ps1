@@ -473,10 +473,71 @@ try {
         throw 'Native host 沒有在手動關閉後 5 秒內退出。'
     }
 
+    $probeProcess.Dispose()
+    $probeProcess = $null
+    $nativeSession.Dispose()
+    $nativeSession = $null
+
+    $nativeSession = Start-NativeSession -Executable $probeExecutable
+    $passive = Send-NativeRequest -Session $nativeSession -Request @{
+        type = 'list_tasks'
+        request_id = 'background-probe-passive-after-manual-stop'
+        auto_start = $true
+    }
+    if ($passive.type -ne 'error' -or $passive.error.code -ne 'manually_stopped') {
+        throw '手動關閉後的被動 list_tasks 不應重新啟動 GUI。'
+    }
+    $passiveGuiProcesses = @(Get-Process -Name 'CurlDownloader' -ErrorAction SilentlyContinue | Where-Object {
+        $_.Id -ne $nativeSession.Id -and $_.Path -eq $probeExecutable
+    })
+    if ($passiveGuiProcesses.Count -ne 0) {
+        throw '手動關閉後的被動 list_tasks 意外啟動了 GUI。'
+    }
+
+    $explicit = Send-NativeRequest -Session $nativeSession -Request @{
+        type = 'list_tasks'
+        request_id = 'background-probe-explicit-restart'
+        auto_start = $true
+        start_intent_unix_ms = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    }
+    if ($explicit.type -ne 'task_list') {
+        throw '新的明確 start intent 沒有重新啟動 GUI。'
+    }
+    Wait-For -FailureMessage '新的明確 start intent 沒有啟動第二次最小化 GUI。' -Condition {
+        @(Get-Process -Name 'CurlDownloader' -ErrorAction SilentlyContinue | Where-Object {
+            $_.Id -ne $nativeSession.Id -and $_.Path -eq $probeExecutable
+        }).Count -eq 1
+    }
+    $probeCandidates = @(Get-Process -Name 'CurlDownloader' -ErrorAction SilentlyContinue | Where-Object {
+        $_.Id -ne $nativeSession.Id -and $_.Path -eq $probeExecutable
+    })
+    if ($probeCandidates.Count -ne 1) {
+        throw '找不到新的最小化 GUI 程序。'
+    }
+    $probeProcess = $probeCandidates[0]
+    Wait-For -FailureMessage '明確重啟後 GUI 沒有以最小化模式啟動。' -Condition {
+        $main = Get-ProcessWindow -ProcessId $probeProcess.Id
+        $main -ne [IntPtr]::Zero -and -not [CurlDownloaderSmokeWin32]::IsWindowVisible($main)
+    }
+
+    $restartShutdown = Send-NativeRequest -Session $nativeSession -Request @{
+        type = 'shutdown_manual'
+        request_id = 'background-probe-restart-shutdown'
+        auto_start = $false
+    }
+    if ($restartShutdown.type -ne 'action_result' -or -not [bool]$restartShutdown.ok) {
+        throw '重新啟動後的測試專用 ShutdownManual 失敗。'
+    }
+    if (-not $probeProcess.WaitForExit(5000)) {
+        throw '重新啟動的 GUI 沒有在手動關閉後 5 秒內退出。'
+    }
+    if (-not $nativeSession.WaitForExit(5000)) {
+        throw '重新啟動後的 Native host 沒有在手動關閉後 5 秒內退出。'
+    }
     Move-Item -LiteralPath $probeExecutable -Destination $renamedExecutable
     Move-Item -LiteralPath $renamedExecutable -Destination $probeExecutable
     $trayMessage = if ($fakeShellStarted) { '測試用 Shell_TrayWnd 回呼' } elseif ($trayAvailable) { '真實系統匣雙擊' } else { '系統匣測試略過（目前桌面沒有 Shell_TrayWnd）' }
-    Write-Output "最小化背景控制器 smoke test 通過：同一 Native PID $nativePid 已完成 ping/list_tasks、$trayMessage、show_window、ShutdownManual 及檔案解鎖驗證。"
+    Write-Output "最小化背景控制器 smoke test 通過：同一 portable EXE 已完成 ping/list_tasks、$trayMessage、show_window、ShutdownManual、被動停止查詢、明確重啟及檔案解鎖驗證。"
 } finally {
     if ($null -ne $nativeSession) {
         try {

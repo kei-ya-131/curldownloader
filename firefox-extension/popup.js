@@ -61,8 +61,11 @@
     return { active, completed };
   }
 
-  function popupRefreshRequest() {
-    return { type: 'get-task-summary', autoStart: true };
+  function popupRefreshRequest(startIntentUnixMs) {
+    const request = { type: 'get-task-summary', autoStart: true };
+    const intent = Number(startIntentUnixMs);
+    if (Number.isFinite(intent) && intent > 0) request.startIntentUnixMs = intent;
+    return request;
   }
   function formatDuration(seconds) {
     const value = Math.max(0, Math.round(numberOrZero(seconds)));
@@ -129,24 +132,33 @@
 
     const actions = documentApi.createElement('div');
     actions.className = 'task-actions';
+    const bindOpenAction = (button, type) => {
+      let inFlight = false;
+      button.addEventListener('click', (event) => {
+        event.stopPropagation();
+        if (inFlight) return;
+        inFlight = true;
+        button.disabled = true;
+        Promise.resolve(sendAction(type, task.task_id))
+          .catch(showError)
+          .finally(() => {
+            inFlight = false;
+            button.disabled = false;
+          });
+      });
+    };
     if (task.file_available) {
       const button = documentApi.createElement('button');
       button.type = 'button';
       button.textContent = '開啟檔案';
-      button.addEventListener('click', (event) => {
-        event.stopPropagation();
-        void sendAction('open-file', task.task_id).catch(showError);
-      });
+      bindOpenAction(button, 'open-file');
       actions.append(button);
     }
     if (task.folder_available) {
       const button = documentApi.createElement('button');
       button.type = 'button';
       button.textContent = '開啟資料夾';
-      button.addEventListener('click', (event) => {
-        event.stopPropagation();
-        void sendAction('open-folder', task.task_id).catch(showError);
-      });
+      bindOpenAction(button, 'open-folder');
       actions.append(button);
     }
     if (actions.childElementCount > 0) card.append(actions);
@@ -195,6 +207,7 @@
     }
 
     notifyLifecycle('popup-open');
+    let popupStartIntentUnixMs = Date.now();
 
     function showError(message) {
       error.textContent = message || 'Curl Downloader 操作失敗。';
@@ -202,7 +215,7 @@
     }
 
     async function sendAction(type, taskId) {
-      const response = await api.runtime.sendMessage({ type, taskId, startIntentUnixMs: Date.now() });
+      const response = await api.runtime.sendMessage({ type, taskId });
       if (!response || !response.ok) throw new Error(response && response.error || 'Curl Downloader 操作失敗。');
       return response;
     }
@@ -211,8 +224,9 @@
       if (refreshInFlight) return;
       refreshInFlight = true;
       try {
-        const request = popupRefreshRequest();
-      const response = await api.runtime.sendMessage(request);
+        const request = popupRefreshRequest(popupStartIntentUnixMs);
+        popupStartIntentUnixMs = undefined;
+        const response = await api.runtime.sendMessage(request);
         if (!response || !response.ok) throw new Error(response && response.error || '未能讀取任務。');
         const groups = splitTasks(response.tasks);
         status.textContent = '已連線';
@@ -255,5 +269,5 @@
     }
   }
 
-  return { formatBytes, formatProgress, statusLabel, splitTasks, popupRefreshRequest, startPopup, REFRESH_INTERVAL_MS };
+  return { formatBytes, formatProgress, statusLabel, splitTasks, popupRefreshRequest, renderTask, startPopup, REFRESH_INTERVAL_MS };
 });

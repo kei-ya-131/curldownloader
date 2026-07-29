@@ -163,7 +163,7 @@ test('shares one native port across concurrent calls', async () => {
   ]);
   assert.equal(fake.calls.nativeConnects, 1);
 });
-test('passive popup and badge queries never carry a start intent', async () => {
+test('passive badge queries never carry a start intent', async () => {
   const fake = makeFakeBrowser({
     nativeResponse: () => ({ type: 'task_list', tasks: [] })
   });
@@ -181,28 +181,36 @@ test('passive popup and badge queries never carry a start intent', async () => {
   ), true);
 });
 
-test('initial defaults are passive but explicit retry may start the exe', async () => {
+test('explicit popup and settings actions carry a start intent', async () => {
   const fake = makeFakeBrowser({
-    nativeResponse: (message) => ({
-      type: 'defaults',
-      request_id: message.request_id,
-      target_dir: 'C:\\Downloads'
-    })
+    nativeResponse: (message) => message.type === 'get-defaults'
+      ? {
+        type: 'defaults',
+        request_id: message.request_id,
+        target_dir: 'C:\\Downloads'
+      }
+      : { type: 'task_list', request_id: message.request_id, tasks: [] }
   });
   const background = createBackground(fake.browser, {
     attempts: 1,
     delayMs: 0,
-    now: () => 1000
+    now: () => 1000,
+    timers: false
   });
-  await background.handleRuntimeMessage({ type: 'get-defaults', autoStart: false });
+  await background.handleRuntimeMessage({ type: 'get-defaults', autoStart: true, startIntentUnixMs: 999 });
   await background.handleRuntimeMessage({
     type: 'get-defaults',
     autoStart: true,
     startIntentUnixMs: 1000
   });
-  assert.equal(fake.calls.nativeMessages[0].auto_start, false);
+  await background.handleRuntimeMessage({ type: 'get-task-summary', autoStart: true, startIntentUnixMs: 1001 });
+  await background.handleRuntimeMessage({ type: 'get-task-summary', autoStart: true });
+  assert.equal(fake.calls.nativeMessages[0].auto_start, true);
+  assert.equal(fake.calls.nativeMessages[0].start_intent_unix_ms, 999);
   assert.equal(fake.calls.nativeMessages[1].auto_start, true);
   assert.equal(fake.calls.nativeMessages[1].start_intent_unix_ms, 1000);
+  assert.equal(fake.calls.nativeMessages[2].start_intent_unix_ms, 1001);
+  assert.equal(fake.calls.nativeMessages[3].start_intent_unix_ms, undefined);
 });
 
 test('new download is always an explicit GUI start intent', async () => {
@@ -291,7 +299,27 @@ test('popup refresh backs off after an initial GUI startup failure without cache
 
   assert.equal(fake.calls.nativeMessages.length, callsAfterFailure);
   assert.equal(second.ok, false);
-});test('supported download pauses and opens one settings tab', async () => {
+});
+
+test('new popup start intent bypasses transient restart backoff', async () => {
+  const fake = makeFakeBrowser({ nativeDisconnect: true });
+  const background = createBackground(fake.browser, { attempts: 1, delayMs: 0, timers: false });
+
+  const first = await background.handleRuntimeMessage({ type: 'get-task-summary' });
+  assert.equal(first.ok, false);
+  const callsAfterFailure = fake.calls.nativeMessages.length;
+
+  const explicit = await background.handleRuntimeMessage({
+    type: 'get-task-summary',
+    autoStart: true,
+    startIntentUnixMs: 2000
+  });
+  assert.equal(explicit.ok, false);
+  assert.ok(fake.calls.nativeMessages.length > callsAfterFailure);
+  assert.equal(fake.calls.nativeMessages.at(-1).start_intent_unix_ms, 2000);
+});
+
+test('supported download pauses and opens one settings tab', async () => {
   const fake = makeFakeBrowser();
   const background = createBackground(fake.browser);
   await background.handleCreatedDownload({
@@ -446,6 +474,7 @@ test('task controls bridge list, show, file, and folder actions', async () => {
     'open_folder'
   ]);
   assert.equal(messages.every((message) => message.task_id === undefined || message.task_id === 7), true);
+  assert.equal(messages.slice(1).every((message) => message.start_intent_unix_ms === undefined), true);
 });
 
 test('task control errors stay in popup flow without Firefox fallback', async () => {
