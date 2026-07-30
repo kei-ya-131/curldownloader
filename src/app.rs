@@ -4,8 +4,8 @@ use crate::{
     download::spawn_engine,
     ipc,
     model::{
-        CurlSource, EngineCommand, GlobalSettings, NewTask, PersistedState, ProxyProtocol,
-        ProxySettings, TaskId, TaskSnapshot, TaskStatus,
+        CURRENT_SCHEMA_VERSION, CurlSource, EngineCommand, GlobalSettings, NewTask, PersistedState,
+        ProxyProtocol, ProxySettings, TaskId, TaskSnapshot, TaskStatus,
     },
     storage, tray,
     window_control::{EguiMainWindow, MainWindowControl},
@@ -135,7 +135,7 @@ impl CurlDownloaderApp {
                 let _ = storage::quarantine_corrupt(&state_path);
                 (
                     PersistedState {
-                        schema_version: 1,
+                        schema_version: CURRENT_SCHEMA_VERSION,
                         settings: GlobalSettings {
                             last_download_dir: default_dir.clone(),
                             max_curl_processes: 4,
@@ -148,7 +148,7 @@ impl CurlDownloaderApp {
             }
             Err(_) => (
                 PersistedState {
-                    schema_version: 1,
+                    schema_version: CURRENT_SCHEMA_VERSION,
                     settings: GlobalSettings {
                         last_download_dir: default_dir.clone(),
                         max_curl_processes: 4,
@@ -1611,6 +1611,7 @@ mod tests {
             status,
             requested_segments: 1,
             actual_segments: 1,
+            segments: Vec::new(),
             downloaded: 0,
             total_size: None,
             range_support: crate::model::RangeSupport::Unknown,

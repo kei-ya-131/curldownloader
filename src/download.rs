@@ -791,6 +791,9 @@ impl Engine {
                     start: 0,
                     end: 0,
                     downloaded: 0,
+                    started_unix_ms: None,
+                    completed_unix_ms: None,
+                    active_millis: 0,
                 }];
                 task.status = TaskStatus::Downloading;
                 self.queue.push_back(id);
@@ -801,29 +804,35 @@ impl Engine {
             task.segments = ranges
                 .into_iter()
                 .enumerate()
-                .map(|(index, (start, end))| SegmentState {
-                    index: index as u8,
-                    start,
-                    end,
-                    downloaded: previous_segments
+                .map(|(index, (start, end))| {
+                    let previous = previous_segments
                         .iter()
-                        .find(|previous| previous.start == start && previous.end == end)
-                        .map(|previous| previous.downloaded)
-                        .unwrap_or(0),
+                        .find(|previous| previous.start == start && previous.end == end);
+                    SegmentState {
+                        index: index as u8,
+                        start,
+                        end,
+                        downloaded: previous.map(|previous| previous.downloaded).unwrap_or(0),
+                        started_unix_ms: previous.and_then(|previous| previous.started_unix_ms),
+                        completed_unix_ms: previous.and_then(|previous| previous.completed_unix_ms),
+                        active_millis: previous.map(|previous| previous.active_millis).unwrap_or(0),
+                    }
                 })
                 .collect();
         } else {
             task.actual_segments = 1;
             let end = total.map(|value| value.saturating_sub(1)).unwrap_or(0);
+            let previous = previous_segments
+                .first()
+                .filter(|previous| previous.start == 0 && previous.end == end);
             task.segments = vec![SegmentState {
                 index: 0,
                 start: 0,
                 end,
-                downloaded: previous_segments
-                    .first()
-                    .filter(|previous| previous.start == 0 && previous.end == end)
-                    .map(|previous| previous.downloaded)
-                    .unwrap_or(0),
+                downloaded: previous.map(|previous| previous.downloaded).unwrap_or(0),
+                started_unix_ms: previous.and_then(|previous| previous.started_unix_ms),
+                completed_unix_ms: previous.and_then(|previous| previous.completed_unix_ms),
+                active_millis: previous.map(|previous| previous.active_millis).unwrap_or(0),
             }];
         }
         task.status = TaskStatus::Downloading;
@@ -1400,6 +1409,20 @@ impl Engine {
                     status: task.status,
                     requested_segments: task.requested_segments,
                     actual_segments: task.actual_segments,
+                    segments: task
+                        .segments
+                        .iter()
+                        .map(|segment| SegmentSnapshot {
+                            index: segment.index,
+                            start: segment.start,
+                            end: segment.end,
+                            downloaded: segment.downloaded,
+                            started_unix_ms: segment.started_unix_ms,
+                            completed_unix_ms: segment.completed_unix_ms,
+                            active_millis: segment.active_millis,
+                            active: false,
+                        })
+                        .collect(),
                     downloaded,
                     total_size: task.total_size,
                     range_support: task.range_support,
@@ -1429,7 +1452,7 @@ impl Engine {
         storage::save_state(
             &self.state_path,
             &PersistedState {
-                schema_version: 1,
+                schema_version: CURRENT_SCHEMA_VERSION,
                 settings: self.settings.clone(),
                 tasks: self.tasks.clone(),
             },

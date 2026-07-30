@@ -147,12 +147,32 @@ pub enum RangeSupport {
     Unsupported,
 }
 
+pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SegmentState {
     pub index: u8,
     pub start: u64,
     pub end: u64,
     pub downloaded: u64,
+    #[serde(default)]
+    pub started_unix_ms: Option<u64>,
+    #[serde(default)]
+    pub completed_unix_ms: Option<u64>,
+    #[serde(default)]
+    pub active_millis: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SegmentSnapshot {
+    pub index: u8,
+    pub start: u64,
+    pub end: u64,
+    pub downloaded: u64,
+    pub started_unix_ms: Option<u64>,
+    pub completed_unix_ms: Option<u64>,
+    pub active_millis: u64,
+    pub active: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -277,6 +297,7 @@ pub struct TaskSnapshot {
     pub status: TaskStatus,
     pub requested_segments: u8,
     pub actual_segments: u8,
+    pub segments: Vec<SegmentSnapshot>,
     pub downloaded: u64,
     pub total_size: Option<u64>,
     pub range_support: RangeSupport,
@@ -385,5 +406,36 @@ mod tests {
         task.proxy.requires_password = true;
         task.recover_after_load();
         assert_eq!(task.status, TaskStatus::NeedsProxyPassword);
+    }
+
+    #[test]
+    fn legacy_segment_defaults_history_fields() {
+        let segment: SegmentState = serde_json::from_value(serde_json::json!({
+            "index": 0,
+            "start": 0,
+            "end": 99,
+            "downloaded": 100
+        }))
+        .unwrap();
+
+        assert_eq!(segment.started_unix_ms, None);
+        assert_eq!(segment.completed_unix_ms, None);
+        assert_eq!(segment.active_millis, 0);
+    }
+
+    #[test]
+    fn segment_history_round_trips() {
+        let original = SegmentState {
+            index: 2,
+            start: 200,
+            end: 299,
+            downloaded: 100,
+            started_unix_ms: Some(1_000),
+            completed_unix_ms: Some(1_750),
+            active_millis: 650,
+        };
+        let restored: SegmentState =
+            serde_json::from_value(serde_json::to_value(&original).unwrap()).unwrap();
+        assert_eq!(restored, original);
     }
 }

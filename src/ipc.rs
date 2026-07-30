@@ -1103,6 +1103,7 @@ mod tests {
             status,
             requested_segments: 4,
             actual_segments: 1,
+            segments: Vec::new(),
             downloaded: id * 10,
             total_size: Some(1000),
             range_support: RangeSupport::Unknown,

@@ -129,7 +129,7 @@ mod tests {
         task.proxy.enabled = true;
         task.proxy.set_password("never-write-me".into()).unwrap();
         let state = PersistedState {
-            schema_version: 1,
+            schema_version: CURRENT_SCHEMA_VERSION,
             settings: GlobalSettings {
                 last_download_dir: dir.clone(),
                 max_curl_processes: 4,
@@ -145,6 +145,65 @@ mod tests {
     }
 
     #[test]
+    fn legacy_schema_v1_segment_loads_and_resaves_as_v2() {
+        let dir = test_dir("legacy-segment");
+        let path = dir.join("state.json");
+        let raw = serde_json::json!({
+            "schema_version": 1,
+            "settings": {
+                "last_download_dir": dir,
+                "max_curl_processes": 4,
+                "next_task_id": 2
+            },
+            "tasks": [{
+                "id": 1,
+                "original_url": "https://example.test/a.bin",
+                "effective_url": null,
+                "filename": "a.bin",
+                "target_dir": dir,
+                "requested_segments": 1,
+                "actual_segments": 1,
+                "total_size": 100,
+                "etag": null,
+                "last_modified": null,
+                "range_support": "Unknown",
+                "proxy": {
+                    "enabled": false,
+                    "protocol": "Http",
+                    "host": "",
+                    "port": 8080,
+                    "username": "",
+                    "requires_password": false
+                },
+                "status": "Completed",
+                "segments": [{
+                    "index": 0,
+                    "start": 0,
+                    "end": 99,
+                    "downloaded": 100
+                }],
+                "active_millis": 0,
+                "created_unix_ms": 10,
+                "completed_unix_ms": 1000,
+                "last_error": null
+            }]
+        });
+        std::fs::write(&path, serde_json::to_vec(&raw).unwrap()).unwrap();
+
+        let mut loaded = load_state(&path).unwrap();
+        assert_eq!(loaded.schema_version, 1);
+        assert_eq!(loaded.tasks[0].segments[0].active_millis, 0);
+        assert_eq!(loaded.tasks[0].segments[0].started_unix_ms, None);
+        assert_eq!(loaded.tasks[0].segments[0].completed_unix_ms, None);
+
+        loaded.schema_version = CURRENT_SCHEMA_VERSION;
+        save_state(&path, &loaded).unwrap();
+        let upgraded: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(upgraded["schema_version"], CURRENT_SCHEMA_VERSION);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
     fn restores_backup_when_primary_state_is_missing() {
         let dir = test_dir("backup");
         let path = dir.join("state.json");
@@ -153,7 +212,7 @@ mod tests {
         std::fs::write(&backup, serde_json::to_vec(&state).unwrap()).unwrap();
 
         let loaded = load_state(&path).unwrap();
-        assert_eq!(loaded.schema_version, 1);
+        assert_eq!(loaded.schema_version, CURRENT_SCHEMA_VERSION);
         assert!(path.exists());
         assert!(!backup.exists());
         std::fs::remove_dir_all(dir).unwrap();
@@ -180,7 +239,7 @@ mod tests {
 
     fn minimal_state(dir: &std::path::Path) -> PersistedState {
         PersistedState {
-            schema_version: 1,
+            schema_version: CURRENT_SCHEMA_VERSION,
             settings: GlobalSettings {
                 last_download_dir: dir.to_path_buf(),
                 max_curl_processes: 4,

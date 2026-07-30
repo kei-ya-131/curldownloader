@@ -4,8 +4,8 @@
 use curl_downloader::{
     download::{EngineHandle, spawn_engine},
     model::{
-        ConfiguredTask, EngineCommand, EngineEvent, GlobalSettings, NewTask, PersistedState,
-        ProxySettings, TaskId, TaskSnapshot, TaskStatus,
+        CURRENT_SCHEMA_VERSION, ConfiguredTask, EngineCommand, EngineEvent, GlobalSettings,
+        NewTask, PersistedState, ProxySettings, TaskId, TaskSnapshot, TaskStatus,
     },
 };
 use std::{
@@ -458,7 +458,7 @@ impl EngineHarness {
         let download_dir = unique_dir("engine");
         let state_path = download_dir.join("state.json");
         let state = PersistedState {
-            schema_version: 1,
+            schema_version: CURRENT_SCHEMA_VERSION,
             settings: GlobalSettings {
                 last_download_dir: download_dir.clone(),
                 max_curl_processes: max_processes,
