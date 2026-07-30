@@ -22,7 +22,15 @@ powershell -ExecutionPolicy Bypass -File scripts\build-release-gnu.ps1
 
 輸入 HTTP/HTTPS URL 後建立任務，在任務設定中確認檔名、Windows 絕對下載目錄、分段數及 Proxy，再開始下載。任務卡會顯示進度、速度、ETA、狀態及錯誤；完成任務可開啟檔案或資料夾。程式最小化時會留在 Windows 系統匣，雙擊系統匣 Cyber 圖示可還原視窗。
 
-Windows 下載只會在背景啟動隱藏的 curl 子程序，不會顯示 CMD 視窗。Proxy 密碼只存在本次工作流程的記憶體及 pipe，不會寫入 `state.json` 或 extension storage。
+Windows 下載只會在背景啟動隱藏的 curl 子程序，不會顯示 CMD 視窗。
+
+### 任務詳情與分段歷史
+
+任務詳情只保留兩個真正頁籤：「任務總覽」及「分段設定」。網址、檔名及完整儲存路徑會自動換行，並可直接選取及複製，不會以省略號截斷。已完成任務仍會顯示每一段的位元組範圍、大小、已下載量、狀態、開始及完成時間、實際下載時間和平均速度；這些資料在重啟程式後仍保留。舊版本紀錄沒有的時間資料會顯示「未記錄」，不會自行估算。
+
+從插件或主程式按「開啟檔案／開啟資料夾」時，程式會先重用相同的 Explorer 位置，再用 Windows Shell 開啟目標，並嘗試把實際目標視窗帶到最前。Windows 拒絕切換前景時，目標會閃爍提示，插件收到固定的 target_not_foreground 錯誤；Curl Downloader 自己的 GUI 不會因此被還原。
+
+這些功能全部在同一份 CurlDownloader.exe 內執行，不使用 PowerShell、CMD、helper EXE、程序注入或遠端執行緒。Proxy 密碼只存在本次工作流程的記憶體及 pipe，不會寫入 `state.json` 或 extension storage。
 
 ## Firefox extension
 

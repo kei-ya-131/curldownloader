@@ -899,7 +899,7 @@ impl Engine {
                 let expected = segment.end.saturating_sub(segment.start).saturating_add(1);
                 segment.downloaded < expected && !self.segment_has_active(task.id, segment.index)
             }) else {
-                if !self.task_has_incomplete_segments(id) {
+                if self.task_ready_to_finalize(id) {
                     self.finalize_task(id);
                 }
                 return false;
@@ -1263,9 +1263,9 @@ impl Engine {
             }
             task.last_error = None;
         }
-        if !self.task_has_incomplete_segments(job.task_id) {
+        if self.task_ready_to_finalize(job.task_id) {
             self.finalize_task(job.task_id);
-        } else {
+        } else if self.task_has_incomplete_segments(job.task_id) {
             self.queue.push_back(job.task_id);
         }
     }
@@ -1386,6 +1386,11 @@ impl Engine {
                 segment.downloaded < segment.end.saturating_sub(segment.start).saturating_add(1)
             })
         })
+    }
+
+    fn task_ready_to_finalize(&self, id: TaskId) -> bool {
+        self.task(id)
+            .is_some_and(|task| can_finalize_task(task, self.task_has_active(id)))
     }
 
     fn task_index(&self, id: TaskId) -> Option<usize> {
@@ -1516,6 +1521,16 @@ fn record_segment_completion(segment: &mut SegmentState, unix_ms: u64) {
         segment.completed_unix_ms = Some(unix_ms);
     }
 }
+fn all_segments_complete(task: &DownloadTask) -> bool {
+    task.segments.iter().all(|segment| {
+        segment.downloaded >= segment.end.saturating_sub(segment.start).saturating_add(1)
+    })
+}
+
+fn can_finalize_task(task: &DownloadTask, has_active_jobs: bool) -> bool {
+    !has_active_jobs && all_segments_complete(task)
+}
+
 fn build_segment_snapshots<I>(task: &DownloadTask, active_jobs: I) -> Vec<SegmentSnapshot>
 where
     I: Iterator<Item = (JobKind, Option<u8>)>,
@@ -1732,6 +1747,17 @@ mod tests {
         record_segment_completion(&mut segment, 5_000);
         record_segment_completion(&mut segment, 9_000);
         assert_eq!(segment.completed_unix_ms, Some(5_000));
+    }
+
+    #[test]
+    fn completed_segments_wait_for_other_active_jobs_before_finalization() {
+        let mut task = task_with_two_segments();
+        for segment in &mut task.segments {
+            segment.downloaded = segment.end - segment.start + 1;
+        }
+
+        assert!(!can_finalize_task(&task, true));
+        assert!(can_finalize_task(&task, false));
     }
 
     #[test]
