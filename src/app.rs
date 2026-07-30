@@ -5,7 +5,7 @@ use crate::{
     ipc,
     model::{
         CURRENT_SCHEMA_VERSION, CurlSource, EngineCommand, GlobalSettings, NewTask, PersistedState,
-        ProxyProtocol, ProxySettings, TaskId, TaskSnapshot, TaskStatus,
+        ProxyProtocol, ProxySettings, SegmentSnapshot, TaskId, TaskSnapshot, TaskStatus,
     },
     storage, tray,
     window_control::{EguiMainWindow, MainWindowControl},
@@ -64,6 +64,152 @@ pub fn format_eta(seconds: Option<u64>) -> String {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InspectorTab {
+    Overview,
+    Segments,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InspectorColumns {
+    One,
+    Two,
+}
+
+const INSPECTOR_TWO_COLUMN_MIN_WIDTH: f32 = 720.0;
+
+fn inspector_columns(width: f32) -> InspectorColumns {
+    if width >= INSPECTOR_TWO_COLUMN_MIN_WIDTH {
+        InspectorColumns::Two
+    } else {
+        InspectorColumns::One
+    }
+}
+
+fn format_segment_timestamp(timestamp: Option<u64>) -> String {
+    let Some(timestamp) = timestamp else {
+        return "未記錄".into();
+    };
+    let parts = unix_millis_parts(timestamp);
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::{
+            Foundation::SYSTEMTIME, System::Time::SystemTimeToTzSpecificLocalTime,
+        };
+        let utc = SYSTEMTIME {
+            wYear: parts.0 as u16,
+            wMonth: parts.1,
+            wDayOfWeek: 0,
+            wDay: parts.2,
+            wHour: parts.3,
+            wMinute: parts.4,
+            wSecond: parts.5,
+            wMilliseconds: parts.6,
+        };
+        let mut local = utc;
+        if unsafe { SystemTimeToTzSpecificLocalTime(std::ptr::null(), &utc, &mut local) } != 0 {
+            return format!(
+                "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
+                local.wYear,
+                local.wMonth,
+                local.wDay,
+                local.wHour,
+                local.wMinute,
+                local.wSecond,
+                local.wMilliseconds
+            );
+        }
+    }
+    format_timestamp_parts(parts)
+}
+
+fn unix_millis_parts(timestamp: u64) -> (i32, u16, u16, u16, u16, u16, u16) {
+    let total_seconds = timestamp / 1_000;
+    let days = (total_seconds / 86_400) as i64;
+    let seconds_of_day = total_seconds % 86_400;
+    let milliseconds = (timestamp % 1_000) as u16;
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_part = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_part + 2) / 5 + 1;
+    let month = month_part + if month_part < 10 { 3 } else { -9 };
+    let year = year + if month <= 2 { 1 } else { 0 };
+    (
+        year as i32,
+        month as u16,
+        day as u16,
+        (seconds_of_day / 3_600) as u16,
+        ((seconds_of_day % 3_600) / 60) as u16,
+        (seconds_of_day % 60) as u16,
+        milliseconds,
+    )
+}
+
+fn format_timestamp_parts(parts: (i32, u16, u16, u16, u16, u16, u16)) -> String {
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03} UTC",
+        parts.0, parts.1, parts.2, parts.3, parts.4, parts.5, parts.6
+    )
+}
+
+fn format_segment_duration(segment: &SegmentSnapshot) -> String {
+    if segment.started_unix_ms.is_none() {
+        return "未記錄".into();
+    }
+    format_active_duration(segment.active_millis)
+}
+
+fn format_active_duration(active_millis: u64) -> String {
+    let total_seconds = active_millis / 1_000;
+    if total_seconds >= 3_600 {
+        format!(
+            "{}小時 {:02}分 {:02}秒",
+            total_seconds / 3_600,
+            (total_seconds / 60) % 60,
+            total_seconds % 60
+        )
+    } else if total_seconds >= 60 {
+        format!("{}分 {:02}秒", total_seconds / 60, total_seconds % 60)
+    } else {
+        format!("{}秒", total_seconds)
+    }
+}
+
+fn format_segment_average_speed(segment: &SegmentSnapshot) -> String {
+    if segment.started_unix_ms.is_none() || segment.active_millis == 0 {
+        return "未記錄".into();
+    }
+    let bps = segment.downloaded as f64 * 1_000.0 / segment.active_millis as f64;
+    format_speed(bps)
+}
+
+fn segment_status_label(task_status: TaskStatus, segment: &SegmentSnapshot) -> &'static str {
+    let expected = segment.end.saturating_sub(segment.start).saturating_add(1);
+    if segment.completed_unix_ms.is_some()
+        || (!segment.active && expected > 0 && segment.downloaded >= expected)
+    {
+        return "已完成";
+    }
+    if segment.active {
+        return "下載中";
+    }
+    match task_status {
+        TaskStatus::Paused | TaskStatus::Pausing => "已暫停",
+        TaskStatus::Failed => "失敗",
+        TaskStatus::Cancelled => "已取消",
+        TaskStatus::Queued => "排隊中",
+        TaskStatus::Probing => "探測中",
+        TaskStatus::Downloading => "等待中",
+        TaskStatus::Finalizing => "整合中",
+        TaskStatus::NeedsProxyPassword => "等待密碼",
+        TaskStatus::Completed => "未完成",
+    }
+}
 pub struct CurlDownloaderApp {
     engine_commands: Sender<EngineCommand>,
     controller: ControllerHandle,
@@ -90,6 +236,7 @@ pub struct CurlDownloaderApp {
     ipc_default_dir: Arc<Mutex<PathBuf>>,
     start_minimized: bool,
     hidden_to_tray: bool,
+    inspector_tab: InspectorTab,
     ipc_thread: Option<JoinHandle<()>>,
 }
 #[derive(Clone)]
@@ -237,6 +384,7 @@ impl CurlDownloaderApp {
             ipc_default_dir,
             start_minimized,
             hidden_to_tray: start_minimized,
+            inspector_tab: InspectorTab::Overview,
             ipc_thread,
         }
     }
@@ -799,6 +947,35 @@ impl CurlDownloaderApp {
         }
     }
 
+    fn show_segments_tab(&mut self, ui: &mut egui::Ui, task: &TaskSnapshot) -> Option<TaskDraft> {
+        show_segment_history(ui, task);
+        let can_edit = matches!(
+            task.status,
+            TaskStatus::Queued | TaskStatus::Paused | TaskStatus::Failed
+        );
+        let mut pending_update = None;
+        if let Some(draft) = self.draft.as_mut() {
+            let mut changed = false;
+            ui.add_space(12.0);
+            card_frame(ui).show(ui, |ui| {
+                ui.heading("分段下載設定");
+                changed |= ui
+                    .add_enabled(
+                        can_edit,
+                        egui::Slider::new(&mut draft.segments, 1..=8).text("段"),
+                    )
+                    .changed();
+                ui.weak("下載開始後會固定分段數；完成後仍會保留每段歷史資料。");
+                if !can_edit {
+                    ui.weak("下載已開始，分段數已鎖定。");
+                }
+            });
+            if changed {
+                pending_update = Some(draft.clone());
+            }
+        }
+        pending_update
+    }
     fn show_inspector(&mut self, ui: &mut egui::Ui) {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().inner_margin(16))
@@ -820,7 +997,10 @@ impl CurlDownloaderApp {
                             .strong(),
                     );
                     ui.vertical(|ui| {
-                        ui.heading(&task.filename);
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(&task.filename).heading()).wrap(),
+                        )
+                        .on_hover_text(&task.filename);
                         ui.horizontal(|ui| {
                             ui.colored_label(
                                 status_color(ui, task.status),
@@ -831,13 +1011,17 @@ impl CurlDownloaderApp {
                     });
                 });
                 ui.separator();
-                ui.horizontal(|ui| {
-                    ui.colored_label(
-                        ui.visuals().hyperlink_color,
-                        egui::RichText::new("▤  任務總覽").strong(),
+                ui.horizontal_wrapped(|ui| {
+                    ui.selectable_value(
+                        &mut self.inspector_tab,
+                        InspectorTab::Overview,
+                        "任務總覽",
                     );
-                    ui.weak("分段設定");
-                    ui.weak("記事");
+                    ui.selectable_value(
+                        &mut self.inspector_tab,
+                        InspectorTab::Segments,
+                        "分段設定",
+                    );
                 });
                 ui.separator();
 
@@ -845,6 +1029,13 @@ impl CurlDownloaderApp {
                     .id_salt("inspector-scroll")
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
+                        if self.inspector_tab == InspectorTab::Segments {
+                            if let Some(draft) = self.show_segments_tab(ui, &task) {
+                                self.send_draft(&draft);
+                            }
+                            return;
+                        }
+
                         let mut pending_update = None;
                         let mut pending_last_dir = None;
                         let mut pending_password = None;
@@ -855,76 +1046,59 @@ impl CurlDownloaderApp {
                             TaskStatus::Queued | TaskStatus::Paused | TaskStatus::Failed
                         );
 
-                        ui.columns(2, |columns| {
-                            show_progress_card(&mut columns[0], &task);
-                            show_basic_info_card(&mut columns[1], &task);
-                        });
+                        show_overview_cards(ui, &task);
                         ui.add_space(12.0);
 
                         if let Some(draft) = self.draft.as_mut() {
                             let mut changed = false;
-                            ui.columns(2, |columns| {
-                                card_frame(&columns[0]).show(&mut columns[0], |ui| {
-                                    ui.heading("儲存位置");
-                                    ui.label("來源 URL");
-                                    changed |= ui
-                                        .add_enabled(
-                                            can_edit,
-                                            egui::TextEdit::singleline(&mut draft.url),
-                                        )
-                                        .changed();
-                                    ui.label("檔名");
-                                    changed |= ui
-                                        .add_enabled(
-                                            can_edit,
-                                            egui::TextEdit::singleline(&mut draft.filename),
-                                        )
-                                        .changed();
-                                    ui.horizontal(|ui| {
-                                        ui.label("資料夾");
-                                        let response = ui.add_enabled(
-                                            can_edit,
-                                            egui::TextEdit::singleline(&mut draft.target_dir_input),
-                                        );
-                                        if response.lost_focus() {
-                                            let path = PathBuf::from(draft.target_dir_input.trim());
-                                            if path.is_dir() {
-                                                draft.target_dir = path.clone();
-                                                pending_last_dir = Some(path);
-                                                changed = true;
-                                            } else {
-                                                pending_error = Some("下載目錄不存在".into());
-                                            }
+                            card_frame(ui).show(ui, |ui| {
+                                ui.heading("儲存位置");
+                                ui.label("來源 URL");
+                                changed |= ui
+                                    .add_enabled(
+                                        can_edit,
+                                        egui::TextEdit::singleline(&mut draft.url),
+                                    )
+                                    .changed();
+                                ui.label("檔名");
+                                changed |= ui
+                                    .add_enabled(
+                                        can_edit,
+                                        egui::TextEdit::singleline(&mut draft.filename),
+                                    )
+                                    .changed();
+                                ui.horizontal(|ui| {
+                                    ui.label("資料夾");
+                                    let response = ui.add_enabled(
+                                        can_edit,
+                                        egui::TextEdit::singleline(&mut draft.target_dir_input),
+                                    );
+                                    if response.lost_focus() {
+                                        let path = PathBuf::from(draft.target_dir_input.trim());
+                                        if path.is_dir() {
+                                            draft.target_dir = path.clone();
+                                            pending_last_dir = Some(path);
+                                            changed = true;
+                                        } else {
+                                            pending_error = Some("下載目錄不存在".into());
                                         }
-                                        if ui
-                                            .add_enabled(can_edit, egui::Button::new("瀏覽…"))
-                                            .clicked()
+                                    }
+                                    if ui
+                                        .add_enabled(can_edit, egui::Button::new("瀏覽…"))
+                                        .clicked()
+                                    {
+                                        if let Some(path) = rfd::FileDialog::new()
+                                            .set_directory(&draft.target_dir)
+                                            .pick_folder()
                                         {
-                                            if let Some(path) = rfd::FileDialog::new()
-                                                .set_directory(&draft.target_dir)
-                                                .pick_folder()
-                                            {
-                                                draft.target_dir_input = path.display().to_string();
-                                                draft.target_dir = path.clone();
-                                                pending_last_dir = Some(path);
-                                                changed = true;
-                                            }
+                                            draft.target_dir_input = path.display().to_string();
+                                            draft.target_dir = path.clone();
+                                            pending_last_dir = Some(path);
+                                            changed = true;
                                         }
-                                    });
-                                    ui.weak("下載完成後，檔案會保存於此位置。");
+                                    }
                                 });
-                                card_frame(&columns[1]).show(&mut columns[1], |ui| {
-                                    ui.heading("分段設定");
-                                    ui.label("分段數");
-                                    changed |= ui
-                                        .add_enabled(
-                                            can_edit,
-                                            egui::Slider::new(&mut draft.segments, 1..=8)
-                                                .text("段"),
-                                        )
-                                        .changed();
-                                    ui.weak("分段下載可提升穩定性及速度。");
-                                });
+                                ui.weak("下載完成後，檔案會保存於此位置。");
                             });
                             ui.add_space(12.0);
                             card_frame(ui).show(ui, |ui| {
@@ -1031,7 +1205,11 @@ impl CurlDownloaderApp {
                                 );
                                 if !error.diagnostic.trim().is_empty() {
                                     ui.collapsing("詳細診斷（已清理敏感資料）", |ui| {
-                                        ui.monospace(&error.diagnostic);
+                                        ui.add(
+                                            egui::Label::new(&error.diagnostic)
+                                                .wrap()
+                                                .selectable(true),
+                                        );
                                     });
                                 }
                             });
@@ -1193,6 +1371,94 @@ fn status_color(ui: &egui::Ui, status: TaskStatus) -> egui::Color32 {
     }
 }
 
+fn show_overview_cards(ui: &mut egui::Ui, task: &TaskSnapshot) {
+    match inspector_columns(ui.available_width()) {
+        InspectorColumns::Two => {
+            ui.columns(2, |columns| {
+                show_progress_card(&mut columns[0], task);
+                show_basic_info_card(&mut columns[1], task);
+            });
+        }
+        InspectorColumns::One => {
+            show_progress_card(ui, task);
+            ui.add_space(12.0);
+            show_basic_info_card(ui, task);
+        }
+    }
+}
+
+fn show_segment_history(ui: &mut egui::Ui, task: &TaskSnapshot) {
+    ui.heading("分段下載歷史");
+    ui.weak(format!(
+        "已保存 {} 段；每段的範圍、進度、活動時間及平均速度會隨任務保存。",
+        task.segments.len()
+    ));
+    ui.add_space(8.0);
+    if task.segments.is_empty() {
+        card_frame(ui).show(ui, |ui| {
+            ui.weak("此任務沒有可顯示的分段歷史。舊版本未保存的資料會標示為未記錄。");
+        });
+        return;
+    }
+
+    for segment in &task.segments {
+        let range = if segment.end >= segment.start {
+            format!("位元組 {}–{}", segment.start, segment.end)
+        } else {
+            "位元組範圍未記錄".into()
+        };
+        let progress = format_segment_progress(task, segment);
+        let status = segment_status_label(task.status, segment);
+        card_frame(ui).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.colored_label(
+                    status_color(ui, task.status),
+                    egui::RichText::new(format!("第 {} 段", segment.index + 1)).strong(),
+                );
+                ui.weak(status);
+            });
+            ui.add_space(4.0);
+            show_detail_value(ui, "範圍", &range);
+            show_detail_value(ui, "進度", &progress);
+            show_detail_value(
+                ui,
+                "開始時間",
+                &format_segment_timestamp(segment.started_unix_ms),
+            );
+            show_detail_value(
+                ui,
+                "完成時間",
+                &format_segment_timestamp(segment.completed_unix_ms),
+            );
+            show_detail_value(ui, "活動下載時間", &format_segment_duration(segment));
+            show_detail_value(ui, "平均速度", &format_segment_average_speed(segment));
+        });
+        ui.add_space(8.0);
+    }
+}
+
+fn format_segment_progress(task: &TaskSnapshot, segment: &SegmentSnapshot) -> String {
+    match segment_expected_size(task, segment) {
+        Some(size) => format_progress_text(segment.downloaded, Some(size)),
+        None if segment.downloaded == 0 => "尚未開始  ·  總大小未知".into(),
+        None => format!("{}  ·  總大小未知", format_bytes(segment.downloaded)),
+    }
+}
+
+fn segment_expected_size(task: &TaskSnapshot, segment: &SegmentSnapshot) -> Option<u64> {
+    if task.total_size.is_some() && segment.end >= segment.start {
+        return Some(segment.end - segment.start + 1);
+    }
+    if segment.completed_unix_ms.is_some() && segment.downloaded > 0 {
+        return Some(segment.downloaded);
+    }
+    None
+}
+
+fn show_detail_value(ui: &mut egui::Ui, label: &str, value: &str) {
+    ui.weak(label);
+    ui.add(egui::Label::new(value).wrap().selectable(true));
+}
 fn show_progress_card(ui: &mut egui::Ui, task: &TaskSnapshot) {
     card_frame(ui).show(ui, |ui| {
         ui.heading("下載進度");
@@ -1224,25 +1490,44 @@ fn show_progress_card(ui: &mut egui::Ui, task: &TaskSnapshot) {
 fn show_basic_info_card(ui: &mut egui::Ui, task: &TaskSnapshot) {
     card_frame(ui).show(ui, |ui| {
         ui.heading("基本資料");
-        egui::Grid::new(format!("basic-info-{}", task.id))
-            .num_columns(2)
-            .spacing([12.0, 8.0])
-            .show(ui, |ui| {
-                info_row(ui, "狀態", status_label(task.status));
-                info_row(ui, "下載工具", curl_source_label(task.curl_source));
-                ui.label("來源 URL");
-                ui.label(&task.original_url);
-                ui.end_row();
-                info_row(ui, "檔名", &task.filename);
-                info_row(ui, "儲存位置", &task.target_dir.display().to_string());
-            });
+        show_detail_value(ui, "狀態", status_label(task.status));
+        show_detail_value(ui, "下載工具", curl_source_label(task.curl_source));
+        show_detail_value(ui, "來源 URL", &task.original_url);
+        if let Some(effective_url) = &task.effective_url {
+            if effective_url != &task.original_url {
+                show_detail_value(ui, "實際 URL", effective_url);
+            }
+        }
+        show_detail_value(ui, "檔名", &task.filename);
+        show_detail_value(ui, "儲存位置", &task.target_dir.display().to_string());
+        show_detail_value(
+            ui,
+            "分段",
+            &format!(
+                "要求 {} 段／實際 {} 段",
+                task.requested_segments, task.actual_segments
+            ),
+        );
+        show_detail_value(ui, "Range 支援", range_support_label(task.range_support));
+        show_detail_value(
+            ui,
+            "建立時間",
+            &format_segment_timestamp(Some(task.created_unix_ms)),
+        );
+        show_detail_value(
+            ui,
+            "完成時間",
+            &format_segment_timestamp(task.completed_unix_ms),
+        );
     });
 }
 
-fn info_row(ui: &mut egui::Ui, label: &str, value: &str) {
-    ui.weak(label);
-    ui.label(value);
-    ui.end_row();
+fn range_support_label(range_support: crate::model::RangeSupport) -> &'static str {
+    match range_support {
+        crate::model::RangeSupport::Unknown => "未知",
+        crate::model::RangeSupport::Supported => "支援",
+        crate::model::RangeSupport::Unsupported => "不支援",
+    }
 }
 
 fn draw_progress_ring(ui: &mut egui::Ui, fraction: f32, color: egui::Color32) {
@@ -1450,6 +1735,7 @@ fn open_location(_path: PathBuf) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::SegmentSnapshot;
 
     #[test]
     fn formats_bytes_and_speed() {
@@ -1601,6 +1887,55 @@ mod tests {
         );
     }
 
+    #[test]
+    fn inspector_switches_to_one_column_when_the_panel_is_narrow() {
+        assert_eq!(inspector_columns(720.0), InspectorColumns::Two);
+        assert_eq!(inspector_columns(719.9), InspectorColumns::One);
+    }
+
+    #[test]
+    fn legacy_segment_history_displays_missing_timing_as_unrecorded() {
+        let segment = SegmentSnapshot {
+            index: 0,
+            start: 0,
+            end: 99,
+            downloaded: 100,
+            started_unix_ms: None,
+            completed_unix_ms: None,
+            active_millis: 0,
+            active: false,
+        };
+        assert_eq!(format_segment_timestamp(None), "未記錄");
+        assert_eq!(format_segment_duration(&segment), "未記錄");
+        assert_eq!(format_segment_average_speed(&segment), "未記錄");
+    }
+
+    #[test]
+    fn segment_status_prefers_completed_then_active_state() {
+        let mut segment = SegmentSnapshot {
+            index: 0,
+            start: 0,
+            end: 99,
+            downloaded: 100,
+            started_unix_ms: Some(1_000),
+            completed_unix_ms: Some(2_000),
+            active_millis: 1_000,
+            active: true,
+        };
+        assert_eq!(
+            segment_status_label(TaskStatus::Downloading, &segment),
+            "已完成"
+        );
+
+        segment.completed_unix_ms = None;
+        assert_eq!(
+            segment_status_label(TaskStatus::Downloading, &segment),
+            "下載中"
+        );
+        segment.active = false;
+        segment.downloaded = 50;
+        assert_eq!(segment_status_label(TaskStatus::Paused, &segment), "已暫停");
+    }
     fn test_snapshot(id: TaskId, status: TaskStatus) -> TaskSnapshot {
         TaskSnapshot {
             id,
