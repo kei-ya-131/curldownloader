@@ -4,11 +4,12 @@ use crate::{
         ConfiguredTask, EngineCommand, ProxyProtocol, ProxySettings, TaskId, TaskSnapshot,
         TaskStatus,
     },
+    shell_foreground::{self, OpenTargetOutcome},
 };
 use serde::{Deserialize, Serialize};
 use std::{
     io::{self, Read, Write},
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -658,6 +659,22 @@ fn dispatch_request_for_test(
     let last_download_dir = Arc::new(Mutex::new(PathBuf::from(r"C:\Downloads")));
     dispatch_request(request, &commands, &last_download_dir, state, controller)
 }
+fn action_from_open_outcome(
+    request_id: String,
+    outcome: io::Result<OpenTargetOutcome>,
+    open_failed_code: &'static str,
+    open_failed_message: &'static str,
+) -> IpcResponse {
+    match outcome {
+        Ok(OpenTargetOutcome::Focused) => action_success(request_id),
+        Ok(OpenTargetOutcome::OpenedButNotFocused) => action_error(
+            request_id,
+            "target_not_foreground",
+            "目標已開啟，但未能置前。",
+        ),
+        Err(_) => action_error(request_id, open_failed_code, open_failed_message),
+    }
+}
 fn open_task_file(
     request_id: String,
     task_id: TaskId,
@@ -673,50 +690,14 @@ fn open_task_file(
     if !path.is_file() {
         return action_error(request_id, "file_unavailable", "下載檔案不存在。");
     }
-    match open_path_with_shell(&path) {
-        Ok(()) => action_success(request_id),
-        Err(_) => action_error(request_id, "open_file_failed", "無法開啟下載檔案。"),
-    }
+    action_from_open_outcome(
+        request_id,
+        shell_foreground::open_file_foreground(&path),
+        "open_file_failed",
+        "無法開啟下載檔案。",
+    )
 }
 
-#[cfg(windows)]
-fn open_path_with_shell(path: &Path) -> io::Result<()> {
-    use std::{ffi::OsStr, os::windows::ffi::OsStrExt, ptr};
-    use windows_sys::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL};
-
-    let operation: Vec<u16> = OsStr::new("open")
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    let target: Vec<u16> = path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    let result = unsafe {
-        ShellExecuteW(
-            ptr::null_mut(),
-            operation.as_ptr(),
-            target.as_ptr(),
-            ptr::null(),
-            ptr::null(),
-            SW_SHOWNORMAL,
-        )
-    };
-    if (result as isize) > 32 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-#[cfg(not(windows))]
-fn open_path_with_shell(path: &Path) -> io::Result<()> {
-    std::process::Command::new("explorer.exe")
-        .arg(path)
-        .spawn()
-        .map(|_| ())
-}
 fn open_task_folder(
     request_id: String,
     task_id: TaskId,
@@ -728,10 +709,12 @@ fn open_task_folder(
     if !task.target_dir.is_dir() {
         return action_error(request_id, "folder_unavailable", "目標下載資料夾不存在。");
     }
-    match open_path_with_shell(&task.target_dir) {
-        Ok(()) => action_success(request_id),
-        Err(_) => action_error(request_id, "open_folder_failed", "無法開啟目標下載資料夾。"),
-    }
+    action_from_open_outcome(
+        request_id,
+        shell_foreground::open_folder_foreground(&task.target_dir),
+        "open_folder_failed",
+        "無法開啟目標下載資料夾。",
+    )
 }
 
 fn action_success(request_id: String) -> IpcResponse {
@@ -916,6 +899,7 @@ mod tests {
             CurlSource, DownloadTask, ProxyProtocol, ProxySnapshot, RangeSupport, TaskId,
             TaskSnapshot, TaskStatus,
         },
+        shell_foreground::OpenTargetOutcome,
     };
     #[test]
     fn frame_round_trip_handles_partial_reader() {
@@ -1073,6 +1057,19 @@ mod tests {
         assert_eq!(folder["type"], "open_folder");
     }
 
+    #[test]
+    fn opened_but_not_foreground_has_stable_wire_error() {
+        let response = action_from_open_outcome(
+            "7".into(),
+            Ok(OpenTargetOutcome::OpenedButNotFocused),
+            "open_file_failed",
+            "無法開啟下載檔案。",
+        );
+        let json = serde_json::to_value(response).unwrap();
+        assert_eq!(json["ok"], false);
+        assert_eq!(json["error"]["code"], "target_not_foreground");
+        assert_eq!(json["error"]["message"], "目標已開啟，但未能置前。");
+    }
     #[test]
     fn action_response_keeps_request_id_and_error_shape() {
         let response = IpcResponse::ActionResult {

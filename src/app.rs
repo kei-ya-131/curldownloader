@@ -7,7 +7,7 @@ use crate::{
         CURRENT_SCHEMA_VERSION, CurlSource, EngineCommand, GlobalSettings, NewTask, PersistedState,
         ProxyProtocol, ProxySettings, SegmentSnapshot, TaskId, TaskSnapshot, TaskStatus,
     },
-    storage, tray,
+    shell_foreground, storage, tray,
     window_control::{EguiMainWindow, MainWindowControl},
 };
 use eframe::egui;
@@ -1724,9 +1724,7 @@ fn location_directory(path: &std::path::Path) -> &std::path::Path {
 
 #[cfg(target_os = "windows")]
 fn open_location(path: PathBuf) {
-    let _ = std::process::Command::new("explorer.exe")
-        .arg(location_directory(&path))
-        .spawn();
+    let _ = shell_foreground::open_folder_foreground(location_directory(&path));
 }
 
 #[cfg(not(target_os = "windows"))]

@@ -26,17 +26,31 @@ struct TopLevelWindow {
     has_owner: bool,
 }
 
+#[cfg(windows)]
+pub fn open_file_foreground(path: &Path) -> io::Result<OpenTargetOutcome> {
+    let path = path.to_owned();
+    windows_impl::run_sta(move || windows_impl::open_file(&path))
+}
+
+#[cfg(not(windows))]
 pub fn open_file_foreground(_path: &Path) -> io::Result<OpenTargetOutcome> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        "foreground shell support not implemented",
+        "foreground shell support is only available on Windows",
     ))
 }
 
+#[cfg(windows)]
+pub fn open_folder_foreground(path: &Path) -> io::Result<OpenTargetOutcome> {
+    let path = path.to_owned();
+    windows_impl::run_sta(move || windows_impl::open_folder(&path))
+}
+
+#[cfg(not(windows))]
 pub fn open_folder_foreground(_path: &Path) -> io::Result<OpenTargetOutcome> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        "foreground shell support not implemented",
+        "foreground shell support is only available on Windows",
     ))
 }
 
@@ -218,13 +232,10 @@ mod windows_impl {
             .spawn(move || {
                 let initialize_result = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
                 if initialize_result.0 < 0 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        format!(
-                            "CoInitializeEx failed: HRESULT 0x{:08x}",
-                            initialize_result.0 as u32
-                        ),
-                    ));
+                    return Err(io::Error::other(format!(
+                        "CoInitializeEx failed: HRESULT 0x{:08x}",
+                        initialize_result.0 as u32
+                    )));
                 }
 
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation));
@@ -234,17 +245,14 @@ mod windows_impl {
 
                 match result {
                     Ok(result) => result,
-                    Err(_) => Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        "Windows shell worker panicked",
-                    )),
+                    Err(_) => Err(io::Error::other("Windows shell worker panicked")),
                 }
             })
-            .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+            .map_err(|error| io::Error::other(error.to_string()))?;
 
         handle
             .join()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "Windows shell worker panicked"))?
+            .map_err(|_| io::Error::other("Windows shell worker panicked"))?
     }
 
     pub(super) fn open_file(path: &Path) -> io::Result<super::OpenTargetOutcome> {
@@ -393,10 +401,10 @@ mod windows_impl {
     fn enumerate_explorer_windows() -> io::Result<Vec<super::ExplorerWindow>> {
         let shell_windows: IShellWindows =
             unsafe { CoCreateInstance(&ShellWindows, None, CLSCTX_LOCAL_SERVER) }
-                .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+                .map_err(|error| io::Error::other(error.to_string()))?;
 
         let count = unsafe { shell_windows.Count() }
-            .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+            .map_err(|error| io::Error::other(error.to_string()))?;
         let mut result = Vec::new();
 
         for index in 0..count {
@@ -524,7 +532,10 @@ mod windows_impl {
         }
 
         fn show_restore(&self, hwnd: WindowId) -> bool {
-            unsafe { ShowWindowAsync(win32_handle(hwnd), SW_RESTORE) != 0 }
+            unsafe {
+                ShowWindowAsync(win32_handle(hwnd), SW_RESTORE);
+            }
+            true
         }
 
         fn attach_thread_input(&self, from: u32, to: u32, attach: bool) -> bool {
