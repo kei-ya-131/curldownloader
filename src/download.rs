@@ -1443,20 +1443,13 @@ impl Engine {
                     status: task.status,
                     requested_segments: task.requested_segments,
                     actual_segments: task.actual_segments,
-                    segments: task
-                        .segments
-                        .iter()
-                        .map(|segment| SegmentSnapshot {
-                            index: segment.index,
-                            start: segment.start,
-                            end: segment.end,
-                            downloaded: segment.downloaded,
-                            started_unix_ms: segment.started_unix_ms,
-                            completed_unix_ms: segment.completed_unix_ms,
-                            active_millis: segment.active_millis,
-                            active: false,
-                        })
-                        .collect(),
+                    segments: build_segment_snapshots(
+                        task,
+                        self.active
+                            .values()
+                            .filter(|job| job.task_id == task.id)
+                            .map(|job| (job.kind, job.segment)),
+                    ),
                     downloaded,
                     total_size: task.total_size,
                     range_support: task.range_support,
@@ -1522,6 +1515,32 @@ fn record_segment_completion(segment: &mut SegmentState, unix_ms: u64) {
     if segment.completed_unix_ms.is_none() {
         segment.completed_unix_ms = Some(unix_ms);
     }
+}
+fn build_segment_snapshots<I>(task: &DownloadTask, active_jobs: I) -> Vec<SegmentSnapshot>
+where
+    I: Iterator<Item = (JobKind, Option<u8>)>,
+{
+    let active_indices = active_jobs
+        .filter_map(|(kind, segment_index)| match kind {
+            JobKind::Single => task.segments.first().map(|segment| segment.index),
+            JobKind::Segment => segment_index,
+            JobKind::HeadProbe | JobKind::RangeProbe => None,
+        })
+        .collect::<HashSet<_>>();
+
+    task.segments
+        .iter()
+        .map(|segment| SegmentSnapshot {
+            index: segment.index,
+            start: segment.start,
+            end: segment.end,
+            downloaded: segment.downloaded,
+            started_unix_ms: segment.started_unix_ms,
+            completed_unix_ms: segment.completed_unix_ms,
+            active_millis: segment.active_millis,
+            active: active_indices.contains(&segment.index),
+        })
+        .collect()
 }
 fn transfer_segment_mut(
     task: &mut DownloadTask,
@@ -1715,6 +1734,52 @@ mod tests {
         assert_eq!(segment.completed_unix_ms, Some(5_000));
     }
 
+    #[test]
+    fn segment_snapshots_mark_only_matching_transfer_active() {
+        let task = task_with_two_segments();
+        let snapshots = build_segment_snapshots(&task, [(JobKind::Segment, Some(1))].into_iter());
+        assert!(!snapshots[0].active);
+        assert!(snapshots[1].active);
+    }
+
+    #[test]
+    fn single_transfer_marks_the_first_segment_active() {
+        let task = task_with_one_segment();
+        let snapshots = build_segment_snapshots(&task, [(JobKind::Single, Some(0))].into_iter());
+        assert!(snapshots[0].active);
+    }
+
+    fn task_with_one_segment() -> DownloadTask {
+        let mut task = DownloadTask::new(
+            1,
+            "https://example.test/file.bin",
+            "file.bin".into(),
+            std::env::temp_dir(),
+        );
+        task.actual_segments = 1;
+        task.segments = vec![test_segment()];
+        task
+    }
+
+    fn task_with_two_segments() -> DownloadTask {
+        let mut task = task_with_one_segment();
+        task.actual_segments = 2;
+        task.segments = vec![
+            SegmentState {
+                index: 0,
+                start: 0,
+                end: 49,
+                ..test_segment()
+            },
+            SegmentState {
+                index: 1,
+                start: 50,
+                end: 99,
+                ..test_segment()
+            },
+        ];
+        task
+    }
     fn test_segment() -> SegmentState {
         SegmentState {
             index: 0,

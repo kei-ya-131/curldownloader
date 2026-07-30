@@ -205,6 +205,19 @@ fn downloads_four_ranges_and_merges_exact_bytes() {
             .iter()
             .all(|segment| segment.completed_unix_ms.is_some())
     );
+
+    let mut restarted =
+        support::EngineHarness::from_state(state_path, harness.download_dir().to_path_buf());
+    let restored = restarted.wait_for(id, TaskStatus::Completed, std::time::Duration::from_secs(5));
+    assert_eq!(restored.segments.len(), 4);
+    assert!(restored.segments.iter().all(|segment| !segment.active));
+    assert!(
+        restored
+            .segments
+            .iter()
+            .all(|segment| segment.completed_unix_ms.is_some())
+    );
+    restarted.shutdown_keep_files();
 }
 
 #[test]
