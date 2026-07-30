@@ -112,8 +112,22 @@ fn run_native_host_io<R: Read, W: Write>(input: R, output: W) -> io::Result<()> 
 }
 
 fn run_native_host_io_with_hook<R: Read, W: Write, F: FnMut(&IpcResponse)>(
+    input: R,
+    output: W,
+    after_response: F,
+) -> io::Result<()> {
+    run_native_host_io_with_processor(input, output, process_message, after_response)
+}
+
+fn run_native_host_io_with_processor<
+    R: Read,
+    W: Write,
+    P: FnMut(&[u8]) -> IpcResponse,
+    F: FnMut(&IpcResponse),
+>(
     mut input: R,
     mut output: W,
+    mut process: P,
     mut after_response: F,
 ) -> io::Result<()> {
     let mut hook_called = false;
@@ -131,7 +145,7 @@ fn run_native_host_io_with_hook<R: Read, W: Write, F: FnMut(&IpcResponse)>(
                 return Ok(());
             }
         };
-        let response = process_message(&body);
+        let response = process(&body);
         write_response(&mut output, &response)?;
         let manually_stopped = matches!(
             &response,
@@ -377,10 +391,28 @@ mod tests {
             .unwrap();
         crate::ipc::write_frame(&mut input, br#"{"type":"ping","request_id":"request-2"}"#)
             .unwrap();
+        crate::ipc::write_frame(&mut input, br#"{"type":"ping","request_id":"request-3"}"#)
+            .unwrap();
         let mut output = Vec::new();
         let mut calls = 0;
-        run_native_host_io_with_hook(input.as_slice(), &mut output, |_response| calls += 1)
-            .unwrap();
+        let mut response_number = 0;
+        run_native_host_io_with_processor(
+            input.as_slice(),
+            &mut output,
+            |_body| {
+                response_number += 1;
+                if response_number == 1 {
+                    error_response("request-1", "manually_stopped", "GUI 啟動不獲允許")
+                } else {
+                    IpcResponse::Pong {
+                        request_id: format!("request-{response_number}"),
+                        ok: true,
+                    }
+                }
+            },
+            |_response| calls += 1,
+        )
+        .unwrap();
         assert_eq!(calls, 1);
     }
     #[test]
