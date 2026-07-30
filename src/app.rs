@@ -69,6 +69,43 @@ enum InspectorTab {
     Overview,
     Segments,
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UrlDetailField {
+    Original,
+    Effective,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ExpandedUrlKey {
+    task_id: TaskId,
+    field: UrlDetailField,
+}
+
+fn toggle_expanded_url(
+    current: Option<ExpandedUrlKey>,
+    key: ExpandedUrlKey,
+) -> Option<ExpandedUrlKey> {
+    if current == Some(key) {
+        None
+    } else {
+        Some(key)
+    }
+}
+
+fn is_url_expanded(current: Option<ExpandedUrlKey>, key: ExpandedUrlKey) -> bool {
+    current == Some(key)
+}
+
+fn url_detail_wrap_mode(
+    current: Option<ExpandedUrlKey>,
+    key: ExpandedUrlKey,
+) -> egui::TextWrapMode {
+    if is_url_expanded(current, key) {
+        egui::TextWrapMode::Wrap
+    } else {
+        egui::TextWrapMode::Truncate
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum InspectorColumns {
@@ -237,6 +274,7 @@ pub struct CurlDownloaderApp {
     start_minimized: bool,
     hidden_to_tray: bool,
     inspector_tab: InspectorTab,
+    expanded_url: Option<ExpandedUrlKey>,
     ipc_thread: Option<JoinHandle<()>>,
 }
 #[derive(Clone)]
@@ -385,6 +423,7 @@ impl CurlDownloaderApp {
             start_minimized,
             hidden_to_tray: start_minimized,
             inspector_tab: InspectorTab::Overview,
+            expanded_url: None,
             ipc_thread,
         }
     }
@@ -1890,7 +1929,56 @@ mod tests {
         assert_eq!(inspector_columns(720.0), InspectorColumns::Two);
         assert_eq!(inspector_columns(719.9), InspectorColumns::One);
     }
+    #[test]
+    fn url_detail_is_collapsed_by_default_and_toggles_on_click() {
+        let key = ExpandedUrlKey {
+            task_id: 42,
+            field: UrlDetailField::Original,
+        };
 
+        assert!(!is_url_expanded(None, key));
+        assert_eq!(
+            url_detail_wrap_mode(None, key),
+            egui::TextWrapMode::Truncate
+        );
+
+        let expanded = toggle_expanded_url(None, key);
+        assert_eq!(expanded, Some(key));
+        assert!(is_url_expanded(expanded, key));
+        assert_eq!(
+            url_detail_wrap_mode(expanded, key),
+            egui::TextWrapMode::Wrap
+        );
+
+        assert_eq!(toggle_expanded_url(expanded, key), None);
+        assert!(!is_url_expanded(None, key));
+    }
+
+    #[test]
+    fn expanded_url_state_is_scoped_to_task_and_url_field() {
+        let source = ExpandedUrlKey {
+            task_id: 7,
+            field: UrlDetailField::Original,
+        };
+        let effective = ExpandedUrlKey {
+            task_id: 7,
+            field: UrlDetailField::Effective,
+        };
+        let other_task = ExpandedUrlKey {
+            task_id: 8,
+            field: UrlDetailField::Original,
+        };
+
+        let expanded = toggle_expanded_url(None, source);
+        assert!(is_url_expanded(expanded, source));
+        assert!(!is_url_expanded(expanded, effective));
+        assert!(!is_url_expanded(expanded, other_task));
+
+        let other_field = toggle_expanded_url(expanded, effective);
+        assert_eq!(other_field, Some(effective));
+        assert!(!is_url_expanded(other_field, source));
+        assert!(is_url_expanded(other_field, effective));
+    }
     #[test]
     fn legacy_segment_history_displays_missing_timing_as_unrecorded() {
         let segment = SegmentSnapshot {
