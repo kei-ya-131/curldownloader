@@ -1085,7 +1085,7 @@ impl CurlDownloaderApp {
                             TaskStatus::Queued | TaskStatus::Paused | TaskStatus::Failed
                         );
 
-                        show_overview_cards(ui, &task);
+                        show_overview_cards(ui, &task, &mut self.expanded_url);
                         ui.add_space(12.0);
 
                         if let Some(draft) = self.draft.as_mut() {
@@ -1410,18 +1410,22 @@ fn status_color(ui: &egui::Ui, status: TaskStatus) -> egui::Color32 {
     }
 }
 
-fn show_overview_cards(ui: &mut egui::Ui, task: &TaskSnapshot) {
+fn show_overview_cards(
+    ui: &mut egui::Ui,
+    task: &TaskSnapshot,
+    expanded_url: &mut Option<ExpandedUrlKey>,
+) {
     match inspector_columns(ui.available_width()) {
         InspectorColumns::Two => {
             ui.columns(2, |columns| {
                 show_progress_card(&mut columns[0], task);
-                show_basic_info_card(&mut columns[1], task);
+                show_basic_info_card(&mut columns[1], task, expanded_url);
             });
         }
         InspectorColumns::One => {
             show_progress_card(ui, task);
             ui.add_space(12.0);
-            show_basic_info_card(ui, task);
+            show_basic_info_card(ui, task, expanded_url);
         }
     }
 }
@@ -1498,6 +1502,26 @@ fn show_detail_value(ui: &mut egui::Ui, label: &str, value: &str) {
     ui.weak(label);
     ui.add(egui::Label::new(value).wrap().selectable(true));
 }
+fn show_url_detail_value(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &str,
+    key: ExpandedUrlKey,
+    expanded_url: &mut Option<ExpandedUrlKey>,
+) {
+    ui.weak(label);
+    let response = ui
+        .add(
+            egui::Label::new(value)
+                .wrap_mode(url_detail_wrap_mode(*expanded_url, key))
+                .selectable(true)
+                .sense(egui::Sense::click()),
+        )
+        .on_hover_text(value);
+    if response.clicked() {
+        *expanded_url = toggle_expanded_url(*expanded_url, key);
+    }
+}
 fn show_progress_card(ui: &mut egui::Ui, task: &TaskSnapshot) {
     card_frame(ui).show(ui, |ui| {
         ui.heading("下載進度");
@@ -1526,15 +1550,37 @@ fn show_progress_card(ui: &mut egui::Ui, task: &TaskSnapshot) {
     });
 }
 
-fn show_basic_info_card(ui: &mut egui::Ui, task: &TaskSnapshot) {
+fn show_basic_info_card(
+    ui: &mut egui::Ui,
+    task: &TaskSnapshot,
+    expanded_url: &mut Option<ExpandedUrlKey>,
+) {
     card_frame(ui).show(ui, |ui| {
         ui.heading("基本資料");
         show_detail_value(ui, "狀態", status_label(task.status));
         show_detail_value(ui, "下載工具", curl_source_label(task.curl_source));
-        show_detail_value(ui, "來源 URL", &task.original_url);
+        show_url_detail_value(
+            ui,
+            "來源 URL",
+            &task.original_url,
+            ExpandedUrlKey {
+                task_id: task.id,
+                field: UrlDetailField::Original,
+            },
+            expanded_url,
+        );
         if let Some(effective_url) = &task.effective_url {
             if effective_url != &task.original_url {
-                show_detail_value(ui, "實際 URL", effective_url);
+                show_url_detail_value(
+                    ui,
+                    "實際 URL",
+                    effective_url,
+                    ExpandedUrlKey {
+                        task_id: task.id,
+                        field: UrlDetailField::Effective,
+                    },
+                    expanded_url,
+                );
             }
         }
         show_detail_value(ui, "檔名", &task.filename);
