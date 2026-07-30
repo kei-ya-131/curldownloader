@@ -182,7 +182,29 @@ fn downloads_four_ranges_and_merges_exact_bytes() {
         std::fs::read(completed.target_dir.join("range.bin")).unwrap(),
         b"abcdefghijklmnopqrstuvwxyz"
     );
+    assert_eq!(completed.segments.len(), 4);
+    for segment in &completed.segments {
+        assert_eq!(
+            segment.downloaded,
+            segment.end.saturating_sub(segment.start).saturating_add(1)
+        );
+        assert!(segment.started_unix_ms.is_some());
+        assert!(segment.completed_unix_ms.is_some());
+        assert!(segment.active_millis > 0);
+        assert!(!segment.active);
+    }
     assert!(harness.max_observed_processes() <= 4);
+
+    let state_path = harness.shutdown_keep_files();
+    let persisted = curl_downloader::storage::load_state(&state_path).unwrap();
+    let persisted_task = persisted.tasks.iter().find(|task| task.id == id).unwrap();
+    assert_eq!(persisted_task.segments.len(), 4);
+    assert!(
+        persisted_task
+            .segments
+            .iter()
+            .all(|segment| segment.completed_unix_ms.is_some())
+    );
 }
 
 #[test]
@@ -202,8 +224,54 @@ fn server_without_ranges_falls_back_to_single_stream() {
         std::time::Duration::from_secs(60),
     );
     assert_eq!(completed.actual_segments, 1);
+    assert_eq!(completed.segments.len(), 1);
+    assert!(completed.segments[0].started_unix_ms.is_some());
+    assert!(completed.segments[0].completed_unix_ms.is_some());
+    assert!(completed.segments[0].active_millis > 0);
 }
 
+#[test]
+fn segment_active_time_excludes_pause_and_accumulates_after_resume() {
+    static PAUSE_BODY: [u8; 512] = [b'x'; 512];
+    let server = support::TestHttpServer::start_slow(&PAUSE_BODY, 100);
+    let mut harness = support::EngineHarness::new(2);
+    let id = harness.add_and_start(format!("{}/slow.bin", server.base_url), 2);
+    std::thread::sleep(std::time::Duration::from_millis(1_500));
+    harness
+        .engine
+        .commands
+        .send(EngineCommand::Pause(id))
+        .unwrap();
+    let _paused = harness.wait_for(id, TaskStatus::Paused, std::time::Duration::from_secs(5));
+    let paused_segment =
+        harness.wait_for_segment(id, std::time::Duration::from_secs(5), |segment| {
+            segment.started_unix_ms.is_some() && segment.active_millis > 0
+        });
+
+    std::thread::sleep(std::time::Duration::from_millis(350));
+    harness.poll_once(std::time::Duration::from_millis(700));
+    let still_paused = harness.wait_for_segment(id, std::time::Duration::from_secs(2), |segment| {
+        segment.index == paused_segment.index
+    });
+    assert_eq!(still_paused.active_millis, paused_segment.active_millis);
+
+    harness.resume(id);
+    let completed = harness.wait_for(
+        id,
+        TaskStatus::Completed,
+        std::time::Duration::from_secs(30),
+    );
+    let completed_segment = completed
+        .segments
+        .iter()
+        .find(|segment| segment.index == paused_segment.index)
+        .unwrap();
+    assert_eq!(
+        completed_segment.started_unix_ms,
+        paused_segment.started_unix_ms
+    );
+    assert!(completed_segment.active_millis > paused_segment.active_millis);
+}
 #[test]
 fn shutdown_then_restart_resumes_without_redownloading_prefix() {
     let server =

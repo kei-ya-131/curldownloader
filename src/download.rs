@@ -262,6 +262,8 @@ struct ActiveJob {
     header_path: PathBuf,
     metadata_path: Option<PathBuf>,
     stop: bool,
+    started_at: Instant,
+    started_unix_ms: u64,
 }
 
 struct Engine {
@@ -995,6 +997,14 @@ impl Engine {
             let runtime = self.ensure_runtime()?;
             runtime.spawn(&mut spec, stdout)?
         };
+        let started_at = Instant::now();
+        let started_unix_ms = current_unix_ms();
+        if let Some(segment_state) = self
+            .task_mut(task.id)
+            .and_then(|task| transfer_segment_mut(task, kind, segment))
+        {
+            record_segment_start(segment_state, started_unix_ms);
+        }
         if let Ok(mut command_line) = self.metrics.last_command.lock() {
             *command_line = spec.arguments_text();
         }
@@ -1010,8 +1020,11 @@ impl Engine {
                 header_path,
                 metadata_path,
                 stop: false,
+                started_at,
+                started_unix_ms,
             },
         );
+        let _ = self.persist();
         self.metrics.started();
         Ok(())
     }
@@ -1044,6 +1057,7 @@ impl Engine {
             let Some(mut job) = self.active.remove(&job_id) else {
                 continue;
             };
+            self.record_job_elapsed(&job);
             self.metrics.finished();
             let mut stderr = String::new();
             if let Some(mut pipe) = job.child.stderr.take() {
@@ -1181,6 +1195,7 @@ impl Engine {
         if let Some(task) = self.task_mut(job.task_id) {
             if let Some(segment) = task.segments.first_mut() {
                 segment.downloaded = length;
+                record_segment_completion(segment, current_unix_ms());
             }
             task.last_error = None;
         }
@@ -1244,6 +1259,7 @@ impl Engine {
                 .find(|segment| segment.index == segment_index)
             {
                 segment.downloaded = segment.end.saturating_sub(segment.start).saturating_add(1);
+                record_segment_completion(segment, current_unix_ms());
             }
             task.last_error = None;
         }
@@ -1310,6 +1326,24 @@ impl Engine {
         self.publish_snapshot();
     }
 
+    fn record_job_elapsed(&mut self, job: &ActiveJob) {
+        if !matches!(job.kind, JobKind::Single | JobKind::Segment) {
+            return;
+        }
+        let elapsed = job.started_at.elapsed();
+        let changed = self
+            .task_mut(job.task_id)
+            .and_then(|task| transfer_segment_mut(task, job.kind, job.segment))
+            .map(|segment| {
+                record_segment_start(segment, job.started_unix_ms);
+                add_segment_active_time(segment, elapsed);
+                true
+            })
+            .unwrap_or(false);
+        if changed {
+            let _ = self.persist();
+        }
+    }
     fn stop_all(&mut self) {
         for job in self.active.values_mut() {
             job.stop = true;
@@ -1473,6 +1507,37 @@ fn current_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
+fn record_segment_start(segment: &mut SegmentState, unix_ms: u64) {
+    if segment.started_unix_ms.is_none() {
+        segment.started_unix_ms = Some(unix_ms);
+    }
+}
+
+fn add_segment_active_time(segment: &mut SegmentState, elapsed: Duration) {
+    let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+    segment.active_millis = segment.active_millis.saturating_add(elapsed_ms);
+}
+
+fn record_segment_completion(segment: &mut SegmentState, unix_ms: u64) {
+    if segment.completed_unix_ms.is_none() {
+        segment.completed_unix_ms = Some(unix_ms);
+    }
+}
+fn transfer_segment_mut(
+    task: &mut DownloadTask,
+    kind: JobKind,
+    segment_index: Option<u8>,
+) -> Option<&mut SegmentState> {
+    match kind {
+        JobKind::Single => task.segments.first_mut(),
+        JobKind::Segment => segment_index.and_then(|index| {
+            task.segments
+                .iter_mut()
+                .find(|segment| segment.index == index)
+        }),
+        JobKind::HeadProbe | JobKind::RangeProbe => None,
+    }
+}
 fn proxy_configuration_changed(left: &ProxySettings, right: &ProxySettings) -> bool {
     left.enabled != right.enabled
         || left.protocol != right.protocol
@@ -1621,5 +1686,44 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn job_elapsed_accumulates_without_resetting_first_start() {
+        let mut segment = SegmentState {
+            index: 0,
+            start: 0,
+            end: 99,
+            downloaded: 40,
+            started_unix_ms: Some(1_000),
+            completed_unix_ms: None,
+            active_millis: 250,
+        };
+
+        record_segment_start(&mut segment, 2_000);
+        add_segment_active_time(&mut segment, Duration::from_millis(750));
+
+        assert_eq!(segment.started_unix_ms, Some(1_000));
+        assert_eq!(segment.active_millis, 1_000);
+    }
+
+    #[test]
+    fn completed_segment_records_completion_once() {
+        let mut segment = test_segment();
+        record_segment_completion(&mut segment, 5_000);
+        record_segment_completion(&mut segment, 9_000);
+        assert_eq!(segment.completed_unix_ms, Some(5_000));
+    }
+
+    fn test_segment() -> SegmentState {
+        SegmentState {
+            index: 0,
+            start: 0,
+            end: 99,
+            downloaded: 0,
+            started_unix_ms: None,
+            completed_unix_ms: None,
+            active_millis: 0,
+        }
     }
 }

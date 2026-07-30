@@ -5,7 +5,7 @@ use curl_downloader::{
     download::{EngineHandle, spawn_engine},
     model::{
         CURRENT_SCHEMA_VERSION, ConfiguredTask, EngineCommand, EngineEvent, GlobalSettings,
-        NewTask, PersistedState, ProxySettings, TaskId, TaskSnapshot, TaskStatus,
+        NewTask, PersistedState, ProxySettings, SegmentSnapshot, TaskId, TaskSnapshot, TaskStatus,
     },
 };
 use std::{
@@ -630,6 +630,36 @@ impl EngineHarness {
         }
     }
 
+    pub fn wait_for_segment<F>(
+        &mut self,
+        id: TaskId,
+        timeout: Duration,
+        predicate: F,
+    ) -> SegmentSnapshot
+    where
+        F: Fn(&SegmentSnapshot) -> bool,
+    {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(segment) = self
+                .latest
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|task| task.id == id)
+                .and_then(|task| task.segments.iter().find(|segment| predicate(segment)))
+                .cloned()
+            {
+                return segment;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timeout waiting for segment; latest={:?}",
+                self.latest.lock().unwrap()
+            );
+            self.poll_once(Duration::from_millis(100));
+        }
+    }
     pub fn wait_for_count(&mut self, count: usize, timeout: Duration) -> Vec<TaskSnapshot> {
         let deadline = std::time::Instant::now() + timeout;
         loop {
