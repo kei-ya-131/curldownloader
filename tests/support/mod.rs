@@ -307,6 +307,7 @@ impl TestHttpServer {
                 while !thread_stop.load(Ordering::Acquire) {
                     match listener.accept() {
                         Ok((stream, _)) => {
+                            let _ = stream.set_nonblocking(false);
                             let routes = routes
                                 .iter()
                                 .map(|route| Route {
