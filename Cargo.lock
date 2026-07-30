@@ -767,6 +767,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "url",
+ "windows",
  "windows-sys 0.61.2",
  "winreg",
  "winresource",
