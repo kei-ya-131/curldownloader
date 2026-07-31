@@ -27,6 +27,7 @@
     document.getElementById('url').value = download.url || '';
     document.getElementById('filename').value = download.filename || 'download.bin';
     document.getElementById('target-dir').value = download.targetDir || defaults.targetDir || '';
+    document.getElementById('segments').value = defaults.segments || 4;
     const proxy = download.proxy || defaults.proxy;
     document.getElementById('proxy-enabled').checked = Boolean(proxy.enabled);
     document.getElementById('proxy-protocol').value = proxy.protocol || 'http';
@@ -41,6 +42,7 @@
     return {
       filename: document.getElementById('filename').value.trim(),
       targetDir: document.getElementById('target-dir').value.trim(),
+      segments: Number(document.getElementById('segments').value),
       proxy: {
         enabled: document.getElementById('proxy-enabled').checked,
         protocol: document.getElementById('proxy-protocol').value,

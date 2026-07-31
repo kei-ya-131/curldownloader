@@ -27,12 +27,14 @@
 
   function buildEnqueueMessage(download, form, requestId) {
     const proxy = form.proxy || {};
+    const segments = Number(form.segments);
     return {
       type: 'enqueue',
       request_id: String(requestId),
       url: String(download.url),
       filename: String(form.filename || download.filename || '').trim(),
       target_dir: String(form.targetDir || '').trim(),
+      requested_segments: Number.isInteger(segments) && segments >= 1 && segments <= 8 ? segments : 4,
       proxy: {
         enabled: Boolean(proxy.enabled),
         protocol: String(proxy.protocol || 'http'),

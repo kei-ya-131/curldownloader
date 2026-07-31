@@ -9,6 +9,7 @@
 
   const DEFAULTS = Object.freeze({
     targetDir: '',
+    segments: 4,
     proxy: Object.freeze({
       enabled: false,
       protocol: 'http',
@@ -18,11 +19,19 @@
     })
   });
 
+  function cleanSegments(value) {
+    const segments = Number(value);
+    return Number.isInteger(segments) && segments >= 1 && segments <= 8
+      ? segments
+      : DEFAULTS.segments;
+  }
+
   function cleanDefaults(value) {
     const source = value && typeof value === 'object' ? value : {};
     const sourceProxy = source.proxy && typeof source.proxy === 'object' ? source.proxy : {};
     return {
       targetDir: typeof source.targetDir === 'string' ? source.targetDir : '',
+      segments: cleanSegments(source.segments),
       proxy: {
         enabled: Boolean(sourceProxy.enabled),
         protocol: String(sourceProxy.protocol || DEFAULTS.proxy.protocol),
@@ -49,5 +58,5 @@
     return cleaned;
   }
 
-  return { loadDefaults, saveDefaults, cleanDefaults };
+  return { loadDefaults, saveDefaults, cleanDefaults, cleanSegments };
 });

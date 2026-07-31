@@ -536,3 +536,18 @@ test('manually stopped native host stops polling and closes its session', async 
   assert.equal(background.isBadgeSyncRunning(), false);
   assert.equal(closeCalls, 1);
 });
+
+test('download segment count must be an integer from one through eight', () => {
+  const fake = makeFakeBrowser();
+  const background = createBackground(fake.browser, { timers: false });
+  const base = {
+    filename: 'file.bin',
+    targetDir: 'C:\\Downloads',
+    proxy: { enabled: false }
+  };
+  assert.equal(background.validateForm({ ...base, segments: 1 }), null);
+  assert.equal(background.validateForm({ ...base, segments: 8 }), null);
+  assert.match(background.validateForm({ ...base, segments: 0 }), /1 至 8/);
+  assert.match(background.validateForm({ ...base, segments: 9 }), /1 至 8/);
+  assert.match(background.validateForm({ ...base, segments: 2.5 }), /整數/);
+});

@@ -93,6 +93,9 @@
     if (!form || typeof form !== 'object') return '下載設定無效';
     if (!String(form.filename || '').trim()) return '下載名稱不可為空';
     if (!pathIsAbsolute(String(form.targetDir || '').trim())) return '下載目錄必須是 Windows 絕對路徑';
+    const segments = form.segments === undefined ? 4 : Number(form.segments);
+    if (!Number.isInteger(segments)) return '下載線程數量必須是整數';
+    if (segments < 1 || segments > 8) return '下載線程數量必須介乎 1 至 8';
     const proxy = form.proxy || {};
     if (!proxy.enabled) return null;
     if (!['http', 'https', 'socks5', 'socks5h'].includes(String(proxy.protocol))) {
@@ -561,6 +564,7 @@
     handleRuntimeMessage,
     sendNativeWithRetry,
     refreshTaskStatus,
+    validateForm,
     isBadgeSyncRunning: () => badgeSyncRunning
   };
 });

@@ -42,6 +42,12 @@ h1 { margin: .35rem 0 .75rem; }
 
 label, legend { font-weight: 600; }
 label { display: block; margin: 1rem 0; }
+label small {
+  display: block;
+  margin-top: .35rem;
+  color: GrayText;
+  font-weight: 400;
+}
 
 input, select, button {
   box-sizing: border-box;
