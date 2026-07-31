@@ -1,74 +1,76 @@
 # Curl Downloader
 
-Curl Downloader 是一個 Windows portable 下載器，使用內置或 PATH 中可用的 curl，支援多段下載、續傳、Proxy 及任務狀態管理。發行目錄只包含一份 `CurlDownloader.exe`；Firefox Native Messaging host 由同一份 EXE 以 stdio 模式執行，不會另帶 helper EXE。
+**English** | [繁體中文](README.zh-Hant.md)
+
+Curl Downloader is a portable download manager for Windows. It uses either the bundled curl or a usable curl found on `PATH`, with support for segmented downloads, resuming, per-task proxy settings, and task status management. The release directory contains only one `CurlDownloader.exe`; the same executable runs as the Firefox Native Messaging host in stdio mode, with no separate helper executable.
 
 ## Build
 
-使用 Rust 1.97.1 建立 MSVC 版本：
+Build the MSVC version with Rust 1.97.1:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\build-release.ps1
 ```
 
-沒有 Visual Studio linker 時可使用 GNU fallback：
+If the Visual Studio linker is unavailable, use the GNU fallback:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\build-release-gnu.ps1
 ```
 
-成功後 `dist\` 會驗證並只輸出 `CurlDownloader.exe`。建置時會把 `assets\curl-downloader.ico` 嵌入 EXE，系統匣及 EXE 使用相同 Cyberpunk 圖示。
+After a successful build, `dist\` is validated and contains only `CurlDownloader.exe`. The build embeds `assets\curl-downloader.ico` into the executable, so the system tray and executable use the same Cyberpunk icon.
 
 ## Use
 
-輸入 HTTP/HTTPS URL 後建立任務，在任務設定中確認檔名、Windows 絕對下載目錄、分段數及 Proxy，再開始下載。任務卡會顯示進度、速度、ETA、狀態及錯誤；完成任務可開啟檔案或資料夾。程式最小化時會留在 Windows 系統匣，雙擊系統匣 Cyber 圖示可還原視窗。
+Enter an HTTP/HTTPS URL to create a task. Before starting the download, confirm the file name, absolute Windows download directory, segment count, and proxy settings. Task cards show progress, speed, ETA, status, and errors; completed tasks can open the downloaded file or its folder. When minimized, the application remains in the Windows system tray. Double-click the Cyber tray icon to restore the window.
 
-Windows 下載只會在背景啟動隱藏的 curl 子程序，不會顯示 CMD 視窗。
+On Windows, downloads start only hidden curl child processes in the background and do not display CMD windows.
 
-### 任務詳情與分段歷史
+### Task details and segment history
 
-任務詳情只保留兩個真正頁籤：「任務總覽」及「分段設定」。網址、檔名及完整儲存路徑會自動換行，並可直接選取及複製，不會以省略號截斷。已完成任務仍會顯示每一段的位元組範圍、大小、已下載量、狀態、開始及完成時間、實際下載時間和平均速度；這些資料在重啟程式後仍保留。舊版本紀錄沒有的時間資料會顯示「未記錄」，不會自行估算。
+Task details contain only two actual tabs: **Task overview** and **Segment settings**. URLs, file names, and complete save paths wrap automatically and can be selected and copied directly instead of being truncated with ellipses. Completed tasks still show each segment's byte range, size, downloaded bytes, status, start and completion times, active download duration, and average speed. This information remains available after restarting the application. Timing data missing from records created by older versions is shown as **Not recorded** and is never estimated.
 
-從插件或主程式按「開啟檔案／開啟資料夾」時，程式會先重用相同的 Explorer 位置，再用 Windows Shell 開啟目標，並嘗試把實際目標視窗帶到最前。Windows 拒絕切換前景時，目標會閃爍提示，插件收到固定的 target_not_foreground 錯誤；Curl Downloader 自己的 GUI 不會因此被還原。
+When **Open file** or **Open folder** is selected from the extension or the main application, Curl Downloader first reuses an existing Explorer location, then opens the target through Windows Shell and attempts to bring the actual target window to the foreground. If Windows refuses the foreground switch, the target flashes for attention and the extension receives the stable `target_not_foreground` error. Curl Downloader's own GUI is not restored as a side effect.
 
-這些功能全部在同一份 CurlDownloader.exe 內執行，不使用 PowerShell、CMD、helper EXE、程序注入或遠端執行緒。Proxy 密碼只存在本次工作流程的記憶體及 pipe，不會寫入 `state.json` 或 extension storage。
+All these features run inside the same `CurlDownloader.exe`. They do not use PowerShell, CMD, helper executables, process injection, or remote threads. Proxy passwords exist only in memory and pipes for the current workflow; they are never written to `state.json` or extension storage.
 
 ## Firefox extension
 
-Firefox extension 會攔截 HTTP/HTTPS 下載，先暫停原生下載並開啟設定頁。設定頁可調整下載名稱、Windows 絕對目錄、Proxy 類型／主機／連接埠／帳號及本次密碼；「使用 Firefox」會恢復原生下載，「取消」會取消並清理原生下載。
+The Firefox extension intercepts HTTP/HTTPS downloads, pauses the native Firefox download, and opens a configuration page. The page can change the download name, absolute Windows directory, proxy type, host, port, account, and password for the current request. **Use Firefox** resumes the native download, while **Cancel** cancels and removes it.
 
-### 程式生命週期
+### Application lifecycle
 
-插件第一次需要主程式時，會啟動同一份 `CurlDownloader.exe`，以最小化及系統匣常駐方式運行；整個系統只維持一個 Curl Downloader 主程序。
+The first time the extension needs the main application, it starts the same `CurlDownloader.exe` minimized and resident in the system tray. The entire system keeps only one Curl Downloader main process.
 
-- 最小化或按主視窗的一般關閉按鈕：只會隱藏到系統匣，下載及 Native Messaging 背景控制器繼續運作。
-- 雙擊系統匣圖示：還原並把現有 GUI 帶到最前面，不會建立第二份 EXE。
-- 系統匣右鍵選擇「關閉」：先保存下載進度及續傳資料，再終止主程序。
-- popup、Badge 及狀態查詢屬於被動操作，不會因手動關閉而自動重啟 EXE。
-- 新下載、重試 Native host 或選擇目錄，屬於明確啟動操作，可以重新啟動同一份 EXE；開啟檔案／資料夾及查看任務則保持被動，不會越過手動關閉。
-- 手動再次雙擊 EXE：只會顯示已存在的程序，不會多開。
+- Minimizing or pressing the main window's standard close button only hides it in the system tray. Downloads and the Native Messaging background controller continue running.
+- Double-clicking the tray icon restores the existing GUI and brings it to the foreground without creating a second executable process.
+- Selecting **Close** from the tray icon's context menu saves download progress and resume data before terminating the main process.
+- Popup, badge, and status queries are passive operations and do not restart the executable after a manual shutdown.
+- A new download, retrying the Native host, or choosing a directory is an explicit start operation and may restart the same executable. Opening files or folders and viewing tasks remain passive and do not override a manual shutdown.
+- Double-clicking the executable manually while it is already running only displays the existing instance.
 
-正常使用流程（包括 Portable Firefox ESR）：
+Normal setup, including Portable Firefox ESR:
 
-1. 首次使用前直接啟動 `CurlDownloader.exe` 一次。GUI 啟動時會自動在 `HKCU\Software\Mozilla\NativeMessagingHosts\curl_downloader` 建立或更新 manifest，`path` 直接指向目前的 `CurlDownloader.exe`；不需要手動開啟 regedit。
-2. 在 Firefox `about:addons` 使用「從檔案安裝附加元件」載入 `curl-downloader.xpi`，並按需要允許私人視窗。
-3. 若設定頁顯示 Native host 未啟動或尚未註冊，啟動 `CurlDownloader.exe` 後按「重試 Curl Downloader」。
+1. Before first use, launch `CurlDownloader.exe` once. When the GUI starts, it automatically creates or updates the manifest under `HKCU\Software\Mozilla\NativeMessagingHosts\curl_downloader`, with `path` pointing directly to the current `CurlDownloader.exe`. You do not need to open Registry Editor manually.
+2. In Firefox `about:addons`, use **Install Add-on From File** to load `curl-downloader.xpi`, and allow it in private windows if required.
+3. If the configuration page reports that the Native host is not running or registered, start `CurlDownloader.exe` and select **Retry Curl Downloader**.
 
-Native Messaging 會在需要時建立一條可重用的 `connectNative` 長連線；有下載或 popup 開啟時快速同步，閒置後自動釋放連線。設定頁首次載入及重新點擊插件圖示會以系統匣模式啟動同一份 EXE。若 GUI 被系統匣右鍵手動關閉，插件會收到「已手動關閉」狀態；目前開啟的 popup 只會保持關閉狀態，關閉 popup 後再次點擊插件才會重新啟動。
+Native Messaging creates a reusable long-lived `connectNative` connection when needed. It synchronizes quickly while downloads are active or the popup is open, then releases the connection automatically after becoming idle. The first load of the configuration page and clicking the extension icon again start the same executable in tray mode. If the GUI is closed manually from the tray context menu, the extension receives a **manually closed** state. The currently open popup keeps the application closed; close the popup and click the extension again to restart it.
 
-插件圖示會顯示 Cyber 進度環及 Badge，例如 `68%/3` 代表三個進行中任務的加權整體進度；總大小未知時顯示 `—/3`。有活動任務時約每 500ms 同步；popup 開啟時約每 200ms 更新，沒有活動任務且 popup 關閉時停止背景同步。
+The extension icon displays a Cyber progress ring and badge. For example, `68%/3` represents the weighted overall progress of three active tasks; `—/3` is shown when their total size is unknown. Synchronization runs approximately every 500 ms while tasks are active, approximately every 200 ms while the popup is open, and stops in the background when there are no active tasks and the popup is closed.
 
-點擊工具列圖示可查看所有進行中任務及最近完成的 10 筆。任務卡支援「開啟檔案」、「開啟資料夾」及點擊任務跳轉到 Curl Downloader 詳細畫面。
+Click the toolbar icon to view all active tasks and the 10 most recently completed tasks. Task cards support **Open file**, **Open folder**, and clicking the task to open its detail view in Curl Downloader.
 
-Portable Firefox 的 Native host 仍由 Firefox 的 per-user HKCU 發現機制管理，不需要把 manifest 複製到 Portable Firefox 目錄。若 Firefox 先顯示原生儲存位置對話框，請在同一個 Portable Firefox profile 的下載設定中關閉「總是詢問儲存檔案的位置」，或確認 `browser.download.useDownloadDir` 為 `true`。
+Portable Firefox still discovers the Native host through Firefox's per-user HKCU mechanism. The manifest does not need to be copied into the Portable Firefox directory. If Firefox first displays its native save-location dialog, disable **Always ask you where to save files** in that Portable Firefox profile, or confirm that `browser.download.useDownloadDir` is `true`.
 
-如需手動修復註冊：
+To repair the registration manually:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\install-firefox-native-host.ps1 `
   -ExecutablePath "$PWD\dist\CurlDownloader.exe"
 ```
 
-卸載本工具建立的 per-user registry key 及 manifest：
+To remove the per-user Registry key and manifest created by this tool:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\install-firefox-native-host.ps1 `
@@ -77,21 +79,21 @@ powershell -ExecutionPolicy Bypass -File scripts\install-firefox-native-host.ps1
 
 ## Portable package
 
-先建立 `dist\CurlDownloader.exe` 及 `dist\curl-downloader.xpi`，再執行：
+First build `dist\CurlDownloader.exe` and `dist\curl-downloader.xpi`, then run:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\package-portable.ps1 `
   -OutputDirectory "$PWD\dist\CurlDownloaderPortable"
 ```
 
-portable 目錄只包含 `CurlDownloader.exe`、`curl-downloader.xpi` 及 `portable.flag`，不會附帶第二個 Native host EXE、註冊腳本或啟動腳本；狀態會保存到 portable 目錄內的 `data\state.json`。雙擊同一份 EXE 即可啟動 GUI／系統匣，GUI 會自動在 HKCU 建立 Native Messaging manifest。Firefox Native Messaging 的 per-user HKCU 發現機制是平台要求；extension 本身不會直接寫 Registry。
+The portable directory contains only `CurlDownloader.exe`, `curl-downloader.xpi`, and `portable.flag`. It does not include a second Native host executable, registration script, or launcher script. State is stored in `data\state.json` inside the portable directory. Double-click the same executable to start the GUI and tray process; the GUI automatically creates the Native Messaging manifest in HKCU. Firefox Native Messaging's per-user HKCU discovery mechanism is a platform requirement. The extension itself never writes to the Registry directly.
 
 ## Data locations
 
-- 一般模式：`%APPDATA%\CurlDownloader\state.json`
-- Portable 模式：portable 目錄內的 `data\state.json`
-- 下載部分檔：目的地內的 `.curl-downloader` 目錄
+- Standard mode: `%APPDATA%\CurlDownloader\state.json`
+- Portable mode: `data\state.json` inside the portable directory
+- Partial download files: the `.curl-downloader` directory inside the destination
 
 ## Security software warning
 
-未簽署的新 Windows EXE 可能被企業防毒軟件以「新發現程式」攔截；如需消除提示，請由管理員加入白名單或使用有效程式碼簽署憑證。程式不要求系統管理員權限。
+New, unsigned Windows executables may be blocked by enterprise antivirus software as newly encountered programs. To remove this warning, ask an administrator to allowlist the application or sign it with a valid code-signing certificate. The application does not require administrator privileges.
