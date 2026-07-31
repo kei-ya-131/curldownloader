@@ -108,18 +108,39 @@ fn url_detail_wrap_mode(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum InspectorColumns {
-    One,
-    Two,
+enum OverviewCard {
+    Progress,
+    Basic,
+    Storage,
+    Proxy,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OverviewLayout {
+    TwoColumn {
+        left: [OverviewCard; 2],
+        right: [OverviewCard; 1],
+        below: [OverviewCard; 1],
+    },
+    OneColumn([OverviewCard; 4]),
 }
 
 const INSPECTOR_TWO_COLUMN_MIN_WIDTH: f32 = 720.0;
 
-fn inspector_columns(width: f32) -> InspectorColumns {
+fn overview_layout(width: f32) -> OverviewLayout {
     if width >= INSPECTOR_TWO_COLUMN_MIN_WIDTH {
-        InspectorColumns::Two
+        OverviewLayout::TwoColumn {
+            left: [OverviewCard::Progress, OverviewCard::Storage],
+            right: [OverviewCard::Basic],
+            below: [OverviewCard::Proxy],
+        }
     } else {
-        InspectorColumns::One
+        OverviewLayout::OneColumn([
+            OverviewCard::Progress,
+            OverviewCard::Basic,
+            OverviewCard::Storage,
+            OverviewCard::Proxy,
+        ])
     }
 }
 
@@ -1085,150 +1106,23 @@ impl CurlDownloaderApp {
                             TaskStatus::Queued | TaskStatus::Paused | TaskStatus::Failed
                         );
 
-                        show_overview_cards(ui, &task, &mut self.expanded_url);
-                        ui.add_space(12.0);
-
                         if let Some(draft) = self.draft.as_mut() {
-                            let mut changed = false;
-                            card_frame(ui).show(ui, |ui| {
-                                ui.heading("儲存位置");
-                                ui.label("來源 URL");
-                                changed |= ui
-                                    .add_enabled(
-                                        can_edit,
-                                        egui::TextEdit::singleline(&mut draft.url),
-                                    )
-                                    .changed();
-                                ui.label("檔名");
-                                changed |= ui
-                                    .add_enabled(
-                                        can_edit,
-                                        egui::TextEdit::singleline(&mut draft.filename),
-                                    )
-                                    .changed();
-                                ui.horizontal(|ui| {
-                                    ui.label("資料夾");
-                                    let response = ui.add_enabled(
-                                        can_edit,
-                                        egui::TextEdit::singleline(&mut draft.target_dir_input),
-                                    );
-                                    if response.lost_focus() {
-                                        let path = PathBuf::from(draft.target_dir_input.trim());
-                                        if path.is_dir() {
-                                            draft.target_dir = path.clone();
-                                            pending_last_dir = Some(path);
-                                            changed = true;
-                                        } else {
-                                            pending_error = Some("下載目錄不存在".into());
-                                        }
-                                    }
-                                    if ui
-                                        .add_enabled(can_edit, egui::Button::new("瀏覽…"))
-                                        .clicked()
-                                    {
-                                        if let Some(path) = rfd::FileDialog::new()
-                                            .set_directory(&draft.target_dir)
-                                            .pick_folder()
-                                        {
-                                            draft.target_dir_input = path.display().to_string();
-                                            draft.target_dir = path.clone();
-                                            pending_last_dir = Some(path);
-                                            changed = true;
-                                        }
-                                    }
-                                });
-                                ui.weak("下載完成後，檔案會保存於此位置。");
-                            });
-                            ui.add_space(12.0);
-                            card_frame(ui).show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.heading("Proxy 設定");
-                                    ui.weak("只套用於此任務的下載連線");
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| {
-                                            ui.add_enabled(
-                                                can_edit,
-                                                egui::Checkbox::new(
-                                                    &mut draft.proxy.enabled,
-                                                    "啟用 Proxy",
-                                                ),
-                                            );
-                                        },
-                                    );
-                                });
-                                ui.add_enabled_ui(can_edit, |ui| {
-                                    ui.horizontal_wrapped(|ui| {
-                                        ui.label("協定");
-                                        egui::ComboBox::from_id_salt("proxy-protocol")
-                                            .selected_text(draft.proxy.protocol.scheme())
-                                            .show_ui(ui, |ui| {
-                                                for protocol in [
-                                                    ProxyProtocol::Http,
-                                                    ProxyProtocol::Https,
-                                                    ProxyProtocol::Socks5,
-                                                    ProxyProtocol::Socks5h,
-                                                ] {
-                                                    changed |= ui
-                                                        .selectable_value(
-                                                            &mut draft.proxy.protocol,
-                                                            protocol,
-                                                            protocol.scheme(),
-                                                        )
-                                                        .changed();
-                                                }
-                                            });
-                                        ui.label("主機");
-                                        changed |= ui
-                                            .text_edit_singleline(&mut draft.proxy.host)
-                                            .changed();
-                                        ui.label("連接埠");
-                                        changed |= ui
-                                            .add(
-                                                egui::DragValue::new(&mut draft.proxy.port)
-                                                    .range(1..=65535),
-                                            )
-                                            .changed();
-                                    });
-                                });
-                                if can_edit || needs_password {
-                                    ui.horizontal_wrapped(|ui| {
-                                        ui.label("帳號");
-                                        if can_edit {
-                                            changed |= ui
-                                                .text_edit_singleline(&mut draft.proxy.username)
-                                                .changed();
-                                        } else {
-                                            ui.label(&draft.proxy.username);
-                                        }
-                                        ui.label("密碼");
-                                        let response = ui.add(
-                                            egui::TextEdit::singleline(&mut draft.password_input)
-                                                .password(!draft.show_password),
-                                        );
-                                        draft.show_password = response.is_pointer_button_down_on();
-                                        if can_edit {
-                                            changed |= response.changed();
-                                        }
-                                    });
-                                }
-                                if !can_edit && !needs_password {
-                                    ui.weak("下載已開始，檔名、位置及 Proxy 設定已鎖定。");
-                                }
-                                if needs_password {
-                                    ui.label("此任務需要 Proxy 密碼才能繼續。");
-                                    if ui.button("設定密碼並開始").clicked()
-                                        && !draft.password_input.is_empty()
-                                    {
-                                        pending_password =
-                                            Some((draft.id, draft.password_input.clone()));
-                                        draft.password_input.clear();
-                                    }
-                                }
-                            });
-                            if !needs_password && changed {
-                                pending_update = Some(draft.clone());
-                            }
+                            let overview = show_task_overview(
+                                ui,
+                                &task,
+                                draft,
+                                &mut self.expanded_url,
+                                can_edit,
+                                needs_password,
+                            );
+                            pending_update = if overview.changed {
+                                Some(draft.clone())
+                            } else {
+                                None
+                            };
+                            pending_last_dir = overview.last_download_dir;
+                            pending_password = overview.password;
+                            pending_error = overview.error;
                         }
 
                         if let Some(error) = &task.error {
@@ -1410,24 +1304,215 @@ fn status_color(ui: &egui::Ui, status: TaskStatus) -> egui::Color32 {
     }
 }
 
-fn show_overview_cards(
+#[derive(Default)]
+struct StorageCardOutcome {
+    changed: bool,
+    last_download_dir: Option<PathBuf>,
+    error: Option<String>,
+}
+
+#[derive(Default)]
+struct ProxyCardOutcome {
+    changed: bool,
+    password: Option<(TaskId, String)>,
+}
+
+#[derive(Default)]
+struct OverviewEditOutcome {
+    changed: bool,
+    last_download_dir: Option<PathBuf>,
+    password: Option<(TaskId, String)>,
+    error: Option<String>,
+}
+
+impl OverviewEditOutcome {
+    fn merge_storage(&mut self, outcome: StorageCardOutcome) {
+        self.changed |= outcome.changed;
+        self.last_download_dir = outcome.last_download_dir;
+        self.error = outcome.error;
+    }
+
+    fn merge_proxy(&mut self, outcome: ProxyCardOutcome) {
+        self.changed |= outcome.changed;
+        self.password = outcome.password;
+    }
+}
+
+fn show_task_overview(
     ui: &mut egui::Ui,
     task: &TaskSnapshot,
+    draft: &mut TaskDraft,
     expanded_url: &mut Option<ExpandedUrlKey>,
-) {
-    match inspector_columns(ui.available_width()) {
-        InspectorColumns::Two => {
+    can_edit: bool,
+    needs_password: bool,
+) -> OverviewEditOutcome {
+    let mut outcome = OverviewEditOutcome::default();
+    match overview_layout(ui.available_width()) {
+        OverviewLayout::TwoColumn { .. } => {
+            let mut storage = StorageCardOutcome::default();
             ui.columns(2, |columns| {
                 show_progress_card(&mut columns[0], task);
+                columns[0].add_space(12.0);
+                storage = show_storage_card(&mut columns[0], draft, can_edit);
                 show_basic_info_card(&mut columns[1], task, expanded_url);
             });
+            ui.add_space(12.0);
+            let proxy = show_proxy_card(ui, draft, can_edit, needs_password);
+            outcome.merge_storage(storage);
+            outcome.merge_proxy(proxy);
         }
-        InspectorColumns::One => {
+        OverviewLayout::OneColumn(_) => {
             show_progress_card(ui, task);
             ui.add_space(12.0);
             show_basic_info_card(ui, task, expanded_url);
+            ui.add_space(12.0);
+            let storage = show_storage_card(ui, draft, can_edit);
+            ui.add_space(12.0);
+            let proxy = show_proxy_card(ui, draft, can_edit, needs_password);
+            outcome.merge_storage(storage);
+            outcome.merge_proxy(proxy);
         }
     }
+    outcome
+}
+
+fn show_storage_card(
+    ui: &mut egui::Ui,
+    draft: &mut TaskDraft,
+    can_edit: bool,
+) -> StorageCardOutcome {
+    let mut changed = false;
+    let mut last_download_dir = None;
+    let mut error = None;
+    card_frame(ui).show(ui, |ui| {
+        ui.heading("儲存位置");
+        ui.label("來源 URL");
+        changed |= ui
+            .add_enabled(can_edit, egui::TextEdit::singleline(&mut draft.url))
+            .changed();
+        ui.label("檔名");
+        changed |= ui
+            .add_enabled(can_edit, egui::TextEdit::singleline(&mut draft.filename))
+            .changed();
+        ui.horizontal(|ui| {
+            ui.label("資料夾");
+            let response = ui.add_enabled(
+                can_edit,
+                egui::TextEdit::singleline(&mut draft.target_dir_input),
+            );
+            if response.lost_focus() {
+                let path = PathBuf::from(draft.target_dir_input.trim());
+                if path.is_dir() {
+                    draft.target_dir = path.clone();
+                    last_download_dir = Some(path);
+                    changed = true;
+                } else {
+                    error = Some("下載目錄不存在".into());
+                }
+            }
+            if ui
+                .add_enabled(can_edit, egui::Button::new("瀏覽…"))
+                .clicked()
+            {
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_directory(&draft.target_dir)
+                    .pick_folder()
+                {
+                    draft.target_dir_input = path.display().to_string();
+                    draft.target_dir = path.clone();
+                    last_download_dir = Some(path);
+                    changed = true;
+                }
+            }
+        });
+        ui.weak("下載完成後，檔案會保存於此位置。");
+    });
+    StorageCardOutcome {
+        changed,
+        last_download_dir,
+        error,
+    }
+}
+
+fn show_proxy_card(
+    ui: &mut egui::Ui,
+    draft: &mut TaskDraft,
+    can_edit: bool,
+    needs_password: bool,
+) -> ProxyCardOutcome {
+    let mut changed = false;
+    let mut password = None;
+    card_frame(ui).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.heading("Proxy 設定");
+            ui.weak("只套用於此任務的下載連線");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_enabled(
+                    can_edit,
+                    egui::Checkbox::new(&mut draft.proxy.enabled, "啟用 Proxy"),
+                );
+            });
+        });
+        ui.add_enabled_ui(can_edit, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("協定");
+                egui::ComboBox::from_id_salt("proxy-protocol")
+                    .selected_text(draft.proxy.protocol.scheme())
+                    .show_ui(ui, |ui| {
+                        for protocol in [
+                            ProxyProtocol::Http,
+                            ProxyProtocol::Https,
+                            ProxyProtocol::Socks5,
+                            ProxyProtocol::Socks5h,
+                        ] {
+                            changed |= ui
+                                .selectable_value(
+                                    &mut draft.proxy.protocol,
+                                    protocol,
+                                    protocol.scheme(),
+                                )
+                                .changed();
+                        }
+                    });
+                ui.label("主機");
+                changed |= ui.text_edit_singleline(&mut draft.proxy.host).changed();
+                ui.label("連接埠");
+                changed |= ui
+                    .add(egui::DragValue::new(&mut draft.proxy.port).range(1..=65535))
+                    .changed();
+            });
+        });
+        if can_edit || needs_password {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("帳號");
+                if can_edit {
+                    changed |= ui.text_edit_singleline(&mut draft.proxy.username).changed();
+                } else {
+                    ui.label(&draft.proxy.username);
+                }
+                ui.label("密碼");
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut draft.password_input)
+                        .password(!draft.show_password),
+                );
+                draft.show_password = response.is_pointer_button_down_on();
+                if can_edit {
+                    changed |= response.changed();
+                }
+            });
+        }
+        if !can_edit && !needs_password {
+            ui.weak("下載已開始，檔名、位置及 Proxy 設定已鎖定。");
+        }
+        if needs_password {
+            ui.label("此任務需要 Proxy 密碼才能繼續。");
+            if ui.button("設定密碼並開始").clicked() && !draft.password_input.is_empty() {
+                password = Some((draft.id, draft.password_input.clone()));
+                draft.password_input.clear();
+            }
+        }
+    });
+    ProxyCardOutcome { changed, password }
 }
 
 fn show_segment_history(ui: &mut egui::Ui, task: &TaskSnapshot) {
@@ -1971,9 +2056,28 @@ mod tests {
     }
 
     #[test]
-    fn inspector_switches_to_one_column_when_the_panel_is_narrow() {
-        assert_eq!(inspector_columns(720.0), InspectorColumns::Two);
-        assert_eq!(inspector_columns(719.9), InspectorColumns::One);
+    fn wide_overview_uses_fixed_semantic_columns() {
+        assert_eq!(
+            overview_layout(720.0),
+            OverviewLayout::TwoColumn {
+                left: [OverviewCard::Progress, OverviewCard::Storage],
+                right: [OverviewCard::Basic],
+                below: [OverviewCard::Proxy],
+            }
+        );
+    }
+
+    #[test]
+    fn narrow_overview_uses_stable_single_column_order() {
+        assert_eq!(
+            overview_layout(719.9),
+            OverviewLayout::OneColumn([
+                OverviewCard::Progress,
+                OverviewCard::Basic,
+                OverviewCard::Storage,
+                OverviewCard::Proxy,
+            ])
+        );
     }
     #[test]
     fn url_detail_is_collapsed_by_default_and_toggles_on_click() {
