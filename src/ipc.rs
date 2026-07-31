@@ -94,6 +94,20 @@ fn wire_status_name(status: TaskStatus) -> &'static str {
     }
 }
 
+const DEFAULT_REQUESTED_SEGMENTS: u8 = 4;
+
+fn default_requested_segments() -> u8 {
+    DEFAULT_REQUESTED_SEGMENTS
+}
+
+fn validate_requested_segments(value: u8) -> Result<u8, String> {
+    if (1..=8).contains(&value) {
+        Ok(value)
+    } else {
+        Err("下載線程數量必須介乎 1 至 8".into())
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum IpcRequest {
@@ -132,6 +146,8 @@ pub enum IpcRequest {
         url: String,
         filename: String,
         target_dir: String,
+        #[serde(default = "default_requested_segments")]
+        requested_segments: u8,
         proxy: WireProxy,
     },
 }
@@ -597,8 +613,13 @@ fn dispatch_request(
             url,
             filename,
             target_dir,
+            requested_segments,
             proxy,
         } => {
+            let requested_segments = match validate_requested_segments(requested_segments) {
+                Ok(value) => value,
+                Err(message) => return enqueue_error(request_id, "invalid_task", &message),
+            };
             let proxy = match proxy.into_proxy_settings() {
                 Ok(proxy) => proxy,
                 Err(message) => {
@@ -621,7 +642,7 @@ fn dispatch_request(
                         url,
                         filename,
                         target_dir: target_dir.clone(),
-                        requested_segments: 4,
+                        requested_segments,
                         proxy,
                     },
                     response: response_tx,
@@ -872,6 +893,34 @@ fn pipe_name_wide() -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_enqueue_without_segments_defaults_to_four() {
+        let request: IpcRequest = serde_json::from_value(serde_json::json!({
+            "type": "enqueue",
+            "request_id": "legacy",
+            "url": "https://example.test/file.bin",
+            "filename": "file.bin",
+            "target_dir": "C:\\Downloads",
+            "proxy": WireProxy::direct()
+        }))
+        .unwrap();
+        let IpcRequest::Enqueue {
+            requested_segments, ..
+        } = request
+        else {
+            panic!("expected enqueue request");
+        };
+        assert_eq!(requested_segments, 4);
+    }
+
+    #[test]
+    fn requested_segments_accepts_only_one_through_eight() {
+        assert_eq!(validate_requested_segments(1), Ok(1));
+        assert_eq!(validate_requested_segments(8), Ok(8));
+        assert!(validate_requested_segments(0).is_err());
+        assert!(validate_requested_segments(9).is_err());
+    }
     #[test]
     fn pipe_retry_can_be_cancelled_before_opening_another_host_connection() {
         let request = IpcRequest::Ping {

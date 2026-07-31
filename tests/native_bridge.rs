@@ -44,6 +44,7 @@ fn pipe_enqueue_reaches_the_single_download_engine() {
         url: format!("{}/bridge.bin", server.base_url),
         filename: "from-firefox.bin".into(),
         target_dir: target.to_string_lossy().into_owned(),
+        requested_segments: 8,
         proxy: WireProxy::direct(),
     };
     let response = curl_downloader::ipc::call_pipe(&request, Duration::from_secs(5)).unwrap();
@@ -58,10 +59,33 @@ fn pipe_enqueue_reaches_the_single_download_engine() {
 
     let completed = harness.wait_for(id, TaskStatus::Completed, Duration::from_secs(60));
     assert_eq!(*defaults.lock().unwrap(), target);
+    assert_eq!(completed.requested_segments, 8);
+    assert_eq!(completed.actual_segments, 1);
     assert_eq!(
         std::fs::read(completed.target_dir.join("from-firefox.bin")).unwrap(),
         b"bridge payload"
     );
+
+    let invalid_response = curl_downloader::ipc::call_pipe(
+        &IpcRequest::Enqueue {
+            request_id: "invalid-segments".into(),
+            url: format!("{}/bridge.bin", server.base_url),
+            filename: "invalid.bin".into(),
+            target_dir: target.to_string_lossy().into_owned(),
+            requested_segments: 9,
+            proxy: WireProxy::direct(),
+        },
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    assert!(matches!(
+        invalid_response,
+        IpcResponse::EnqueueResult {
+            ok: false,
+            error: Some(ref error),
+            ..
+        } if error.code == "invalid_task"
+    ));
 
     stop.store(true, Ordering::Release);
     let _ = pipe.join();
