@@ -97,8 +97,11 @@
 
     const main = documentApi.createElement('div');
     main.className = 'task-main';
+    const filename = String(task.filename || '未命名下載');
+    const filenameElement = textElement(documentApi, 'strong', 'filename', filename);
+    filenameElement.setAttribute('title', filename);
     main.append(
-      textElement(documentApi, 'strong', 'filename', task.filename || '未命名下載'),
+      filenameElement,
       textElement(documentApi, 'span', 'status', statusLabel(task.status))
     );
     card.append(main);

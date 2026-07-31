@@ -1,5 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
 const { formatBytes, formatProgress, statusLabel, splitTasks, popupRefreshRequest, renderTask, REFRESH_INTERVAL_MS } = require('../popup.js');
 test('popup sends one explicit start intent and later passive refreshes', () => {
   assert.deepEqual(popupRefreshRequest(1234), {
@@ -11,6 +13,15 @@ test('popup sends one explicit start intent and later passive refreshes', () => 
 });
 test('refreshes task summaries frequently enough for fast downloads', () => {
   assert.ok(REFRESH_INTERVAL_MS <= 250);
+});
+
+test('long task filenames cannot expand the popup card', () => {
+  const css = fs.readFileSync(path.join(__dirname, '..', 'popup.css'), 'utf8');
+  assert.match(css, /\.task-list\s*\{[^}]*min-width:\s*0/s);
+  assert.match(css, /\.task-card\s*\{[^}]*min-width:\s*0/s);
+  assert.match(css, /\.task-main\s*\{[^}]*min-width:\s*0/s);
+  assert.match(css, /\.filename\s*\{[^}]*flex:\s*1 1 auto/s);
+  assert.match(css, /\.filename\s*\{[^}]*text-overflow:\s*ellipsis/s);
 });
 
 test('formats task summary values for the popup', () => {
@@ -55,9 +66,29 @@ function fakeElement() {
         ? this.listeners.click({ stopPropagation() {} })
         : undefined;
     },
-    setAttribute() {}
+    setAttribute(name, value) {
+      this.attributes = this.attributes || {};
+      this.attributes[name] = value;
+    }
   };
 }
+
+test('ellipsized filename keeps the complete name as a tooltip', () => {
+  const documentApi = { createElement: () => fakeElement() };
+  const filename = 'Qwen3.5-9B-The-Defiant-Fable-Uncnr-Heretic-NEO-MAX-IQ3_M.gguf';
+  const card = renderTask(documentApi, {
+    task_id: 9,
+    filename,
+    status: 'downloading',
+    downloaded: 1,
+    total_size: 2,
+    target_dir: 'D:\\\\llama\\\\models',
+    file_available: false,
+    folder_available: true
+  }, async () => ({ ok: true }), () => {});
+  const filenameElement = card.children[0].children[0];
+  assert.equal(filenameElement.attributes.title, filename);
+});
 
 test('open action button ignores duplicate clicks while its request is pending', async () => {
   const documentApi = { createElement: () => fakeElement() };
