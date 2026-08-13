@@ -871,6 +871,11 @@ impl Engine {
         let Some(task) = self.task(id).cloned() else {
             return Err("找不到下載任務".into());
         };
+        if decision == FileDecision::Cancel && task.status == TaskStatus::Cancelled {
+            self.persist().map_err(|error| error.to_string())?;
+            self.publish_snapshot();
+            return Ok(());
+        }
         if task.status != TaskStatus::AwaitingFileDecision {
             return Err("此任務目前沒有待處理的檔案衝突".into());
         }
@@ -980,7 +985,9 @@ impl Engine {
             return Err("下載已完成，不能取消。".to_owned());
         }
         if status == TaskStatus::Cancelled {
-            return Ok(());
+            return self
+                .persist()
+                .map_err(|error| format!("取消任務後無法保存狀態：{error}"));
         }
         self.stop_task_jobs(id);
         self.queue.retain(|queued| *queued != id);

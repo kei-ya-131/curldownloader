@@ -344,6 +344,93 @@ test('supported download pauses and opens one settings tab', async () => {
   assert.match(fake.calls.tabs[0].url, /settings\.html\?downloadId=1$/);
 });
 
+test('closing settings after an enqueue timeout does not restore Firefox blindly', async () => {
+  const fake = makeFakeBrowser({
+    nativeResponse: (message) => message.type === 'enqueue'
+      ? { type: 'enqueue_result', ok: false, error: { code: 'engine_timeout' } }
+      : { type: 'task_list', tasks: [] }
+  });
+  const background = createBackground(fake.browser, { attempts: 1, delayMs: 0 });
+  const created = await background.handleCreatedDownload({
+    id: 4,
+    url: 'https://example.test/file.zip',
+    filename: 'file.zip'
+  });
+  const result = await background.submitExternalDownload(4, {
+    filename: 'file.zip',
+    targetDir: 'C:\\Downloads',
+    proxy: { enabled: false }
+  });
+  assert.equal(result.code, 'enqueue_pending');
+  fake.events.removed(created.tabId);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(fake.calls.resume, []);
+  assert.deepEqual(fake.calls.download, []);
+  const pending = await background.handleRuntimeMessage({ type: 'get-pending', downloadId: 4 });
+  assert.equal(pending.ok, true);
+  assert.ok(fake.calls.notifications.some((item) => item.message.includes('尚未確認')));
+});
+
+test('a failed retry after enqueue timeout keeps Firefox handoff pending', async () => {
+  let enqueueAttempts = 0;
+  const fake = makeFakeBrowser({
+    nativeResponse: (message) => {
+      if (message.type === 'enqueue') {
+        enqueueAttempts += 1;
+        return enqueueAttempts === 1
+          ? { type: 'enqueue_result', ok: false, error: { code: 'engine_timeout' } }
+          : { type: 'error', error: { code: 'native_unavailable', message: '暫時無法連線' } };
+      }
+      return { type: 'task_list', tasks: [] };
+    }
+  });
+  const background = createBackground(fake.browser, { attempts: 1, delayMs: 0 });
+  await background.handleCreatedDownload({
+    id: 6,
+    url: 'https://example.test/file.zip',
+    filename: 'file.zip'
+  });
+  const form = {
+    filename: 'file.zip',
+    targetDir: 'C:\\Downloads',
+    proxy: { enabled: false }
+  };
+  const first = await background.submitExternalDownload(6, form);
+  assert.equal(first.code, 'enqueue_pending');
+  const second = await background.submitExternalDownload(6, form);
+  assert.equal(second.code, 'enqueue_pending');
+  assert.deepEqual(fake.calls.download, []);
+  const pending = await background.handleRuntimeMessage({ type: 'get-pending', downloadId: 6 });
+  assert.equal(pending.ok, true);
+});
+
+test('closing settings while enqueue is in flight does not race Firefox fallback', async () => {
+  const fake = makeFakeBrowser({
+    nativeDelayMs: 5,
+    nativeResponse: (message) => message.type === 'enqueue'
+      ? { type: 'enqueue_result', ok: true, task_id: 44, awaiting_file_decision: false }
+      : { type: 'task_list', tasks: [] }
+  });
+  const background = createBackground(fake.browser, { attempts: 1, delayMs: 0 });
+  const created = await background.handleCreatedDownload({
+    id: 5,
+    url: 'https://example.test/file.zip',
+    filename: 'file.zip'
+  });
+  const submit = background.submitExternalDownload(5, {
+    filename: 'file.zip',
+    targetDir: 'C:\\Downloads',
+    proxy: { enabled: false }
+  });
+  fake.events.removed(created.tabId);
+  const result = await submit;
+  assert.equal(result.ok, true);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(fake.calls.download, []);
+  const pending = await background.handleRuntimeMessage({ type: 'get-pending', downloadId: 5 });
+  assert.equal(pending.ok, false);
+});
+
 test('Native host failure resumes the original Firefox download', async () => {
   const fake = makeFakeBrowser({ nativeDisconnect: true });
   const background = createBackground(fake.browser, { attempts: 1, delayMs: 0 });
