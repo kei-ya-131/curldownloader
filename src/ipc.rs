@@ -1,8 +1,8 @@
 use crate::{
     controller::{ControllerCommand, SharedControllerState},
     model::{
-        ConfiguredTask, EngineCommand, ProxyProtocol, ProxySettings, TaskId, TaskSnapshot,
-        TaskStatus,
+        ConfiguredTask, EngineCommand, FileDecision, ProxyProtocol, ProxySettings, TaskId,
+        TaskOrigin, TaskSnapshot, TaskStatus,
     },
     shell_foreground::{self, OpenTargetOutcome},
 };
@@ -26,6 +26,7 @@ const TEST_SHUTDOWN_MANUAL_ENV: &str = "CURL_DOWNLOADER_TEST_SHUTDOWN_MANUAL";
 pub struct WireTaskSummary {
     pub task_id: TaskId,
     pub filename: String,
+    pub origin: String,
     pub status: String,
     pub downloaded: u64,
     pub total_size: Option<u64>,
@@ -67,6 +68,7 @@ fn task_summary(task: &TaskSnapshot) -> WireTaskSummary {
     WireTaskSummary {
         task_id: task.id,
         filename: task.filename.clone(),
+        origin: wire_origin_name(task.origin).into(),
         status: wire_status_name(task.status).into(),
         downloaded: task.downloaded,
         total_size: task.total_size,
@@ -87,10 +89,18 @@ fn wire_status_name(status: TaskStatus) -> &'static str {
         TaskStatus::Pausing => "pausing",
         TaskStatus::Paused => "paused",
         TaskStatus::NeedsProxyPassword => "needs_proxy_password",
+        TaskStatus::AwaitingFileDecision => "awaiting_file_decision",
         TaskStatus::Finalizing => "finalizing",
         TaskStatus::Completed => "completed",
         TaskStatus::Failed => "failed",
         TaskStatus::Cancelled => "cancelled",
+    }
+}
+
+fn wire_origin_name(origin: TaskOrigin) -> &'static str {
+    match origin {
+        TaskOrigin::Gui => "gui",
+        TaskOrigin::Firefox => "firefox",
     }
 }
 
@@ -150,6 +160,11 @@ pub enum IpcRequest {
         requested_segments: u8,
         proxy: WireProxy,
     },
+    ResolveFileConflict {
+        request_id: String,
+        task_id: TaskId,
+        decision: String,
+    },
 }
 
 impl IpcRequest {
@@ -164,7 +179,8 @@ impl IpcRequest {
             | Self::ShowTask { request_id, .. }
             | Self::OpenFile { request_id, .. }
             | Self::OpenFolder { request_id, .. }
-            | Self::Enqueue { request_id, .. } => request_id,
+            | Self::Enqueue { request_id, .. }
+            | Self::ResolveFileConflict { request_id, .. } => request_id,
         }
     }
 }
@@ -194,6 +210,8 @@ pub enum IpcResponse {
         request_id: String,
         ok: bool,
         task_id: Option<u64>,
+        #[serde(default)]
+        awaiting_file_decision: bool,
         error: Option<WireError>,
     },
     TaskList {
@@ -608,6 +626,33 @@ fn dispatch_request(
             request_id,
             task_id,
         } => open_task_folder(request_id, task_id, state),
+        IpcRequest::ResolveFileConflict {
+            request_id,
+            task_id,
+            decision,
+        } => {
+            let decision = match decision.as_str() {
+                "overwrite" => FileDecision::Overwrite,
+                "cancel" => FileDecision::Cancel,
+                _ => return action_error(request_id, "invalid_decision", "檔案衝突決定無效。"),
+            };
+            let (response_tx, response_rx) = std::sync::mpsc::channel();
+            if commands
+                .send(EngineCommand::ResolveFileConflict {
+                    id: task_id,
+                    decision,
+                    response: response_tx,
+                })
+                .is_err()
+            {
+                return action_error(request_id, "engine_unavailable", "下載引擎未能接收操作。");
+            }
+            match response_rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(Ok(())) => action_success(request_id),
+                Ok(Err(message)) => action_error(request_id, "conflict_failed", &message),
+                Err(_) => action_error(request_id, "engine_timeout", "下載引擎回應逾時。"),
+            }
+        }
         IpcRequest::Enqueue {
             request_id,
             url,
@@ -627,6 +672,7 @@ fn dispatch_request(
                         request_id,
                         ok: false,
                         task_id: None,
+                        awaiting_file_decision: false,
                         error: Some(WireError {
                             code: "invalid_proxy".into(),
                             message,
@@ -637,7 +683,7 @@ fn dispatch_request(
             let target_dir = PathBuf::from(target_dir);
             let (response_tx, response_rx) = std::sync::mpsc::channel();
             if commands
-                .send(EngineCommand::AddConfigured {
+                .send(EngineCommand::AddConfiguredWithOrigin {
                     task: ConfiguredTask {
                         url,
                         filename,
@@ -645,6 +691,7 @@ fn dispatch_request(
                         requested_segments,
                         proxy,
                     },
+                    origin: TaskOrigin::Firefox,
                     response: response_tx,
                 })
                 .is_err()
@@ -652,14 +699,15 @@ fn dispatch_request(
                 return enqueue_error(request_id, "engine_unavailable", "下載引擎未能接收任務");
             }
             match response_rx.recv_timeout(Duration::from_secs(5)) {
-                Ok(Ok(task_id)) => {
+                Ok(Ok(acceptance)) => {
                     if let Ok(mut default_dir) = last_download_dir.lock() {
                         *default_dir = target_dir;
                     }
                     IpcResponse::EnqueueResult {
                         request_id,
                         ok: true,
-                        task_id: Some(task_id),
+                        task_id: Some(acceptance.task_id),
+                        awaiting_file_decision: acceptance.awaiting_file_decision,
                         error: None,
                     }
                 }
@@ -761,6 +809,7 @@ fn enqueue_error(request_id: String, code: &str, message: &str) -> IpcResponse {
         request_id,
         ok: false,
         task_id: None,
+        awaiting_file_decision: false,
         error: Some(WireError {
             code: code.into(),
             message: message.into(),
@@ -1147,6 +1196,7 @@ mod tests {
             filename: format!("file-{id}.bin"),
             target_dir: PathBuf::from(format!(r"C:\Downloads\{id}")),
             status,
+            origin: TaskOrigin::Gui,
             requested_segments: 4,
             actual_segments: 1,
             segments: Vec::new(),

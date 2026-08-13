@@ -66,6 +66,15 @@
         <button id="cancel" type="button" class="link">取消</button>
       </div>
     </form>
+
+    <section id="file-conflict" class="file-conflict" hidden>
+      <h2>檔案已存在</h2>
+      <p>目標資料夾已有同名檔案，請選擇處理方式。</p>
+      <div class="actions">
+        <button id="overwrite-task" type="button">覆蓋（完成後替換）</button>
+        <button id="cancel-task" type="button" class="secondary">取消任務</button>
+      </div>
+    </section>
   </main>
   <script src="core.js"></script>
   <script src="storage.js"></script>

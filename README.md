@@ -36,9 +36,11 @@ All these features run inside the same `CurlDownloader.exe`. They do not use Pow
 
 ## Firefox extension
 
-The Firefox extension intercepts HTTP/HTTPS downloads, pauses the native Firefox download, and opens a configuration page. The page can change the download name, absolute Windows directory, proxy type, host, port, account, and password for the current request. **Use Firefox** resumes the native download, while **Cancel** cancels and removes it.
+The Firefox extension intercepts HTTP/HTTPS downloads, cancels and erases the native Firefox item to keep its download panel out of the way, and opens a configuration page. The page can change the download name, absolute Windows directory, proxy type, host, port, account, and password for the current request. **Use Firefox** recreates the native download, while **Cancel** cancels the intercepted request.
 
 ### Application lifecycle
+
+GUI 啟動時會自動在 `HKCU\Software\Mozilla\NativeMessagingHosts\curl_downloader` 建立或更新 Native host；設定頁無法連線時可按「重試 Curl Downloader」。
 
 The first time the extension needs the main application, it starts the same `CurlDownloader.exe` minimized and resident in the system tray. The entire system keeps only one Curl Downloader main process.
 
@@ -92,7 +94,7 @@ The portable directory contains only `CurlDownloader.exe`, `curl-downloader.xpi`
 
 - Standard mode: `%APPDATA%\CurlDownloader\state.json`
 - Portable mode: `data\state.json` inside the portable directory
-- Partial download files: the `.curl-downloader` directory inside the destination
+- Partial download files: the hidden `.curl-downloader` directory inside the destination. It exists only while work is pending and is removed when a task completes, is cancelled, or its history is cleared.
 
 ## Security software warning
 

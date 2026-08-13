@@ -75,6 +75,7 @@
       filename: pending.filename,
       targetDir: pending.targetDir || '',
       forceRecreate: Boolean(pending.forceRecreate),
+      firefoxDownloadRemoved: Boolean(pending.firefoxDownloadRemoved),
       proxy: {
         enabled: Boolean(pending.proxy && pending.proxy.enabled),
         protocol: (pending.proxy && pending.proxy.protocol) || 'http',
@@ -311,7 +312,34 @@
     }
   }
 
+  // Firefox displays its native download panel as soon as onCreated fires.
+  // Remove the original item immediately; a Firefox fallback is recreated
+  // only when the user explicitly chooses it.
+  async function cancelAndEraseDownload(pending) {
+    try {
+      await browserApi.downloads.cancel(pending.downloadId);
+    } catch (_error) {
+      // It may already be complete/cancelled; still try to erase its history.
+    }
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        await browserApi.downloads.erase({ id: pending.downloadId });
+        pending.firefoxDownloadRemoved = true;
+        return true;
+      } catch (_error) {
+        // Firefox can finish cancelling the item just after cancel() resolves.
+        // A few immediate retries avoid reopening the native download panel.
+        if (attempt < 2) await Promise.resolve();
+      }
+    }
+    return false;
+  }
+
   async function cancelFirefoxDownload(pending) {
+    if (pending.firefoxDownloadRemoved) {
+      pendingDownloads.delete(pending.downloadId);
+      return { ok: true };
+    }
     try {
       await browserApi.downloads.cancel(pending.downloadId);
     } catch (_error) {
@@ -342,20 +370,28 @@
       filename: core.fallbackFilename(download.filename || 'download.bin'),
       targetDir: defaults.targetDir || '',
       proxy: defaults.proxy || defaultProxy(),
-      forceRecreate: false
+      forceRecreate: true,
+      firefoxDownloadRemoved: false
     };
     pendingDownloads.set(download.id, pending);
 
     try {
-      await browserApi.downloads.pause(download.id);
-    } catch (_error) {
-      pending.forceRecreate = true;
-      await restoreFirefoxDownload(pending);
-      pendingDownloads.delete(download.id);
-      return { restored: true };
-    }
-
-    try {
+      // Pause first so Firefox stops writing while the native item is being
+      // cancelled; cancellation/erase immediately afterwards removes the
+      // native download panel before the settings tab is shown.
+      try { await browserApi.downloads.pause(download.id); } catch (_error) {
+        await restoreFirefoxDownload(pending);
+        pendingDownloads.delete(download.id);
+        return { restored: true };
+      }
+      const removed = await cancelAndEraseDownload(pending);
+      if (!removed && !pending.firefoxDownloadRemoved) {
+        try { await browserApi.downloads.pause(download.id); } catch (_error) { /* best effort */ }
+        await notifyFailure('Firefox 原生下載視窗未能隱藏，已恢復 Firefox。');
+        await restoreFirefoxDownload(pending);
+        pendingDownloads.delete(download.id);
+        return { restored: true };
+      }
       const getUrl = browserApi.runtime.getURL
         ? browserApi.runtime.getURL('settings.html')
         : 'settings.html';
@@ -388,25 +424,41 @@
         throw new Error('Curl Downloader 未接收任務');
       }
       accepted = true;
-      try {
-        await browserApi.downloads.cancel(pending.downloadId);
-        await browserApi.downloads.erase({ id: pending.downloadId });
-      } catch (_error) {
+      if (!pending.firefoxDownloadRemoved && !(await cancelAndEraseDownload(pending))) {
         await notifyFailure('Curl Downloader 已接收任務，但 Firefox 原下載未能清理。');
       }
       pendingDownloads.delete(pending.downloadId);
       restartDelayMs = 500;
       restartCooldownUntil = 0;
+      if (!response.awaiting_file_decision && response.task_id !== undefined) {
+        try {
+          await sendNativeWithRetry({
+            type: 'show_task',
+            task_id: Number(response.task_id),
+            ...passiveStartupFields()
+          });
+        } catch (_error) {
+          // The task is already accepted; showing its page is best effort.
+        }
+      }
       void refreshTaskStatus();
       try {
         await storage.saveDefaults(form);
       } catch (_error) {
         // Saving defaults must never change the already accepted download.
       }
-      return { ok: true, taskId: response.task_id };
+      return {
+        ok: true,
+        taskId: response.task_id,
+        awaitingFileDecision: Boolean(response.awaiting_file_decision)
+      };
     } catch (_error) {
       if (!accepted) {
         await notifyFailure('Native host 未能接收下載，已恢復 Firefox。');
+        // Try resuming first for compatibility with a Firefox item that was
+        // cancelled too late; restoreFirefoxDownload falls back to a fresh
+        // Firefox item if resume is rejected after erase.
+        pending.forceRecreate = false;
         await restoreFirefoxDownload(pending);
         pendingDownloads.delete(pending.downloadId);
       }
@@ -452,10 +504,13 @@
     const nativeType = {
       'show-task': 'show_task',
       'open-file': 'open_file',
-      'open-folder': 'open_folder'
+      'open-folder': 'open_folder',
+      'resolve-file-conflict': 'resolve_file_conflict'
     }[message.type];
     try {
-      const response = await sendNativeWithRetry({ type: nativeType, task_id: taskId, ...passiveStartupFields() });
+      const request = { type: nativeType, task_id: taskId, ...passiveStartupFields() };
+      if (message.type === 'resolve-file-conflict') request.decision = message.decision;
+      const response = await sendNativeWithRetry(request);
       if (!response || response.type !== 'action_result') {
         return { ok: false, error: 'Curl Downloader 未能完成操作。' };
       }
@@ -526,6 +581,7 @@
     if (message.type === 'show-task' || message.type === 'open-file' || message.type === 'open-folder') {
       return sendTaskAction(message);
     }
+    if (message.type === 'resolve-file-conflict') return sendTaskAction(message);
     if (message.type === 'get-defaults') {
       try {
         const response = await sendNativeWithRetry({ type: 'get_defaults', ...startupFields(Boolean(message.autoStart), message.startIntentUnixMs) });

@@ -9,7 +9,11 @@
   const submitButton = document.getElementById('submit-external');
   const retryButton = document.getElementById('retry-native');
   const cancelButton = document.getElementById('cancel');
+  const conflictElement = document.getElementById('file-conflict');
+  const overwriteButton = document.getElementById('overwrite-task');
+  const cancelTaskButton = document.getElementById('cancel-task');
   let pending;
+  let acceptedTaskId = null;
 
   function setStatus(message, kind) {
     statusElement.textContent = message;
@@ -88,6 +92,35 @@
     }
   }
 
+  function showFileConflict(taskId) {
+    acceptedTaskId = taskId;
+    conflictElement.hidden = false;
+    formElement.hidden = true;
+    setStatus('下載已建立，但目標檔案已存在；請選擇覆蓋或取消任務。');
+  }
+
+  async function resolveFileConflict(decision) {
+    if (acceptedTaskId === null) return;
+    overwriteButton.disabled = true;
+    cancelTaskButton.disabled = true;
+    try {
+      const response = await browser.runtime.sendMessage({
+        type: 'resolve-file-conflict',
+        taskId: acceptedTaskId,
+        decision
+      });
+      if (!response || !response.ok) {
+        throw new Error(response && response.error ? response.error : '無法處理檔案衝突。');
+      }
+      setStatus(decision === 'overwrite' ? '已選擇覆蓋，下載完成後會替換舊檔。' : '已取消下載任務。', 'success');
+      await closeSettingsPage();
+    } catch (error) {
+      overwriteButton.disabled = false;
+      cancelTaskButton.disabled = false;
+      setStatus(error.message || '無法處理檔案衝突。', 'error');
+    }
+  }
+
   async function loadNativeDefaults(manual) {
     retryButton.hidden = !manual;
     retryButton.disabled = true;
@@ -141,6 +174,10 @@
         return;
       }
       await CurlExtensionStorage.saveDefaults(form);
+      if (response.awaitingFileDecision) {
+        showFileConflict(response.taskId);
+        return;
+      }
       setStatus('已交給 Curl Downloader。', 'success');
       await closeSettingsPage();
     } catch (error) {
@@ -165,7 +202,7 @@
     const response = await loadNativeDefaults(true);
     if (response && response.ok) {
       applyNativeDefaults(response);
-      setStatus('已連線到 Curl Downloader；原 Firefox 下載目前保持暫停，請選擇處理方式。');
+      setStatus('已連線到 Curl Downloader；原 Firefox 下載已攔截，請選擇處理方式。');
     } else {
       setStatus(`${response && response.error ? response.error : 'Curl Downloader 未啟動或尚未註冊 Native host。'}；啟動後再按「重試」。`, 'error');
     }
@@ -173,6 +210,8 @@
   formElement.addEventListener('submit', submitExternal);
   document.getElementById('use-firefox').addEventListener('click', restoreFirefox);
   cancelButton.addEventListener('click', cancelDownload);
+  overwriteButton.addEventListener('click', () => { void resolveFileConflict('overwrite'); });
+  cancelTaskButton.addEventListener('click', () => { void resolveFileConflict('cancel'); });
 
   (async () => {
     if (!Number.isInteger(downloadId)) {
@@ -193,7 +232,7 @@
       if (nativeDefaults && nativeDefaults.ok === false && nativeDefaults.error) {
         setStatus(`${nativeDefaults.error}；請先啟動 Curl Downloader，完成註冊後按「重試」。`, 'error');
       } else {
-        setStatus('原 Firefox 下載目前保持暫停，請選擇處理方式。');
+        setStatus('原 Firefox 下載已攔截，請選擇處理方式。');
       }
     } catch (error) {
       setStatus(error.message || '讀取下載資料失敗。', 'error');

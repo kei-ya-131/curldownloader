@@ -246,6 +246,38 @@ pub fn finalize_file(merged: &Path, target: &Path) -> io::Result<()> {
     fs::rename(merged, target)
 }
 
+/// Commit a fully validated temporary file to its destination.  When an
+/// overwrite was explicitly approved, the old file is moved aside only for
+/// the short commit window and restored if the replacement fails.
+pub fn replace_file(merged: &Path, target: &Path) -> io::Result<()> {
+    if !target.exists() {
+        return fs::rename(merged, target);
+    }
+
+    let parent = target.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("download");
+    let mut backup = parent.join(format!(".{file_name}.curl-overwrite-backup"));
+    if backup.exists() {
+        let stamp = current_unix_ms();
+        backup = parent.join(format!(".{file_name}.curl-overwrite-backup-{stamp}"));
+    }
+
+    fs::rename(target, &backup)?;
+    match fs::rename(merged, target) {
+        Ok(()) => {
+            let _ = fs::remove_file(backup);
+            Ok(())
+        }
+        Err(error) => {
+            let _ = fs::rename(&backup, target);
+            Err(error)
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum JobKind {
     HeadProbe,
@@ -329,7 +361,12 @@ impl Engine {
                 if self.active.is_empty() {
                     self.refresh_progress();
                     for task in &mut self.tasks {
-                        if !matches!(task.status, TaskStatus::Completed | TaskStatus::Cancelled) {
+                        if !matches!(
+                            task.status,
+                            TaskStatus::Completed
+                                | TaskStatus::Cancelled
+                                | TaskStatus::AwaitingFileDecision
+                        ) {
                             task.status = if task.proxy.enabled && task.proxy.requires_password {
                                 TaskStatus::NeedsProxyPassword
                             } else {
@@ -364,14 +401,43 @@ impl Engine {
                 }
             }
             EngineCommand::AddConfigured { task, response } => {
-                let result = self.add_configured_task(task);
-                let should_start = result.is_ok();
-                let _ = response.send(result);
-                if should_start {
-                    if let Some(id) = self.tasks.last().map(|task| task.id) {
-                        self.request_start(id);
+                match self.add_configured_task(task, TaskOrigin::Gui) {
+                    Ok(acceptance) => {
+                        let task_id = acceptance.task_id;
+                        let should_start = !acceptance.awaiting_file_decision;
+                        let _ = response.send(Ok(task_id));
+                        if should_start {
+                            self.request_start(task_id);
+                        }
+                    }
+                    Err(error) => {
+                        let _ = response.send(Err(error));
                     }
                 }
+            }
+            EngineCommand::AddConfiguredWithOrigin {
+                task,
+                origin,
+                response,
+            } => match self.add_configured_task(task, origin) {
+                Ok(acceptance) => {
+                    let should_start = !acceptance.awaiting_file_decision;
+                    let _ = response.send(Ok(acceptance));
+                    if should_start {
+                        self.request_start(acceptance.task_id);
+                    }
+                }
+                Err(error) => {
+                    let _ = response.send(Err(error));
+                }
+            },
+            EngineCommand::ResolveFileConflict {
+                id,
+                decision,
+                response,
+            } => {
+                let result = self.resolve_file_conflict(id, decision);
+                let _ = response.send(result);
             }
             EngineCommand::Start(id) => self.request_start(id),
             EngineCommand::Pause(id) => self.pause_task(id),
@@ -460,15 +526,24 @@ impl Engine {
         let id = self.settings.next_task_id;
         self.settings.next_task_id = self.settings.next_task_id.saturating_add(1);
         let filename = filename::suggest_filename(None, &url, id);
-        let mut task = DownloadTask::new(id, &new_task.url, filename, new_task.target_dir);
+        let mut task = DownloadTask::new_with_origin(
+            id,
+            &new_task.url,
+            filename,
+            new_task.target_dir,
+            TaskOrigin::Gui,
+        );
         task.created_unix_ms = current_unix_ms();
-        let _ = fs::create_dir_all(storage::task_work_dir(&task));
         self.tasks.push(task);
         let _ = self.persist();
         self.publish_snapshot();
     }
 
-    fn add_configured_task(&mut self, new_task: ConfiguredTask) -> Result<TaskId, String> {
+    fn add_configured_task(
+        &mut self,
+        new_task: ConfiguredTask,
+        origin: TaskOrigin,
+    ) -> Result<ConfiguredTaskAcceptance, String> {
         let parsed = url::Url::parse(&new_task.url).map_err(|_| "網址格式無效".to_owned())?;
         if !matches!(parsed.scheme(), "http" | "https") {
             return Err("只支援 HTTP 或 HTTPS 網址".into());
@@ -481,21 +556,30 @@ impl Engine {
 
         let id = self.settings.next_task_id;
         let filename = filename::sanitize_filename(&new_task.filename, id);
-        let mut task = DownloadTask::new(id, &new_task.url, filename, new_task.target_dir);
+        let mut task =
+            DownloadTask::new_with_origin(id, &new_task.url, filename, new_task.target_dir, origin);
         task.requested_segments = new_task.requested_segments.clamp(1, 8);
         task.proxy = new_task.proxy;
         task.created_unix_ms = current_unix_ms();
-        fs::create_dir_all(storage::task_work_dir(&task))
-            .map_err(|error| format!("無法建立下載工作目錄：{error}"))?;
+        let target = task.target_dir.join(&task.filename);
+        if target.exists() {
+            task.pending_target_fingerprint = storage::target_fingerprint(&target)
+                .map_err(|error| format!("無法讀取目標檔案：{error}"))?;
+            task.status = TaskStatus::AwaitingFileDecision;
+        }
 
         self.settings.next_task_id = self.settings.next_task_id.saturating_add(1);
         let id = task.id;
+        let awaiting_file_decision = task.status == TaskStatus::AwaitingFileDecision;
         self.tasks.push(task);
         self.settings.last_download_dir = target_dir;
         self.persist()
             .map_err(|error| format!("無法保存下載任務：{error}"))?;
         self.publish_snapshot();
-        Ok(id)
+        Ok(ConfiguredTaskAcceptance {
+            task_id: id,
+            awaiting_file_decision,
+        })
     }
 
     fn update_draft(
@@ -536,13 +620,22 @@ impl Engine {
         let source_changed = self.task(id).is_some_and(|task| {
             task.original_url != url || proxy_configuration_changed(&task.proxy, &proxy)
         });
-        if source_changed {
+        let destination_changed = self
+            .task(id)
+            .is_some_and(|task| task.target_dir != target_dir);
+        if source_changed || destination_changed {
             self.stop_task_jobs(id);
             self.queue.retain(|queued| *queued != id);
             self.pending_start.remove(&id);
+            self.range_probe.remove(&id);
+            if destination_changed {
+                if let Some(previous) = self.task(id).cloned() {
+                    let _ = storage::cleanup_task_work_dir(&previous);
+                }
+            }
         }
         let needs_password = proxy.enabled && proxy.requires_password && proxy.password.is_none();
-        if !source_changed && needs_password {
+        if !source_changed && !destination_changed && needs_password {
             self.stop_task_jobs(id);
             self.queue.retain(|queued| *queued != id);
         }
@@ -554,13 +647,16 @@ impl Engine {
         task.target_dir = target_dir;
         task.requested_segments = requested_segments.clamp(1, 8);
         task.proxy = proxy;
-        if source_changed {
+        if source_changed || destination_changed {
             task.effective_url = None;
             task.total_size = None;
             task.etag = None;
             task.last_modified = None;
             task.range_support = RangeSupport::Unknown;
             task.segments.clear();
+            task.actual_segments = 1;
+            task.overwrite_approval = None;
+            task.pending_target_fingerprint = None;
             if task.proxy.enabled && task.proxy.requires_password && task.proxy.password.is_none() {
                 task.status = TaskStatus::NeedsProxyPassword;
             } else {
@@ -648,19 +744,124 @@ impl Engine {
                 self.pending_start.insert(id);
             }
             TaskStatus::Queued | TaskStatus::Paused | TaskStatus::Failed => {
+                if !self.prepare_target_for_start(id) {
+                    return;
+                }
                 if self.task(id).is_some_and(|task| task.total_size.is_none()) {
                     self.begin_probe(id);
                 } else {
                     self.start_task(id);
                 }
             }
-            TaskStatus::NeedsProxyPassword => {}
+            TaskStatus::NeedsProxyPassword | TaskStatus::AwaitingFileDecision => {}
             _ => {}
         }
     }
 
+    fn prepare_target_for_start(&mut self, id: TaskId) -> bool {
+        let Some(task) = self.task(id).cloned() else {
+            return false;
+        };
+        let target = task.target_dir.join(&task.filename);
+        let fingerprint = match storage::target_fingerprint(&target) {
+            Ok(fingerprint) => fingerprint,
+            Err(error) => {
+                self.fail_task(
+                    id,
+                    task_error(
+                        ErrorKind::Disk,
+                        "無法讀取目標檔案",
+                        &error.to_string(),
+                        "檢查目標檔案權限",
+                    ),
+                );
+                return false;
+            }
+        };
+        if fingerprint.is_none() {
+            if let Some(task) = self.task_mut(id) {
+                task.pending_target_fingerprint = None;
+                task.overwrite_approval = None;
+            }
+            return true;
+        }
+        let approved = self.task(id).is_some_and(|task| {
+            task.overwrite_approval == Some(FileDecision::Overwrite)
+                && task.pending_target_fingerprint == fingerprint
+        });
+        if approved {
+            return true;
+        }
+        if let Some(task) = self.task_mut(id) {
+            task.pending_target_fingerprint = fingerprint;
+            task.overwrite_approval = None;
+            task.status = TaskStatus::AwaitingFileDecision;
+        }
+        self.stop_task_jobs(id);
+        self.queue.retain(|queued| *queued != id);
+        self.pending_start.remove(&id);
+        let _ = self.persist();
+        self.publish_snapshot();
+        false
+    }
+
+    fn resolve_file_conflict(&mut self, id: TaskId, decision: FileDecision) -> Result<(), String> {
+        let Some(task) = self.task(id).cloned() else {
+            return Err("找不到下載任務".into());
+        };
+        if task.status != TaskStatus::AwaitingFileDecision {
+            return Err("此任務目前沒有待處理的檔案衝突".into());
+        }
+        match decision {
+            FileDecision::Cancel => {
+                self.stop_task_jobs(id);
+                self.queue.retain(|queued| *queued != id);
+                self.pending_start.remove(&id);
+                self.range_probe.remove(&id);
+                self.meters.remove(&id);
+                if let Some(task) = self.task_mut(id) {
+                    let _ = storage::cleanup_task_work_dir(task);
+                    task.proxy.clear_password();
+                    task.overwrite_approval = None;
+                    task.pending_target_fingerprint = None;
+                    task.status = TaskStatus::Cancelled;
+                }
+                self.persist().map_err(|error| error.to_string())?;
+                self.publish_snapshot();
+                Ok(())
+            }
+            FileDecision::Overwrite => {
+                let target = task.target_dir.join(&task.filename);
+                let current = storage::target_fingerprint(&target)
+                    .map_err(|error| format!("無法讀取目標檔案：{error}"))?;
+                if current != task.pending_target_fingerprint && current.is_some() {
+                    if let Some(task) = self.task_mut(id) {
+                        task.pending_target_fingerprint = current;
+                        task.overwrite_approval = None;
+                    }
+                    self.persist().map_err(|error| error.to_string())?;
+                    self.publish_snapshot();
+                    return Err("目標檔案在提示期間已變更，請重新確認".into());
+                }
+                if let Some(task) = self.task_mut(id) {
+                    task.overwrite_approval = current.as_ref().map(|_| FileDecision::Overwrite);
+                    task.pending_target_fingerprint = current;
+                    task.status = TaskStatus::Queued;
+                }
+                let ready = self.task_ready_to_finalize(id);
+                self.persist().map_err(|error| error.to_string())?;
+                if ready {
+                    self.finalize_task(id);
+                } else {
+                    self.request_start(id);
+                }
+                Ok(())
+            }
+        }
+    }
+
     fn begin_probe(&mut self, id: TaskId) {
-        let Some(task) = self.task(id) else {
+        let Some(task) = self.task(id).cloned() else {
             return;
         };
         if task.proxy.enabled && task.proxy.requires_password && task.proxy.password.is_none() {
@@ -669,6 +870,18 @@ impl Engine {
             }
             let _ = self.persist();
             self.publish_snapshot();
+            return;
+        }
+        if let Err(error) = storage::ensure_task_work_dir(&task) {
+            self.fail_task(
+                id,
+                task_error(
+                    ErrorKind::Disk,
+                    "無法建立下載工作目錄",
+                    &error.to_string(),
+                    "選擇其他目錄",
+                ),
+            );
             return;
         }
         self.stop_task_jobs(id);
@@ -699,9 +912,10 @@ impl Engine {
         self.queue.retain(|queued| *queued != id);
         self.pending_start.remove(&id);
         if let Some(task) = self.task_mut(id) {
-            let work = storage::task_work_dir(task);
-            let _ = fs::remove_dir_all(work);
+            let _ = storage::cleanup_task_work_dir(task);
             task.proxy.clear_password();
+            task.overwrite_approval = None;
+            task.pending_target_fingerprint = None;
             task.status = TaskStatus::Cancelled;
         }
         let _ = self.persist();
@@ -727,7 +941,7 @@ impl Engine {
             self.pending_start.remove(&task.id);
             self.range_probe.remove(&task.id);
             self.meters.remove(&task.id);
-            let _ = fs::remove_dir_all(storage::task_work_dir(task));
+            let _ = storage::cleanup_task_work_dir(task);
         }
         self.tasks
             .retain(|task| !matches!(task.status, TaskStatus::Completed | TaskStatus::Cancelled));
@@ -757,20 +971,33 @@ impl Engine {
             return;
         }
         let target = task.target_dir.join(&task.filename);
-        if target.exists() {
-            self.fail_task(
-                id,
-                task_error(
-                    ErrorKind::Disk,
-                    "目標檔案已存在",
-                    "為避免靜默覆寫而停止",
-                    "更改檔名或移除現有檔案",
-                ),
-            );
+        let fingerprint = match storage::target_fingerprint(&target) {
+            Ok(fingerprint) => fingerprint,
+            Err(error) => {
+                self.fail_task(
+                    id,
+                    task_error(
+                        ErrorKind::Disk,
+                        "無法讀取目標檔案",
+                        &error.to_string(),
+                        "檢查目標檔案權限",
+                    ),
+                );
+                return;
+            }
+        };
+        if fingerprint.is_some()
+            && !(task.overwrite_approval == Some(FileDecision::Overwrite)
+                && fingerprint == task.pending_target_fingerprint)
+        {
+            task.pending_target_fingerprint = fingerprint;
+            task.overwrite_approval = None;
+            task.status = TaskStatus::AwaitingFileDecision;
+            let _ = self.persist();
+            self.publish_snapshot();
             return;
         }
-        let work = storage::task_work_dir(task);
-        if let Err(error) = fs::create_dir_all(&work) {
+        if let Err(error) = storage::ensure_task_work_dir(task) {
             self.fail_task(
                 id,
                 task_error(
@@ -1276,16 +1503,32 @@ impl Engine {
         };
         let work = storage::task_work_dir(&task);
         let target = task.target_dir.join(&task.filename);
-        if target.exists() {
-            self.fail_task(
-                id,
-                task_error(
-                    ErrorKind::Disk,
-                    "目標檔案已存在",
-                    "為避免靜默覆寫而停止",
-                    "更改檔名或移除現有檔案",
-                ),
-            );
+        let current_target = match storage::target_fingerprint(&target) {
+            Ok(fingerprint) => fingerprint,
+            Err(error) => {
+                self.fail_task(
+                    id,
+                    task_error(
+                        ErrorKind::Disk,
+                        "無法讀取目標檔案",
+                        &error.to_string(),
+                        "檢查目標檔案權限",
+                    ),
+                );
+                return;
+            }
+        };
+        if current_target.is_some()
+            && (task.overwrite_approval != Some(FileDecision::Overwrite)
+                || task.pending_target_fingerprint != current_target)
+        {
+            if let Some(task) = self.task_mut(id) {
+                task.pending_target_fingerprint = current_target;
+                task.overwrite_approval = None;
+                task.status = TaskStatus::AwaitingFileDecision;
+            }
+            let _ = self.persist();
+            self.publish_snapshot();
             return;
         }
         if let Some(task) = self.task_mut(id) {
@@ -1299,9 +1542,9 @@ impl Engine {
                 .collect::<Vec<_>>();
             let merged = work.join("merged.part");
             merge_segments(&parts, &merged, task.total_size.unwrap_or(0))
-                .and_then(|_| finalize_file(&merged, &target))
+                .and_then(|_| replace_file(&merged, &target))
         } else {
-            finalize_file(&work.join("payload.part"), &target)
+            replace_file(&work.join("payload.part"), &target)
         };
         if let Err(error) = result {
             self.fail_task(
@@ -1315,9 +1558,11 @@ impl Engine {
             );
             return;
         }
-        let _ = fs::remove_dir_all(work);
+        let _ = storage::cleanup_task_work_dir(&task);
         if let Some(task) = self.task_mut(id) {
             task.proxy.clear_password();
+            task.overwrite_approval = None;
+            task.pending_target_fingerprint = None;
             task.last_error = None;
             task.completed_unix_ms = Some(current_unix_ms());
             task.status = TaskStatus::Completed;
@@ -1446,6 +1691,7 @@ impl Engine {
                     filename: task.filename.clone(),
                     target_dir: task.target_dir.clone(),
                     status: task.status,
+                    origin: task.origin,
                     requested_segments: task.requested_segments,
                     actual_segments: task.actual_segments,
                     segments: build_segment_snapshots(
@@ -1528,7 +1774,10 @@ fn all_segments_complete(task: &DownloadTask) -> bool {
 }
 
 fn can_finalize_task(task: &DownloadTask, has_active_jobs: bool) -> bool {
-    !has_active_jobs && all_segments_complete(task)
+    // A newly configured task has no segment metadata yet.  Treating the
+    // empty iterator as complete would try to commit `payload.part` before
+    // the probe and transfer have even started.
+    !has_active_jobs && !task.segments.is_empty() && all_segments_complete(task)
 }
 
 fn build_segment_snapshots<I>(task: &DownloadTask, active_jobs: I) -> Vec<SegmentSnapshot>
@@ -1704,6 +1953,28 @@ mod tests {
         assert_eq!(std::fs::read(&merged).unwrap(), b"defabc");
         std::fs::write(&target, b"existing").unwrap();
         assert!(finalize_file(&merged, &target).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn replace_file_keeps_old_content_until_commit_and_removes_backup() {
+        let dir = test_dir("replace");
+        let target = dir.join("file.bin");
+        let merged = dir.join("payload.part");
+        std::fs::write(&target, b"old").unwrap();
+        std::fs::write(&merged, b"new").unwrap();
+        replace_file(&merged, &target).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"new");
+        assert!(!merged.exists());
+        assert!(
+            !dir.read_dir()
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("curl-overwrite-backup"))
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 

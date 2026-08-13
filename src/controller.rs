@@ -417,7 +417,8 @@ fn begin_shutdown(
 mod tests {
     use super::*;
     use crate::model::{
-        CurlSource, ProxyProtocol, ProxySnapshot, RangeSupport, TaskSnapshot, TaskStatus,
+        CurlSource, ProxyProtocol, ProxySnapshot, RangeSupport, TaskOrigin, TaskSnapshot,
+        TaskStatus,
     };
     use std::{path::PathBuf, time::Duration};
 
@@ -429,6 +430,7 @@ mod tests {
             filename: "file.bin".into(),
             target_dir: PathBuf::from(r"C:\Downloads"),
             status,
+            origin: TaskOrigin::Gui,
             requested_segments: 1,
             actual_segments: 1,
             segments: Vec::new(),
@@ -488,7 +490,7 @@ mod runtime_tests {
     use crate::{
         model::{
             CurlSource, EngineCommand, EngineEvent, ProxyProtocol, ProxySnapshot, RangeSupport,
-            TaskSnapshot, TaskStatus,
+            TaskOrigin, TaskSnapshot, TaskStatus,
         },
         startup_policy,
         tray::{TrayController, TrayEvent},
@@ -582,6 +584,7 @@ mod runtime_tests {
                 filename: "file.bin".into(),
                 target_dir: PathBuf::from(r"C:\Downloads"),
                 status,
+                origin: TaskOrigin::Gui,
                 requested_segments: 1,
                 actual_segments: 1,
                 segments: Vec::new(),
