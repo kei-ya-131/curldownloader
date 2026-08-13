@@ -138,6 +138,8 @@ pub enum TaskStatus {
     Completed,
     Failed,
     Cancelled,
+    #[serde(other)]
+    Unknown,
 }
 
 /// Where a task was created.  The origin is persisted for recovery and for
@@ -160,6 +162,13 @@ pub struct TargetFingerprint {
     pub length: u64,
     #[serde(default)]
     pub modified_unix_nanos: Option<u128>,
+    /// Stable file identity when the platform exposes one.  This catches a
+    /// replacement with identical size and timestamps without hashing the
+    /// entire file during task creation.
+    #[serde(default)]
+    pub file_identity: Option<[u64; 2]>,
+    #[serde(default)]
+    pub content_digest: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -236,6 +245,9 @@ pub struct DownloadTask {
     pub status: TaskStatus,
     #[serde(default)]
     pub origin: TaskOrigin,
+    /// Native-messaging request id used to make Firefox retries idempotent.
+    #[serde(default)]
+    pub external_request_id: Option<String>,
     #[serde(default)]
     pub overwrite_approval: Option<FileDecision>,
     #[serde(default)]
@@ -275,6 +287,7 @@ impl DownloadTask {
             proxy: ProxySettings::default(),
             status: TaskStatus::Queued,
             origin,
+            external_request_id: None,
             overwrite_approval: None,
             pending_target_fingerprint: None,
             segments: Vec::new(),
@@ -291,11 +304,22 @@ impl DownloadTask {
             TaskStatus::NeedsProxyPassword
         } else if self.status == TaskStatus::Completed {
             TaskStatus::Completed
+        } else if self.status == TaskStatus::Cancelled {
+            TaskStatus::Cancelled
         } else if self.status == TaskStatus::AwaitingFileDecision {
             TaskStatus::AwaitingFileDecision
         } else {
             TaskStatus::Paused
         };
+    }
+
+    pub fn sanitize_persisted_filename(&mut self) {
+        let safe = crate::filename::sanitize_filename(&self.filename, self.id);
+        if safe != self.filename {
+            self.filename = safe;
+            self.overwrite_approval = None;
+            self.pending_target_fingerprint = None;
+        }
     }
 }
 
@@ -368,6 +392,7 @@ pub struct ConfiguredTask {
     pub target_dir: PathBuf,
     pub requested_segments: u8,
     pub proxy: ProxySettings,
+    pub request_id: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -396,6 +421,10 @@ pub enum EngineCommand {
     Start(TaskId),
     Pause(TaskId),
     Cancel(TaskId),
+    CancelWithResponse {
+        id: TaskId,
+        response: Sender<Result<(), String>>,
+    },
     Remove(TaskId),
     ClearHistory,
     StartAll,

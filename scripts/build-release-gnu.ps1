@@ -33,6 +33,12 @@ Invoke-CargoChecked @('clippy', '--ignore-rust-version', '--all-targets', '--tar
 Invoke-CargoChecked @('test', '--ignore-rust-version', '--target', $target, '--', '--test-threads=1')
 Invoke-CargoChecked @('build', '--ignore-rust-version', '--release', '--target', $target, '--bin', 'curl-downloader')
 
+# The smoke probe needs a controlled parent-process authentication override.
+# Keep that test-only feature in a separate optimized target directory so the
+# shipped, feature-free release binary is never replaced by the probe build.
+$smokeTargetDirectory = 'target/smoke-native-auth'
+Invoke-CargoChecked @('--target-dir', $smokeTargetDirectory, 'build', '--ignore-rust-version', '--release', '--features', 'smoke-test-native-auth', '--target', $target, '--bin', 'curl-downloader')
+
 New-Item -ItemType Directory -Path 'dist' -Force | Out-Null
 Copy-Item -LiteralPath "target/$target/release/curl-downloader.exe" -Destination 'dist/CurlDownloader.exe'
 
@@ -40,7 +46,12 @@ $scriptHost = (Get-Command pwsh -ErrorAction SilentlyContinue | Select-Object -F
 if ([string]::IsNullOrWhiteSpace($scriptHost)) {
     $scriptHost = (Get-Command powershell).Source
 }
-& $scriptHost -NoProfile -ExecutionPolicy Bypass -File 'scripts/test-minimized-background-controller.ps1' -ExecutablePath 'dist/CurlDownloader.exe'
+& $scriptHost -NoProfile -ExecutionPolicy Bypass -File 'scripts/test-minimized-background-controller.ps1' -ExecutablePath 'dist/CurlDownloader.exe' -SkipNativeMessaging
+if ($LASTEXITCODE -ne 0) {
+    throw 'Release GUI smoke test failed.'
+}
+$smokeExecutable = Join-Path $smokeTargetDirectory "$target\release\curl-downloader.exe"
+& $scriptHost -NoProfile -ExecutionPolicy Bypass -File 'scripts/test-minimized-background-controller.ps1' -ExecutablePath $smokeExecutable
 if ($LASTEXITCODE -ne 0) {
     throw 'Minimized background controller smoke test failed.'
 }

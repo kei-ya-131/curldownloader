@@ -74,8 +74,20 @@
   }
 
   async function restoreFirefox() {
-    await browser.runtime.sendMessage({ type: 'restore-firefox', downloadId });
-    await closeSettingsPage();
+    const button = document.getElementById('use-firefox');
+    if (button) button.disabled = true;
+    try {
+      const response = await browser.runtime.sendMessage({ type: 'restore-firefox', downloadId });
+      if (!response || !response.ok) {
+        throw new Error(response && response.error
+          ? response.error
+          : 'Firefox 下載未能恢復；請稍後重試。');
+      }
+      await closeSettingsPage();
+    } catch (error) {
+      if (button) button.disabled = false;
+      setStatus(error.message || 'Firefox 下載未能恢復；請稍後重試。', 'error');
+    }
   }
 
   async function cancelDownload() {
@@ -173,7 +185,12 @@
         setTimeout(() => { void closeSettingsPage(); }, 700);
         return;
       }
-      await CurlExtensionStorage.saveDefaults(form);
+      try {
+        await CurlExtensionStorage.saveDefaults(form);
+      } catch (_error) {
+        // The accepted task and conflict decision remain usable even when
+        // Firefox storage is unavailable or over quota.
+      }
       if (response.awaitingFileDecision) {
         showFileConflict(response.taskId);
         return;

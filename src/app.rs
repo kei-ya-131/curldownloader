@@ -261,7 +261,7 @@ fn segment_status_label(task_status: TaskStatus, segment: &SegmentSnapshot) -> &
         return "下載中";
     }
     match task_status {
-        TaskStatus::Paused | TaskStatus::Pausing => "已暫停",
+        TaskStatus::Paused | TaskStatus::Pausing | TaskStatus::Unknown => "已暫停",
         TaskStatus::Failed => "失敗",
         TaskStatus::Cancelled => "已取消",
         TaskStatus::Queued => "排隊中",
@@ -1354,7 +1354,7 @@ fn task_card_frame(ui: &egui::Ui, selected: bool) -> egui::Frame {
 fn status_color(ui: &egui::Ui, status: TaskStatus) -> egui::Color32 {
     let visuals = ui.visuals();
     match status {
-        TaskStatus::Queued | TaskStatus::Paused | TaskStatus::Cancelled => {
+        TaskStatus::Queued | TaskStatus::Paused | TaskStatus::Cancelled | TaskStatus::Unknown => {
             visuals.weak_text_color()
         }
         TaskStatus::Probing | TaskStatus::Downloading => visuals.hyperlink_color,
@@ -1803,6 +1803,7 @@ fn status_label(status: TaskStatus) -> &'static str {
         TaskStatus::Completed => "已完成",
         TaskStatus::Failed => "失敗",
         TaskStatus::Cancelled => "已取消",
+        TaskStatus::Unknown => "已暫停",
     }
 }
 
@@ -1824,6 +1825,7 @@ fn status_icon(status: TaskStatus) -> &'static str {
         TaskStatus::Completed => "✓",
         TaskStatus::Failed => "!",
         TaskStatus::Cancelled => "×",
+        TaskStatus::Unknown => "Ⅱ",
     }
 }
 

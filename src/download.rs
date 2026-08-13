@@ -246,36 +246,59 @@ pub fn finalize_file(merged: &Path, target: &Path) -> io::Result<()> {
     fs::rename(merged, target)
 }
 
-/// Commit a fully validated temporary file to its destination.  When an
-/// overwrite was explicitly approved, the old file is moved aside only for
-/// the short commit window and restored if the replacement fails.
+/// Commit a fully validated temporary file to its destination.  The platform
+/// replacement primitive keeps the old file in place until the replacement is
+/// committed atomically; a crash cannot leave the destination missing.
 pub fn replace_file(merged: &Path, target: &Path) -> io::Result<()> {
     if !target.exists() {
-        return fs::rename(merged, target);
-    }
-
-    let parent = target.parent().unwrap_or_else(|| Path::new("."));
-    let file_name = target
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("download");
-    let mut backup = parent.join(format!(".{file_name}.curl-overwrite-backup"));
-    if backup.exists() {
-        let stamp = current_unix_ms();
-        backup = parent.join(format!(".{file_name}.curl-overwrite-backup-{stamp}"));
-    }
-
-    fs::rename(target, &backup)?;
-    match fs::rename(merged, target) {
-        Ok(()) => {
-            let _ = fs::remove_file(backup);
-            Ok(())
-        }
-        Err(error) => {
-            let _ = fs::rename(&backup, target);
-            Err(error)
+        match fs::rename(merged, target) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() != io::ErrorKind::AlreadyExists => return Err(error),
+            Err(_) => {}
         }
     }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+        };
+
+        let target_w: Vec<u16> = target.as_os_str().encode_wide().chain(Some(0)).collect();
+        let merged_w: Vec<u16> = merged.as_os_str().encode_wide().chain(Some(0)).collect();
+        let replaced = unsafe {
+            MoveFileExW(
+                merged_w.as_ptr(),
+                target_w.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if replaced == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    {
+        fs::rename(merged, target)
+    }
+}
+
+fn replace_file_if_unchanged(
+    merged: &Path,
+    target: &Path,
+    expected: &Option<TargetFingerprint>,
+) -> io::Result<()> {
+    let current = storage::target_fingerprint_with_digest(target)?;
+    if !fingerprints_match(expected.as_ref(), current.as_ref()) {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "目標檔案在整合期間已變更，拒絕覆蓋",
+        ));
+    }
+    replace_file(merged, target)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -323,13 +346,21 @@ impl Engine {
         metrics: Arc<EngineMetrics>,
     ) -> Self {
         for task in &mut state.tasks {
-            if task.status != TaskStatus::Completed {
+            task.sanitize_persisted_filename();
+            if !matches!(task.status, TaskStatus::Completed | TaskStatus::Cancelled) {
                 task.recover_after_load();
                 if let Err(error) = reconcile_task(task) {
                     task.last_error = Some(error);
                     task.status = TaskStatus::Failed;
                 }
             }
+        }
+        for task in state
+            .tasks
+            .iter()
+            .filter(|task| matches!(task.status, TaskStatus::Completed | TaskStatus::Cancelled))
+        {
+            let _ = storage::cleanup_task_work_dir(task);
         }
         Self {
             state_path,
@@ -385,6 +416,7 @@ impl Engine {
             self.schedule_round_robin();
             if last_tick.elapsed() >= Duration::from_millis(500) {
                 self.refresh_progress();
+                self.retry_terminal_work_dir_cleanup();
                 self.publish_snapshot();
                 last_tick = Instant::now();
             }
@@ -441,7 +473,13 @@ impl Engine {
             }
             EngineCommand::Start(id) => self.request_start(id),
             EngineCommand::Pause(id) => self.pause_task(id),
-            EngineCommand::Cancel(id) => self.cancel_task(id),
+            EngineCommand::Cancel(id) => {
+                let _ = self.cancel_task(id);
+            }
+            EngineCommand::CancelWithResponse { id, response } => {
+                let result = self.cancel_task(id);
+                let _ = response.send(result);
+            }
             EngineCommand::Remove(id) => self.remove_task(id),
             EngineCommand::ClearHistory => self.clear_history(),
             EngineCommand::StartAll => {
@@ -544,6 +582,17 @@ impl Engine {
         new_task: ConfiguredTask,
         origin: TaskOrigin,
     ) -> Result<ConfiguredTaskAcceptance, String> {
+        if let Some(request_id) = new_task.request_id.as_deref()
+            && let Some(existing) = self.tasks.iter().find(|task| {
+                task.external_request_id.as_deref() == Some(request_id)
+                    && !matches!(task.status, TaskStatus::Failed | TaskStatus::Cancelled)
+            })
+        {
+            return Ok(ConfiguredTaskAcceptance {
+                task_id: existing.id,
+                awaiting_file_decision: existing.status == TaskStatus::AwaitingFileDecision,
+            });
+        }
         let parsed = url::Url::parse(&new_task.url).map_err(|_| "網址格式無效".to_owned())?;
         if !matches!(parsed.scheme(), "http" | "https") {
             return Err("只支援 HTTP 或 HTTPS 網址".into());
@@ -558,6 +607,7 @@ impl Engine {
         let filename = filename::sanitize_filename(&new_task.filename, id);
         let mut task =
             DownloadTask::new_with_origin(id, &new_task.url, filename, new_task.target_dir, origin);
+        task.external_request_id = new_task.request_id;
         task.requested_segments = new_task.requested_segments.clamp(1, 8);
         task.proxy = new_task.proxy;
         task.created_unix_ms = current_unix_ms();
@@ -622,7 +672,7 @@ impl Engine {
         });
         let destination_changed = self
             .task(id)
-            .is_some_and(|task| task.target_dir != target_dir);
+            .is_some_and(|task| task.target_dir != target_dir || task.filename != filename_value);
         if source_changed || destination_changed {
             self.stop_task_jobs(id);
             self.queue.retain(|queued| *queued != id);
@@ -639,11 +689,12 @@ impl Engine {
             self.stop_task_jobs(id);
             self.queue.retain(|queued| *queued != id);
         }
+        let safe_filename = filename::sanitize_filename(&filename_value, id);
         let Some(task) = self.task_mut(id) else {
             return;
         };
         task.original_url = url;
-        task.filename = filename_value;
+        task.filename = safe_filename;
         task.target_dir = target_dir;
         task.requested_segments = requested_segments.clamp(1, 8);
         task.proxy = proxy;
@@ -763,7 +814,15 @@ impl Engine {
             return false;
         };
         let target = task.target_dir.join(&task.filename);
-        let fingerprint = match storage::target_fingerprint(&target) {
+        let fingerprint = match if task
+            .pending_target_fingerprint
+            .as_ref()
+            .is_some_and(|value| value.content_digest.is_some())
+        {
+            storage::target_fingerprint_with_digest(&target)
+        } else {
+            storage::target_fingerprint(&target)
+        } {
             Ok(fingerprint) => fingerprint,
             Err(error) => {
                 self.fail_task(
@@ -787,7 +846,10 @@ impl Engine {
         }
         let approved = self.task(id).is_some_and(|task| {
             task.overwrite_approval == Some(FileDecision::Overwrite)
-                && task.pending_target_fingerprint == fingerprint
+                && fingerprints_match(
+                    task.pending_target_fingerprint.as_ref(),
+                    fingerprint.as_ref(),
+                )
         });
         if approved {
             return true;
@@ -822,6 +884,7 @@ impl Engine {
                 if let Some(task) = self.task_mut(id) {
                     let _ = storage::cleanup_task_work_dir(task);
                     task.proxy.clear_password();
+                    task.external_request_id = None;
                     task.overwrite_approval = None;
                     task.pending_target_fingerprint = None;
                     task.status = TaskStatus::Cancelled;
@@ -832,9 +895,11 @@ impl Engine {
             }
             FileDecision::Overwrite => {
                 let target = task.target_dir.join(&task.filename);
-                let current = storage::target_fingerprint(&target)
+                let current = storage::target_fingerprint_with_digest(&target)
                     .map_err(|error| format!("無法讀取目標檔案：{error}"))?;
-                if current != task.pending_target_fingerprint && current.is_some() {
+                if !fingerprints_match(task.pending_target_fingerprint.as_ref(), current.as_ref())
+                    && current.is_some()
+                {
                     if let Some(task) = self.task_mut(id) {
                         task.pending_target_fingerprint = current;
                         task.overwrite_approval = None;
@@ -907,23 +972,40 @@ impl Engine {
         let _ = self.persist();
     }
 
-    fn cancel_task(&mut self, id: TaskId) {
+    fn cancel_task(&mut self, id: TaskId) -> Result<(), String> {
+        let Some(status) = self.task(id).map(|task| task.status) else {
+            return Err("找不到下載任務。".to_owned());
+        };
+        if status == TaskStatus::Completed {
+            return Err("下載已完成，不能取消。".to_owned());
+        }
+        if status == TaskStatus::Cancelled {
+            return Ok(());
+        }
         self.stop_task_jobs(id);
         self.queue.retain(|queued| *queued != id);
         self.pending_start.remove(&id);
         if let Some(task) = self.task_mut(id) {
             let _ = storage::cleanup_task_work_dir(task);
             task.proxy.clear_password();
+            task.external_request_id = None;
             task.overwrite_approval = None;
             task.pending_target_fingerprint = None;
             task.status = TaskStatus::Cancelled;
         }
-        let _ = self.persist();
+        self.persist()
+            .map_err(|error| format!("取消任務後無法保存狀態：{error}"))?;
+        Ok(())
     }
 
     fn remove_task(&mut self, id: TaskId) {
-        self.cancel_task(id);
-        self.tasks.retain(|task| task.id != id);
+        let _ = self.cancel_task(id);
+        let can_remove = self
+            .task(id)
+            .is_some_and(|task| storage::cleanup_task_work_dir(task).is_ok());
+        if can_remove {
+            self.tasks.retain(|task| task.id != id);
+        }
         let _ = self.persist();
         self.publish_snapshot();
     }
@@ -943,10 +1025,24 @@ impl Engine {
             self.meters.remove(&task.id);
             let _ = storage::cleanup_task_work_dir(task);
         }
-        self.tasks
-            .retain(|task| !matches!(task.status, TaskStatus::Completed | TaskStatus::Cancelled));
+        self.tasks.retain(|task| {
+            if !matches!(task.status, TaskStatus::Completed | TaskStatus::Cancelled) {
+                return true;
+            }
+            storage::cleanup_task_work_dir(task).is_err()
+        });
         let _ = self.persist();
         self.publish_snapshot();
+    }
+
+    fn retry_terminal_work_dir_cleanup(&self) {
+        for task in self
+            .tasks
+            .iter()
+            .filter(|task| matches!(task.status, TaskStatus::Completed | TaskStatus::Cancelled))
+        {
+            let _ = storage::cleanup_task_work_dir(task);
+        }
     }
 
     fn start_task(&mut self, id: TaskId) {
@@ -971,7 +1067,15 @@ impl Engine {
             return;
         }
         let target = task.target_dir.join(&task.filename);
-        let fingerprint = match storage::target_fingerprint(&target) {
+        let fingerprint = match if task
+            .pending_target_fingerprint
+            .as_ref()
+            .is_some_and(|value| value.content_digest.is_some())
+        {
+            storage::target_fingerprint_with_digest(&target)
+        } else {
+            storage::target_fingerprint(&target)
+        } {
             Ok(fingerprint) => fingerprint,
             Err(error) => {
                 self.fail_task(
@@ -988,7 +1092,10 @@ impl Engine {
         };
         if fingerprint.is_some()
             && !(task.overwrite_approval == Some(FileDecision::Overwrite)
-                && fingerprint == task.pending_target_fingerprint)
+                && fingerprints_match(
+                    task.pending_target_fingerprint.as_ref(),
+                    fingerprint.as_ref(),
+                ))
         {
             task.pending_target_fingerprint = fingerprint;
             task.overwrite_approval = None;
@@ -1368,14 +1475,23 @@ impl Engine {
             task.range_support = meta.range_support;
             task.etag = meta.etag;
             task.last_modified = meta.last_modified;
+            let mut destination_changed = false;
             if let Some(server_name) = meta.content_disposition.as_deref() {
                 if let Ok(url) = url::Url::parse(&task.original_url) {
                     let generated = filename::suggest_filename(None, &url, task.id);
                     if task.filename == generated {
-                        task.filename =
+                        let suggested =
                             filename::suggest_filename(Some(server_name), &url, task.id);
+                        destination_changed = task.filename != suggested;
+                        task.filename = suggested;
                     }
                 }
+            }
+            if destination_changed {
+                // A server-provided filename changes the overwrite target;
+                // an approval for the old path must not carry over.
+                task.overwrite_approval = None;
+                task.pending_target_fingerprint = None;
             }
             task.status = TaskStatus::Queued;
         }
@@ -1503,7 +1619,7 @@ impl Engine {
         };
         let work = storage::task_work_dir(&task);
         let target = task.target_dir.join(&task.filename);
-        let current_target = match storage::target_fingerprint(&target) {
+        let current_target = match storage::target_fingerprint_with_digest(&target) {
             Ok(fingerprint) => fingerprint,
             Err(error) => {
                 self.fail_task(
@@ -1520,7 +1636,10 @@ impl Engine {
         };
         if current_target.is_some()
             && (task.overwrite_approval != Some(FileDecision::Overwrite)
-                || task.pending_target_fingerprint != current_target)
+                || !fingerprints_match(
+                    task.pending_target_fingerprint.as_ref(),
+                    current_target.as_ref(),
+                ))
         {
             if let Some(task) = self.task_mut(id) {
                 task.pending_target_fingerprint = current_target;
@@ -1542,9 +1661,9 @@ impl Engine {
                 .collect::<Vec<_>>();
             let merged = work.join("merged.part");
             merge_segments(&parts, &merged, task.total_size.unwrap_or(0))
-                .and_then(|_| replace_file(&merged, &target))
+                .and_then(|_| replace_file_if_unchanged(&merged, &target, &current_target))
         } else {
-            replace_file(&work.join("payload.part"), &target)
+            replace_file_if_unchanged(&work.join("payload.part"), &target, &current_target)
         };
         if let Err(error) = result {
             self.fail_task(
@@ -1749,6 +1868,26 @@ fn current_unix_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn fingerprints_match(
+    expected: Option<&TargetFingerprint>,
+    current: Option<&TargetFingerprint>,
+) -> bool {
+    match (expected, current) {
+        (None, None) => true,
+        (Some(expected), Some(current)) => {
+            expected.length == current.length
+                && expected.modified_unix_nanos == current.modified_unix_nanos
+                && expected
+                    .file_identity
+                    .is_none_or(|identity| current.file_identity == Some(identity))
+                && expected
+                    .content_digest
+                    .is_none_or(|digest| current.content_digest == Some(digest))
+        }
+        _ => false,
+    }
 }
 
 fn record_segment_start(segment: &mut SegmentState, unix_ms: u64) {

@@ -4,6 +4,10 @@ const createBackground = require('../background.js');
 
 function makeFakeBrowser({
   resumeFails = false,
+  pauseFails = false,
+  eraseFails = false,
+  downloadFails = false,
+  tabCreateFails = false,
   nativeDisconnect = false,
   nativeFailuresBeforeSuccess = 0,
   nativeDelayMs = 0,
@@ -35,15 +39,22 @@ function makeFakeBrowser({
   const browser = {
     downloads: {
       onCreated: { addListener(listener) { events.created = listener; } },
-      pause: async (id) => { calls.pause.push(id); },
+      pause: async (id) => {
+        calls.pause.push(id);
+        if (pauseFails) throw new Error('pause failed');
+      },
       resume: async (id) => {
         calls.resume.push(id);
         if (resumeFails) throw new Error('resume failed');
       },
       cancel: async (id) => { calls.cancel.push(id); },
-      erase: async (query) => { calls.erase.push(query); },
+      erase: async (query) => {
+        calls.erase.push(query);
+        if (eraseFails) throw new Error('erase failed');
+      },
       download: async (details) => {
         calls.download.push(details);
+        if (downloadFails) throw new Error('download failed');
         const id = nextDownloadId++;
         queueMicrotask(() => events.created && events.created({
           id,
@@ -56,6 +67,7 @@ function makeFakeBrowser({
     tabs: {
       onRemoved: { addListener(listener) { events.removed = listener; } },
       create: async (details) => {
+        if (tabCreateFails) throw new Error('tab create failed');
         const tab = { id: nextTabId++, ...details };
         calls.tabs.push(tab);
         return tab;
@@ -550,4 +562,105 @@ test('download segment count must be an integer from one through eight', () => {
   assert.match(background.validateForm({ ...base, segments: 0 }), /1 至 8/);
   assert.match(background.validateForm({ ...base, segments: 9 }), /1 至 8/);
   assert.match(background.validateForm({ ...base, segments: 2.5 }), /整數/);
+});
+
+test('pause failure resumes the original Firefox item without duplicating it', async () => {
+  const fake = makeFakeBrowser({ pauseFails: true, eraseFails: true });
+  const background = createBackground(fake.browser);
+  const result = await background.handleCreatedDownload({
+    id: 11,
+    url: 'https://example.test/file.zip',
+    filename: 'file.zip'
+  });
+  assert.deepEqual(fake.calls.pause, [11]);
+  assert.deepEqual(fake.calls.cancel, []);
+  assert.deepEqual(fake.calls.erase, []);
+  assert.deepEqual(fake.calls.resume, [11]);
+  assert.deepEqual(fake.calls.download, []);
+  assert.deepEqual(result, { restored: true });
+});
+
+test('erase failure after pause keeps the settings page available for retry', async () => {
+  const fake = makeFakeBrowser({ eraseFails: true });
+  const background = createBackground(fake.browser);
+  const result = await background.handleCreatedDownload({
+    id: 12,
+    url: 'https://example.test/file.zip',
+    filename: 'file.zip'
+  });
+  assert.deepEqual(fake.calls.pause, [12]);
+  assert.deepEqual(fake.calls.cancel, [12]);
+  assert.equal(fake.calls.erase.length, 3);
+  assert.deepEqual(fake.calls.resume, []);
+  assert.deepEqual(fake.calls.download, []);
+  assert.deepEqual(result, { paused: true, tabId: 10 });
+});
+
+test('Firefox restore failure keeps the pending item for a visible retry', async () => {
+  const fake = makeFakeBrowser({ downloadFails: true });
+  const background = createBackground(fake.browser, { attempts: 1, delayMs: 0 });
+  await background.handleCreatedDownload({
+    id: 13,
+    url: 'https://example.test/file.zip',
+    filename: 'file.zip'
+  });
+  const result = await background.handleRuntimeMessage({
+    type: 'restore-firefox',
+    downloadId: 13
+  });
+  assert.equal(result.ok, false);
+  const pending = await background.handleRuntimeMessage({ type: 'get-pending', downloadId: 13 });
+  assert.equal(pending.ok, true);
+});
+
+test('accepted Curl task is cancelled before Firefox fallback when native erase fails', async () => {
+  const fake = makeFakeBrowser({
+    eraseFails: true,
+    nativeResponse: (message) => {
+      if (message.type === 'enqueue') {
+        return { type: 'enqueue_result', ok: true, task_id: 91, awaiting_file_decision: false };
+      }
+      if (message.type === 'cancel_task') {
+        return { type: 'action_result', ok: true };
+      }
+      return { type: 'task_list', tasks: [] };
+    }
+  });
+  const background = createBackground(fake.browser, { attempts: 1, delayMs: 0 });
+  await background.handleCreatedDownload({
+    id: 15,
+    url: 'https://example.test/file.zip',
+    filename: 'file.zip'
+  });
+  const result = await background.submitExternalDownload(15, {
+    filename: 'file.zip',
+    targetDir: 'C:\\Downloads',
+    proxy: { enabled: false }
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'firefox_cleanup_failed');
+  assert.equal(result.taskCancelled, true);
+  assert.deepEqual(fake.calls.nativeMessages.map((message) => message.type), [
+    'enqueue',
+    'cancel_task'
+  ]);
+  const pending = await background.handleRuntimeMessage({ type: 'get-pending', downloadId: 15 });
+  assert.equal(pending.ok, true);
+});
+
+test('settings-tab failure reports an unrecoverable Firefox handoff without losing pending state', async () => {
+  const fake = makeFakeBrowser({ tabCreateFails: true, resumeFails: true, downloadFails: true });
+  const background = createBackground(fake.browser, { attempts: 1, delayMs: 0 });
+  const result = await background.handleCreatedDownload({
+    id: 14,
+    url: 'https://example.test/file.zip',
+    filename: 'file.zip'
+  });
+  assert.deepEqual(result, {
+    restored: false,
+    error: 'Firefox 下載未能恢復；請重新開啟下載設定頁後重試。'
+  });
+  assert.ok(fake.calls.notifications.length >= 1);
+  const pending = await background.handleRuntimeMessage({ type: 'get-pending', downloadId: 14 });
+  assert.equal(pending.ok, true);
 });

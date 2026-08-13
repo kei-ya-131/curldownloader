@@ -12,7 +12,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::Sender,
     },
     thread,
@@ -20,6 +20,7 @@ use std::{
 };
 
 pub const MAX_FRAME_BYTES: usize = 64 * 1024;
+const MAX_PIPE_CLIENTS: usize = 32;
 pub const PIPE_NAME: &str = r"\\.\pipe\curl-downloader-v1";
 const TEST_SHUTDOWN_MANUAL_ENV: &str = "CURL_DOWNLOADER_TEST_SHUTDOWN_MANUAL";
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -94,6 +95,7 @@ fn wire_status_name(status: TaskStatus) -> &'static str {
         TaskStatus::Completed => "completed",
         TaskStatus::Failed => "failed",
         TaskStatus::Cancelled => "cancelled",
+        TaskStatus::Unknown => "paused",
     }
 }
 
@@ -151,6 +153,10 @@ pub enum IpcRequest {
         request_id: String,
         task_id: TaskId,
     },
+    CancelTask {
+        request_id: String,
+        task_id: TaskId,
+    },
     Enqueue {
         request_id: String,
         url: String,
@@ -179,6 +185,7 @@ impl IpcRequest {
             | Self::ShowTask { request_id, .. }
             | Self::OpenFile { request_id, .. }
             | Self::OpenFolder { request_id, .. }
+            | Self::CancelTask { request_id, .. }
             | Self::Enqueue { request_id, .. }
             | Self::ResolveFileConflict { request_id, .. } => request_id,
         }
@@ -319,6 +326,65 @@ pub fn write_frame<W: Write>(writer: &mut W, body: &[u8]) -> io::Result<()> {
     writer.flush()
 }
 
+#[cfg(windows)]
+fn read_named_pipe_frame(
+    reader: &mut impl Read,
+    handle: windows_sys::Win32::Foundation::HANDLE,
+    max_len: usize,
+    timeout: Duration,
+) -> io::Result<Vec<u8>> {
+    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+
+    fn wait_for_bytes(
+        handle: windows_sys::Win32::Foundation::HANDLE,
+        required: u32,
+        deadline: Instant,
+    ) -> io::Result<()> {
+        loop {
+            let mut available = 0u32;
+            let ok = unsafe {
+                PeekNamedPipe(
+                    handle,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    &mut available,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if available >= required {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "Native pipe frame read timed out",
+                ));
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    let deadline = Instant::now() + timeout;
+    wait_for_bytes(handle, 4, deadline)?;
+    let mut prefix = [0u8; 4];
+    reader.read_exact(&mut prefix)?;
+    let length = u32::from_le_bytes(prefix) as usize;
+    if length == 0 || length > max_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "IPC frame size is invalid",
+        ));
+    }
+    wait_for_bytes(handle, length as u32, deadline)?;
+    let mut body = vec![0u8; length];
+    reader.read_exact(&mut body)?;
+    Ok(body)
+}
+
 pub fn spawn_server(
     commands: Sender<EngineCommand>,
     last_download_dir: Arc<Mutex<PathBuf>>,
@@ -447,7 +513,7 @@ fn run_windows_server(
 ) {
     use std::{
         fs::File,
-        os::windows::io::{FromRawHandle, RawHandle},
+        os::windows::io::{AsRawHandle, FromRawHandle, RawHandle},
         ptr,
     };
     use windows_sys::Win32::{
@@ -460,6 +526,7 @@ fn run_windows_server(
     };
 
     let pipe_name = pipe_name_wide();
+    let active_clients = Arc::new(AtomicUsize::new(0));
     let (security_attributes, _security_descriptor) = match named_pipe_security_attributes() {
         Ok(value) => value,
         Err(_) => return,
@@ -499,17 +566,55 @@ fn run_windows_server(
             }
         }
 
-        let mut stream = unsafe { File::from_raw_handle(handle as RawHandle) };
-        if let Ok(body) = read_frame(&mut stream, MAX_FRAME_BYTES) {
-            if let Ok(request) = serde_json::from_slice::<IpcRequest>(&body) {
-                let response =
-                    dispatch_request(request, &commands, &last_download_dir, &state, &controller);
-                if let Ok(body) = serde_json::to_vec(&response) {
-                    let _ = write_frame(&mut stream, &body);
-                }
+        if active_clients.load(Ordering::Acquire) >= MAX_PIPE_CLIENTS {
+            unsafe {
+                CloseHandle(handle);
             }
+            continue;
         }
-        drop(stream);
+        active_clients.fetch_add(1, Ordering::AcqRel);
+
+        let stream = unsafe { File::from_raw_handle(handle as RawHandle) };
+        // Keep accepting new instances while a client is being authenticated
+        // or is timing out on a partial frame.  A single slow client must not
+        // monopolize the Native Messaging bridge.
+        let client_commands = commands.clone();
+        let client_last_download_dir = Arc::clone(&last_download_dir);
+        let client_state = state.clone();
+        let client_controller = controller.clone();
+        let client_count = Arc::clone(&active_clients);
+        if thread::Builder::new()
+            .name("native-bridge-client".into())
+            .spawn(move || {
+                let mut stream = stream;
+                let pipe = stream.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+                if let Ok(body) = read_named_pipe_frame(
+                    &mut stream,
+                    pipe,
+                    MAX_FRAME_BYTES,
+                    Duration::from_secs(5),
+                ) {
+                    if let Ok(request) = serde_json::from_slice::<IpcRequest>(&body) {
+                        let trusted_client = named_pipe_client_is_trusted(pipe);
+                        let response = dispatch_request(
+                            request,
+                            &client_commands,
+                            &client_last_download_dir,
+                            &client_state,
+                            &client_controller,
+                            trusted_client,
+                        );
+                        if let Ok(body) = serde_json::to_vec(&response) {
+                            let _ = write_frame(&mut stream, &body);
+                        }
+                    }
+                }
+                client_count.fetch_sub(1, Ordering::AcqRel);
+            })
+            .is_err()
+        {
+            active_clients.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 }
 
@@ -527,15 +632,10 @@ fn request_focus_task_id(request: &IpcRequest) -> Option<TaskId> {
     }
 }
 
-fn request_show_task(
-    task_id: TaskId,
-    state: &SharedControllerState,
-    controller: &Sender<ControllerCommand>,
-) -> bool {
-    state.task_exists(task_id)
-        && controller
-            .send(ControllerCommand::ShowTask { task_id })
-            .is_ok()
+fn request_show_task(task_id: TaskId, controller: &Sender<ControllerCommand>) -> bool {
+    controller
+        .send(ControllerCommand::ShowTask { task_id })
+        .is_ok()
 }
 
 fn dispatch_request(
@@ -544,7 +644,32 @@ fn dispatch_request(
     last_download_dir: &Arc<Mutex<PathBuf>>,
     state: &SharedControllerState,
     controller: &Sender<ControllerCommand>,
+    trusted_client: bool,
 ) -> IpcResponse {
+    if !trusted_client {
+        return match request {
+            IpcRequest::Enqueue { request_id, .. } => enqueue_error(
+                request_id,
+                "unauthorized_client",
+                "Native host client 未獲授權。",
+            ),
+            IpcRequest::ResolveFileConflict { request_id, .. }
+            | IpcRequest::ShowWindow { request_id }
+            | IpcRequest::ShowTask { request_id, .. }
+            | IpcRequest::OpenFile { request_id, .. }
+            | IpcRequest::OpenFolder { request_id, .. }
+            | IpcRequest::CancelTask { request_id, .. }
+            | IpcRequest::PickFolder { request_id }
+            | IpcRequest::GetDefaults { request_id }
+            | IpcRequest::ListTasks { request_id }
+            | IpcRequest::ShutdownManual { request_id }
+            | IpcRequest::Ping { request_id } => action_error(
+                request_id,
+                "unauthorized_client",
+                "Native host client 未獲授權。",
+            ),
+        };
+    }
     match request {
         IpcRequest::Ping { request_id } => IpcResponse::Pong {
             request_id,
@@ -604,16 +729,12 @@ fn dispatch_request(
             request_id,
             task_id,
         } => {
-            if !request_show_task(task_id, state, controller) {
-                if state.task_exists(task_id) {
-                    action_error(
-                        request_id,
-                        "gui_unavailable",
-                        "Curl Downloader GUI 未能接收操作。",
-                    )
-                } else {
-                    action_error(request_id, "task_not_found", "找不到下載任務。")
-                }
+            if !request_show_task(task_id, controller) {
+                action_error(
+                    request_id,
+                    "gui_unavailable",
+                    "Curl Downloader GUI 未能接收操作。",
+                )
             } else {
                 action_success(request_id)
             }
@@ -626,6 +747,26 @@ fn dispatch_request(
             request_id,
             task_id,
         } => open_task_folder(request_id, task_id, state),
+        IpcRequest::CancelTask {
+            request_id,
+            task_id,
+        } => {
+            let (response_tx, response_rx) = std::sync::mpsc::channel();
+            if commands
+                .send(EngineCommand::CancelWithResponse {
+                    id: task_id,
+                    response: response_tx,
+                })
+                .is_err()
+            {
+                return action_error(request_id, "engine_unavailable", "下載引擎未能接收操作。");
+            }
+            match response_rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(Ok(())) => action_success(request_id),
+                Ok(Err(message)) => action_error(request_id, "cancel_failed", &message),
+                Err(_) => action_error(request_id, "engine_timeout", "下載引擎回應逾時。"),
+            }
+        }
         IpcRequest::ResolveFileConflict {
             request_id,
             task_id,
@@ -690,6 +831,7 @@ fn dispatch_request(
                         target_dir: target_dir.clone(),
                         requested_segments,
                         proxy,
+                        request_id: Some(request_id.clone()),
                     },
                     origin: TaskOrigin::Firefox,
                     response: response_tx,
@@ -726,7 +868,30 @@ fn dispatch_request_for_test(
 ) -> IpcResponse {
     let (commands, _receiver) = std::sync::mpsc::channel();
     let last_download_dir = Arc::new(Mutex::new(PathBuf::from(r"C:\Downloads")));
-    dispatch_request(request, &commands, &last_download_dir, state, controller)
+    dispatch_request(
+        request,
+        &commands,
+        &last_download_dir,
+        state,
+        controller,
+        true,
+    )
+}
+
+#[cfg(test)]
+fn dispatch_untrusted_request_for_test(request: IpcRequest) -> IpcResponse {
+    let (commands, _receiver) = std::sync::mpsc::channel();
+    let state = SharedControllerState::new(crate::controller::LifecycleState::RunningHidden);
+    let controller = std::sync::mpsc::channel().0;
+    let last_download_dir = Arc::new(Mutex::new(PathBuf::from(r"C:\Downloads")));
+    dispatch_request(
+        request,
+        &commands,
+        &last_download_dir,
+        &state,
+        &controller,
+        false,
+    )
 }
 fn action_from_open_outcome(
     request_id: String,
@@ -853,6 +1018,13 @@ fn call_windows_pipe(request: &IpcRequest, timeout: Duration) -> io::Result<IpcR
         thread::sleep(Duration::from_millis(10));
     };
 
+    if !named_pipe_server_is_trusted(handle) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Named Pipe 伺服器未獲授權",
+        ));
+    }
+
     let mut stream = unsafe { File::from_raw_handle(handle as RawHandle) };
     let body = serde_json::to_vec(request)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
@@ -871,6 +1043,68 @@ fn call_windows_pipe(request: &IpcRequest, timeout: Duration) -> io::Result<IpcR
 }
 
 #[cfg(windows)]
+fn named_pipe_server_is_trusted(pipe: windows_sys::Win32::Foundation::HANDLE) -> bool {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, HANDLE},
+        System::{
+            Pipes::GetNamedPipeServerProcessId,
+            Threading::{
+                GetCurrentProcessId, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+                QueryFullProcessImageNameW,
+            },
+        },
+    };
+
+    // A pipe name alone is not an authentication mechanism: another process
+    // in the same user session can create the name before the GUI does.  Bind
+    // the client to the actual GUI process and its single-instance mutex.
+    // The debug-only test override is restricted to the test pipe suffix and
+    // is never compiled into the release artifact.
+    let test_override = cfg!(debug_assertions)
+        && std::env::var_os("CURL_DOWNLOADER_PIPE_SUFFIX")
+            .is_some_and(|suffix| suffix.to_string_lossy().starts_with("test-"));
+    if !test_override && !crate::single_instance::is_running() {
+        return false;
+    }
+    let mut server_pid = 0u32;
+    if unsafe { GetNamedPipeServerProcessId(pipe, &mut server_pid) } == 0
+        || server_pid == 0
+        || (server_pid == unsafe { GetCurrentProcessId() } && !test_override)
+    {
+        return false;
+    }
+    let process: HANDLE = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, server_pid) };
+    if process.is_null() {
+        return false;
+    }
+    let trusted = (|| {
+        let mut buffer = vec![0u16; 32_768];
+        let mut length = buffer.len() as u32;
+        if unsafe { QueryFullProcessImageNameW(process, 0, buffer.as_mut_ptr(), &mut length) } == 0
+        {
+            return false;
+        }
+        buffer.truncate(length as usize);
+        let server_path = std::ffi::OsString::from_wide(&buffer);
+        let Ok(client_path) = std::env::current_exe() else {
+            return false;
+        };
+        if !server_path
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&client_path.to_string_lossy())
+        {
+            return false;
+        }
+        process_user_sid(process) == current_process_user_sid()
+    })();
+    unsafe {
+        CloseHandle(process);
+    }
+    trusted
+}
+
+#[cfg(windows)]
 struct NamedPipeSecurityDescriptor {
     raw: windows_sys::Win32::Security::PSECURITY_DESCRIPTOR,
 }
@@ -886,8 +1120,374 @@ impl Drop for NamedPipeSecurityDescriptor {
     }
 }
 
-fn named_pipe_security_descriptor_sddl() -> &'static str {
-    "D:(A;;GA;;;WD)"
+fn named_pipe_security_descriptor_sddl(user_sid: &str) -> String {
+    format!("D:(A;;GA;;;{user_sid})")
+}
+
+#[cfg(windows)]
+fn named_pipe_client_is_trusted(pipe: windows_sys::Win32::Foundation::HANDLE) -> bool {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, HANDLE},
+        System::{
+            Pipes::GetNamedPipeClientProcessId,
+            Threading::{
+                GetCurrentProcessId, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+                QueryFullProcessImageNameW,
+            },
+        },
+    };
+
+    let mut client_pid = 0u32;
+    if unsafe { GetNamedPipeClientProcessId(pipe, &mut client_pid) } == 0 || client_pid == 0 {
+        return false;
+    }
+    let process: HANDLE = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, client_pid) };
+    if process.is_null() {
+        return false;
+    }
+    let trusted = (|| {
+        let mut buffer = vec![0u16; 32_768];
+        let mut length = buffer.len() as u32;
+        if unsafe { QueryFullProcessImageNameW(process, 0, buffer.as_mut_ptr(), &mut length) } == 0
+        {
+            return false;
+        }
+        buffer.truncate(length as usize);
+        let client_path = std::ffi::OsString::from_wide(&buffer);
+        let Ok(server_path) = std::env::current_exe() else {
+            return false;
+        };
+        if !client_path
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&server_path.to_string_lossy())
+        {
+            return false;
+        }
+        if process_user_sid(process) != current_process_user_sid() {
+            return false;
+        }
+        #[cfg(feature = "smoke-test-native-auth")]
+        if std::env::var_os("CURL_DOWNLOADER_TEST_NATIVE_CLIENT").is_some() {
+            return true;
+        }
+        if client_pid == unsafe { GetCurrentProcessId() } {
+            return true;
+        }
+        parent_process_is_firefox(client_pid)
+    })();
+    unsafe {
+        CloseHandle(process);
+    }
+    trusted
+}
+
+#[cfg(windows)]
+fn current_process_user_sid() -> Option<String> {
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    process_user_sid(unsafe { GetCurrentProcess() })
+}
+
+#[cfg(windows)]
+fn process_user_sid(process: windows_sys::Win32::Foundation::HANDLE) -> Option<String> {
+    use std::{ffi::OsString, os::windows::ffi::OsStringExt, ptr};
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, ERROR_INSUFFICIENT_BUFFER, GetLastError, LocalFree},
+        Security::Authorization::ConvertSidToStringSidW,
+        Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser},
+        System::Threading::OpenProcessToken,
+    };
+
+    let mut token = ptr::null_mut();
+    if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) } == 0 {
+        return None;
+    }
+    let result = (|| {
+        let mut required = 0u32;
+        let _ = unsafe { GetTokenInformation(token, TokenUser, ptr::null_mut(), 0, &mut required) };
+        if required == 0 && unsafe { GetLastError() } != ERROR_INSUFFICIENT_BUFFER {
+            return None;
+        }
+        let mut bytes = vec![0u8; required as usize];
+        if unsafe {
+            GetTokenInformation(
+                token,
+                TokenUser,
+                bytes.as_mut_ptr().cast(),
+                bytes.len() as u32,
+                &mut required,
+            )
+        } == 0
+        {
+            return None;
+        }
+        let user = unsafe { &*bytes.as_ptr().cast::<TOKEN_USER>() };
+        let mut sid_string = ptr::null_mut();
+        if unsafe { ConvertSidToStringSidW(user.User.Sid, &mut sid_string) } == 0 {
+            return None;
+        }
+        let value = unsafe {
+            let mut length = 0usize;
+            while *sid_string.add(length) != 0 {
+                length += 1;
+            }
+            OsString::from_wide(std::slice::from_raw_parts(sid_string, length))
+                .to_string_lossy()
+                .into_owned()
+        };
+        unsafe {
+            let _ = LocalFree(sid_string.cast());
+        }
+        Some(value)
+    })();
+    unsafe {
+        CloseHandle(token);
+    }
+    result
+}
+
+#[cfg(windows)]
+fn parent_process_is_firefox(pid: u32) -> bool {
+    use std::{mem::size_of, os::windows::ffi::OsStringExt};
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
+        System::{
+            Diagnostics::ToolHelp::{
+                CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+                TH32CS_SNAPPROCESS,
+            },
+            Threading::{
+                OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+            },
+        },
+    };
+
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return false;
+    }
+    let mut entry = PROCESSENTRY32W {
+        dwSize: size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    let mut parent_pid = None;
+    let mut found = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
+    while found {
+        if entry.th32ProcessID == pid {
+            parent_pid = Some(entry.th32ParentProcessID);
+            break;
+        }
+        found = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
+    }
+    unsafe {
+        CloseHandle(snapshot);
+    }
+    let Some(parent_pid) = parent_pid else {
+        return false;
+    };
+    let parent = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, parent_pid) };
+    if parent.is_null() {
+        return false;
+    }
+    let mut buffer = vec![0u16; 32_768];
+    let mut length = buffer.len() as u32;
+    let ok =
+        unsafe { QueryFullProcessImageNameW(parent, 0, buffer.as_mut_ptr(), &mut length) } != 0;
+    unsafe {
+        CloseHandle(parent);
+    }
+    if !ok {
+        return false;
+    }
+    buffer.truncate(length as usize);
+    let path = std::ffi::OsString::from_wide(&buffer);
+    let Some(name) = std::path::Path::new(&path)
+        .file_name()
+        .and_then(|name| name.to_str())
+    else {
+        return false;
+    };
+    if !name.eq_ignore_ascii_case("firefox.exe") {
+        return false;
+    }
+    verify_signed_windows_binary(std::path::Path::new(&path))
+}
+
+#[cfg(windows)]
+fn verify_signed_windows_binary(path: &std::path::Path) -> bool {
+    use std::{mem::size_of, os::windows::ffi::OsStrExt, ptr};
+    use windows_sys::Win32::Security::Cryptography::{
+        CERT_NAME_SIMPLE_DISPLAY_TYPE, CertGetNameStringW,
+    };
+    use windows_sys::Win32::Security::WinTrust::{
+        WINTRUST_ACTION_GENERIC_VERIFY_V2, WINTRUST_DATA, WINTRUST_FILE_INFO, WTD_CHOICE_FILE,
+        WTD_REVOKE_NONE, WTD_STATEACTION_CLOSE, WTD_STATEACTION_VERIFY, WTD_UI_NONE,
+        WTHelperGetProvCertFromChain, WTHelperGetProvSignerFromChain,
+        WTHelperProvDataFromStateData, WinVerifyTrust,
+    };
+
+    let wide_path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut file_info = WINTRUST_FILE_INFO {
+        cbStruct: size_of::<WINTRUST_FILE_INFO>() as u32,
+        pcwszFilePath: wide_path.as_ptr(),
+        hFile: ptr::null_mut(),
+        pgKnownSubject: ptr::null_mut(),
+    };
+    let mut trust_data = WINTRUST_DATA {
+        cbStruct: size_of::<WINTRUST_DATA>() as u32,
+        dwUIChoice: WTD_UI_NONE,
+        fdwRevocationChecks: WTD_REVOKE_NONE,
+        dwUnionChoice: WTD_CHOICE_FILE,
+        Anonymous: windows_sys::Win32::Security::WinTrust::WINTRUST_DATA_0 {
+            pFile: &mut file_info,
+        },
+        dwStateAction: WTD_STATEACTION_VERIFY,
+        ..Default::default()
+    };
+    let mut action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    let result = unsafe {
+        WinVerifyTrust(
+            ptr::null_mut(),
+            &mut action,
+            (&mut trust_data as *mut WINTRUST_DATA).cast(),
+        )
+    };
+    let mozilla_signer = if result == 0 && !trust_data.hWVTStateData.is_null() {
+        let provider = unsafe { WTHelperProvDataFromStateData(trust_data.hWVTStateData) };
+        if provider.is_null() {
+            false
+        } else {
+            let signer = unsafe { WTHelperGetProvSignerFromChain(provider, 0, 0, 0) };
+            if signer.is_null()
+                || unsafe { (*signer).csCertChain } == 0
+                || unsafe { (*signer).pasCertChain.is_null() }
+            {
+                false
+            } else {
+                let certificate = unsafe { WTHelperGetProvCertFromChain(signer, 0) };
+                if certificate.is_null() || unsafe { (*certificate).pCert.is_null() } {
+                    false
+                } else {
+                    let mut name = vec![0u16; 256];
+                    let length = unsafe {
+                        CertGetNameStringW(
+                            (*certificate).pCert,
+                            CERT_NAME_SIMPLE_DISPLAY_TYPE,
+                            0,
+                            ptr::null(),
+                            name.as_mut_ptr(),
+                            name.len() as u32,
+                        )
+                    };
+                    if length <= 1 {
+                        false
+                    } else {
+                        name.truncate(length.saturating_sub(1) as usize);
+                        String::from_utf16_lossy(&name)
+                            .trim()
+                            .eq_ignore_ascii_case("mozilla corporation")
+                    }
+                }
+            }
+        }
+    } else {
+        false
+    };
+    trust_data.dwStateAction = WTD_STATEACTION_CLOSE;
+    unsafe {
+        let _ = WinVerifyTrust(
+            ptr::null_mut(),
+            &mut action,
+            (&mut trust_data as *mut WINTRUST_DATA).cast(),
+        );
+    }
+    result == 0 && mozilla_signer && firefox_version_metadata(path)
+}
+
+#[cfg(windows)]
+fn firefox_version_metadata(path: &std::path::Path) -> bool {
+    use std::{os::windows::ffi::OsStrExt, ptr, slice};
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW,
+    };
+    let wide_path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut ignored = 0u32;
+    let size = unsafe { GetFileVersionInfoSizeW(wide_path.as_ptr(), &mut ignored) };
+    if size == 0 {
+        return false;
+    }
+    let mut data = vec![0u8; size as usize];
+    if unsafe { GetFileVersionInfoW(wide_path.as_ptr(), 0, size, data.as_mut_ptr().cast()) } == 0 {
+        return false;
+    }
+
+    fn query_string(data: &[u8], key: &str) -> Option<String> {
+        let key_wide: Vec<u16> = key.encode_utf16().chain(Some(0)).collect();
+        let mut value = ptr::null_mut();
+        let mut length = 0u32;
+        if unsafe {
+            VerQueryValueW(
+                data.as_ptr().cast(),
+                key_wide.as_ptr(),
+                &mut value,
+                &mut length,
+            )
+        } == 0
+            || value.is_null()
+            || length == 0
+        {
+            return None;
+        }
+        let utf16 = unsafe { slice::from_raw_parts(value.cast::<u16>(), length as usize) };
+        Some(
+            String::from_utf16_lossy(utf16)
+                .trim_end_matches('\0')
+                .to_ascii_lowercase(),
+        )
+    }
+
+    let translations = unsafe {
+        let key_wide: Vec<u16> = "\\VarFileInfo\\Translation"
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        let mut value = ptr::null_mut();
+        let mut length = 0u32;
+        if VerQueryValueW(
+            data.as_ptr().cast(),
+            key_wide.as_ptr(),
+            &mut value,
+            &mut length,
+        ) != 0
+            && !value.is_null()
+        {
+            slice::from_raw_parts(value.cast::<u16>(), (length as usize) / 2)
+                .chunks_exact(2)
+                .map(|pair| (pair[0], pair[1]))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        }
+    };
+    let translations = if translations.is_empty() {
+        vec![(0x0409, 0x04b0)]
+    } else {
+        translations
+    };
+
+    translations.into_iter().any(|(language, code_page)| {
+        let company_key = format!("\\StringFileInfo\\{language:04x}{code_page:04x}\\CompanyName");
+        let product_key = format!("\\StringFileInfo\\{language:04x}{code_page:04x}\\ProductName");
+        let company = query_string(&data, &company_key);
+        let product = query_string(&data, &product_key);
+        company.is_some_and(|value| value.contains("mozilla"))
+            && product.is_some_and(|value| value.contains("firefox"))
+    })
+}
+
+#[cfg(not(windows))]
+fn named_pipe_client_is_trusted(_pipe: ()) -> bool {
+    true
 }
 
 #[cfg(windows)]
@@ -898,10 +1498,24 @@ fn named_pipe_security_attributes() -> io::Result<(
     use std::{mem::size_of, ptr};
     use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
 
-    let sddl: Vec<u16> = named_pipe_security_descriptor_sddl()
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
+    let user_sid = current_process_user_sid().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "無法取得目前 Windows 使用者 SID",
+        )
+    })?;
+    let sddl_text = if cfg!(debug_assertions)
+        && std::env::var_os("CURL_DOWNLOADER_PIPE_SUFFIX")
+            .is_some_and(|suffix| suffix.to_string_lossy().starts_with("test-"))
+    {
+        // The in-process integration test shares a pipe with the test runner;
+        // keep this debug-only ACL broad while the PID/path/SID check still
+        // authenticates the peer.  Release builds always use the per-user ACL.
+        "D:(A;;GA;;;WD)".to_owned()
+    } else {
+        named_pipe_security_descriptor_sddl(&user_sid)
+    };
+    let sddl: Vec<u16> = sddl_text.encode_utf16().chain(std::iter::once(0)).collect();
     let mut raw = ptr::null_mut();
     let mut descriptor_size = 0u32;
     let converted = unsafe {
@@ -926,7 +1540,7 @@ fn named_pipe_security_attributes() -> io::Result<(
 }
 #[cfg(windows)]
 fn pipe_name_wide() -> Vec<u16> {
-    let name = std::env::var("CURL_DOWNLOADER_PIPE_SUFFIX")
+    let suffix = std::env::var("CURL_DOWNLOADER_PIPE_SUFFIX")
         .ok()
         .filter(|suffix| {
             !suffix.is_empty()
@@ -934,8 +1548,12 @@ fn pipe_name_wide() -> Vec<u16> {
                     .chars()
                     .all(|character| character.is_ascii_alphanumeric() || character == '-')
         })
-        .map(|suffix| format!("{PIPE_NAME}-{suffix}"))
-        .unwrap_or_else(|| PIPE_NAME.to_owned());
+        .map(|suffix| format!("-{suffix}"))
+        .unwrap_or_default();
+    let user_suffix = current_process_user_sid()
+        .map(|sid| format!("-{sid}"))
+        .unwrap_or_default();
+    let name = format!("{PIPE_NAME}{suffix}{user_suffix}");
     name.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
@@ -988,7 +1606,30 @@ mod tests {
 
     #[test]
     fn named_pipe_security_descriptor_is_available_to_local_clients() {
-        assert_eq!(named_pipe_security_descriptor_sddl(), "D:(A;;GA;;;WD)");
+        assert_eq!(
+            named_pipe_security_descriptor_sddl("S-1-5-21-test"),
+            "D:(A;;GA;;;S-1-5-21-test)"
+        );
+    }
+
+    #[test]
+    fn untrusted_pipe_clients_cannot_enqueue_tasks() {
+        let response = dispatch_untrusted_request_for_test(IpcRequest::Enqueue {
+            request_id: "untrusted".into(),
+            url: "https://example.test/file.bin".into(),
+            filename: "file.bin".into(),
+            target_dir: r"C:\Downloads".into(),
+            requested_segments: 1,
+            proxy: WireProxy::direct(),
+        });
+        assert!(matches!(
+            response,
+            IpcResponse::EnqueueResult {
+                ok: false,
+                error: Some(WireError { code, .. }),
+                ..
+            } if code == "unauthorized_client"
+        ));
     }
 
     use crate::{

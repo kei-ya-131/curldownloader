@@ -148,10 +148,45 @@ pub fn target_fingerprint(path: &Path) -> io::Result<Option<TargetFingerprint>> 
         .ok()
         .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|duration| duration.as_nanos());
+    #[cfg(windows)]
+    let file_identity = {
+        // The stable Windows MetadataExt file-index APIs are still gated on
+        // older toolchains.  Creation time is a fast, replacement-sensitive
+        // identity fallback; the final digest check remains authoritative.
+        metadata
+            .created()
+            .ok()
+            .and_then(|created| created.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| {
+                let value = duration.as_nanos();
+                [value as u64, (value >> 64) as u64]
+            })
+    };
+    #[cfg(unix)]
+    let file_identity = {
+        use std::os::unix::fs::MetadataExt;
+        Some([metadata.dev(), metadata.ino()])
+    };
+    #[cfg(not(any(windows, unix)))]
+    let file_identity = None;
     Ok(Some(TargetFingerprint {
         length: metadata.len(),
         modified_unix_nanos,
+        file_identity,
+        content_digest: None,
     }))
+}
+
+pub fn target_fingerprint_with_digest(path: &Path) -> io::Result<Option<TargetFingerprint>> {
+    let Some(mut fingerprint) = target_fingerprint(path)? else {
+        return Ok(None);
+    };
+    use sha2::{Digest, Sha256};
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    io::copy(&mut file, &mut hasher)?;
+    fingerprint.content_digest = Some(hasher.finalize().into());
+    Ok(Some(fingerprint))
 }
 
 #[cfg(windows)]
