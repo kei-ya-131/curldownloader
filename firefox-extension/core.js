@@ -25,10 +25,32 @@
     return basename;
   }
 
-  function buildEnqueueMessage(download, form, requestId) {
+  function serializeRequestContext(requestContext, download) {
+    if (!requestContext || typeof requestContext !== 'object') return null;
+    const headers = Array.isArray(requestContext.headers)
+      ? requestContext.headers
+        .filter((header) => header && typeof header === 'object')
+        .map((header) => ({
+          name: String(header.name || ''),
+          value: String(header.value === undefined || header.value === null ? '' : header.value)
+        }))
+      : [];
+    return {
+      headers,
+      source_page_url: requestContext.sourcePageUrl || download.referrer || null,
+      initial_url: String(requestContext.initialUrl || download.url),
+      final_url: String(requestContext.finalUrl || download.url),
+      incognito: Boolean(requestContext.incognito),
+      cookie_store_id: requestContext.cookieStoreId === undefined
+        ? null
+        : String(requestContext.cookieStoreId || '')
+    };
+  }
+
+  function buildEnqueueMessage(download, form, requestId, requestContext) {
     const proxy = form.proxy || {};
     const segments = Number(form.segments);
-    return {
+    const message = {
       type: 'enqueue',
       request_id: String(requestId),
       url: String(download.url),
@@ -44,11 +66,15 @@
         password: String(proxy.password || '')
       }
     };
+    const serializedContext = serializeRequestContext(requestContext, download);
+    if (serializedContext) message.request_context = serializedContext;
+    return message;
   }
 
   return {
     isSupportedDownloadUrl,
     fallbackFilename,
-    buildEnqueueMessage
+    buildEnqueueMessage,
+    serializeRequestContext
   };
 });

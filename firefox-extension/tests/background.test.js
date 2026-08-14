@@ -16,7 +16,11 @@ function makeFakeBrowser({
   const events = {
     created: null,
     removed: null,
-    message: null
+    message: null,
+    sendHeaders: null,
+    redirect: null,
+    completed: null,
+    errorOccurred: null
   };
   const calls = {
     pause: [],
@@ -26,6 +30,7 @@ function makeFakeBrowser({
     download: [],
     tabs: [],
     notifications: [],
+    webRequest: [],
     nativeMessages: [],
     nativeConnects: 0,
     nativeDisconnects: 0,
@@ -72,6 +77,12 @@ function makeFakeBrowser({
         calls.tabs.push(tab);
         return tab;
       }
+    },
+    webRequest: {
+      onSendHeaders: { addListener(listener) { events.sendHeaders = listener; calls.webRequest.push('sendHeaders'); } },
+      onBeforeRedirect: { addListener(listener) { events.redirect = listener; calls.webRequest.push('redirect'); } },
+      onCompleted: { addListener(listener) { events.completed = listener; calls.webRequest.push('completed'); } },
+      onErrorOccurred: { addListener(listener) { events.errorOccurred = listener; calls.webRequest.push('errorOccurred'); } }
     },
     browserAction: {
       async setBadgeText(details) { calls.badgeText.push(details); },
@@ -342,6 +353,52 @@ test('supported download pauses and opens one settings tab', async () => {
   assert.deepEqual(fake.calls.pause, [1]);
   assert.equal(fake.calls.tabs.length, 1);
   assert.match(fake.calls.tabs[0].url, /settings\.html\?downloadId=1$/);
+});
+
+test('sniffed Firefox request context is attached to the matching enqueue', async () => {
+  const fake = makeFakeBrowser({
+    nativeResponse: (message) => message.type === 'enqueue'
+      ? { type: 'enqueue_result', ok: true, task_id: 12 }
+      : { type: 'task_list', tasks: [] }
+  });
+  const background = createBackground(fake.browser, { attempts: 1, delayMs: 0, timers: false, now: () => 1000 });
+  fake.events.sendHeaders({
+    requestId: 'firefox-request-1',
+    method: 'GET',
+    url: 'https://files.example.test/a.pdf',
+    tabId: 4,
+    documentUrl: 'https://app.example.test/page',
+    requestHeaders: [
+      { name: 'Cookie', value: 'session=secret' },
+      { name: 'Referer', value: 'https://app.example.test/page' }
+    ]
+  });
+  await background.handleCreatedDownload({
+    id: 22,
+    url: 'https://files.example.test/a.pdf',
+    referrer: 'https://app.example.test/page',
+    tabId: 4,
+    incognito: false,
+    cookieStoreId: 'firefox-default',
+    filename: 'a.pdf'
+  });
+  const submitted = await background.submitExternalDownload(22, {
+    filename: 'a.pdf', targetDir: 'C:\\Downloads', proxy: { enabled: false }
+  });
+  assert.equal(submitted.ok, true);
+  const enqueue = fake.calls.nativeMessages.find((message) => message.type === 'enqueue');
+  assert.deepEqual(enqueue.request_context, {
+    headers: [
+      { name: 'Cookie', value: 'session=secret' },
+      { name: 'Referer', value: 'https://app.example.test/page' }
+    ],
+    source_page_url: 'https://app.example.test/page',
+    initial_url: 'https://files.example.test/a.pdf',
+    final_url: 'https://files.example.test/a.pdf',
+    incognito: false,
+    cookie_store_id: 'firefox-default'
+  });
+  assert.deepEqual(fake.calls.webRequest, ['sendHeaders', 'redirect', 'completed', 'errorOccurred']);
 });
 
 test('closing settings after an enqueue timeout does not restore Firefox blindly', async () => {

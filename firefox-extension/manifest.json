@@ -18,11 +18,14 @@
     "nativeMessaging",
     "notifications",
     "storage",
-    "tabs"
+    "tabs",
+    "webRequest",
+    "http://*/*",
+    "https://*/*"
   ],
   "incognito": "spanning",
   "background": {
-    "scripts": ["core.js", "storage.js", "status.js", "native-session.js", "background.js"],
+    "scripts": ["core.js", "storage.js", "status.js", "native-session.js", "request-context.js", "background.js"],
     "persistent": true
   },
   "browser_action": {

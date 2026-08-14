@@ -6,6 +6,7 @@
       require('./storage.js'),
       require('./status.js'),
       require('./native-session.js'),
+      require('./request-context.js'),
       options
     );
   } else {
@@ -15,14 +16,20 @@
       root.CurlExtensionStorage,
       root.CurlExtensionStatus,
       root.CurlDownloaderNativeSession,
+      root.CurlExtensionRequestContext,
       {}
     );
   }
-})(typeof globalThis === 'object' ? globalThis : this, function (browserApi, core, storage, status, nativeSessionFactory, runtimeOptions) {
+})(typeof globalThis === 'object' ? globalThis : this, function (browserApi, core, storage, status, nativeSessionFactory, requestContextFactory, runtimeOptions) {
   'use strict';
   runtimeOptions = runtimeOptions || {};
   status = status || {};
   const now = typeof runtimeOptions.now === 'function' ? runtimeOptions.now : Date.now;
+  const requestTracker = runtimeOptions.requestTracker || (
+    requestContextFactory && typeof requestContextFactory.createRequestContextTracker === 'function'
+      ? requestContextFactory.createRequestContextTracker({ now })
+      : null
+  );
   const nativeSession = runtimeOptions.nativeSession || (
     typeof nativeSessionFactory === 'function'
       ? nativeSessionFactory(browserApi, { idleMs: runtimeOptions.nativeIdleMs })
@@ -499,6 +506,10 @@
     if (download.state && download.state !== 'in_progress') return { ignored: true };
     if (pendingDownloads.has(download.id)) return { ignored: true };
 
+    const capturedRequestContext = requestTracker && typeof requestTracker.claimDownload === 'function'
+      ? requestTracker.claimDownload(download)
+      : null;
+
     let defaults = { targetDir: '', proxy: defaultProxy() };
     try {
       defaults = await storage.loadDefaults();
@@ -518,6 +529,7 @@
       closeRequested: false,
       operation: 'intercept'
     };
+    if (capturedRequestContext) pending.requestContext = capturedRequestContext;
     pendingDownloads.set(download.id, pending);
 
     try {
@@ -583,7 +595,8 @@
       ...core.buildEnqueueMessage(
         pending,
         form,
-        pending.externalRequestId
+        pending.externalRequestId,
+        pending.requestContext
       ),
       ...startupFields(true, startIntentUnixMs)
     };
@@ -866,6 +879,37 @@
 
   if (browserApi && browserApi.downloads && browserApi.downloads.onCreated) {
     browserApi.downloads.onCreated.addListener((download) => { void handleCreatedDownload(download); });
+  }
+  if (browserApi && browserApi.webRequest && requestTracker) {
+    const filters = { urls: ['http://*/*', 'https://*/*'] };
+    const addWebRequestListener = (event, listener, extraInfoSpec) => {
+      if (!event || typeof event.addListener !== 'function') return;
+      try {
+        event.addListener(listener, filters, extraInfoSpec);
+      } catch (_error) {
+        // Unsupported Firefox versions simply fall back to public downloads.
+      }
+    };
+    addWebRequestListener(
+      browserApi.webRequest.onSendHeaders,
+      (details) => { requestTracker.observeSendHeaders(details); },
+      ['requestHeaders']
+    );
+    addWebRequestListener(
+      browserApi.webRequest.onBeforeRedirect,
+      (details) => { requestTracker.observeRedirect(details); }
+    );
+    addWebRequestListener(
+      browserApi.webRequest.onCompleted,
+      (details) => { requestTracker.observeComplete(details); }
+    );
+    addWebRequestListener(
+      browserApi.webRequest.onErrorOccurred,
+      (details) => {
+        if (typeof requestTracker.observeError === 'function') requestTracker.observeError(details);
+        else requestTracker.observeComplete(details);
+      }
+    );
   }
   if (browserApi && browserApi.tabs && browserApi.tabs.onRemoved) {
     browserApi.tabs.onRemoved.addListener((tabId) => {
