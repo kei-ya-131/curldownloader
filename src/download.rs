@@ -512,6 +512,18 @@ impl Engine {
                     let _ = response.send(Err(error));
                 }
             },
+            EngineCommand::RefreshFirefoxAuthorization {
+                id,
+                request_context,
+                response,
+            } => {
+                let result = self.refresh_firefox_authorization(id, request_context);
+                let ok = result.is_ok();
+                let _ = response.send(result);
+                if ok {
+                    self.request_start(id);
+                }
+            }
             EngineCommand::ResolveFileConflict {
                 id,
                 decision,
@@ -690,6 +702,62 @@ impl Engine {
             task_id: id,
             awaiting_file_decision,
         })
+    }
+
+    fn refresh_firefox_authorization(
+        &mut self,
+        id: TaskId,
+        prepared: crate::request_context::PreparedRequestContext,
+    ) -> Result<(), String> {
+        let Some(task) = self.task(id).cloned() else {
+            return Err("找不到下載任務。".into());
+        };
+        if task.origin != TaskOrigin::Firefox
+            || task.status != TaskStatus::NeedsFirefoxAuthorization
+        {
+            return Err("此任務目前不需要 Firefox 重新授權。".into());
+        }
+        let new_initial = prepared.runtime.initial_url().to_owned();
+        let new_final = prepared.runtime.final_url().to_owned();
+        let old_urls = [
+            task.original_url.as_str(),
+            task.effective_url
+                .as_deref()
+                .unwrap_or(task.original_url.as_str()),
+        ];
+        if !old_urls.iter().any(|old| {
+            same_download_resource(old, &new_initial) || same_download_resource(old, &new_final)
+        }) {
+            return Err("來源已變更，為避免合併不同來源，請另建新任務。".into());
+        }
+
+        let crate::request_context::PreparedRequestContext {
+            stored,
+            runtime,
+            authorization,
+        } = prepared;
+        self.stop_task_jobs(id);
+        self.queue.retain(|queued| *queued != id);
+        self.pending_start.remove(&id);
+        self.range_probe.remove(&id);
+        if let Some(task) = self.task_mut(id) {
+            task.original_url = new_initial;
+            task.effective_url = None;
+            task.total_size = None;
+            task.etag = None;
+            task.last_modified = None;
+            task.range_support = RangeSupport::Unknown;
+            task.request_context = stored;
+            task.authorization = authorization;
+            task.reauthorization_requested = false;
+            task.last_error = None;
+            task.status = TaskStatus::Queued;
+        }
+        self.runtime_contexts.insert(id, runtime);
+        self.persist()
+            .map_err(|error| format!("重新授權後無法保存狀態：{error}"))?;
+        self.publish_snapshot();
+        Ok(())
     }
 
     fn update_draft(
@@ -2042,6 +2110,24 @@ fn fingerprints_match(
         }
         _ => false,
     }
+}
+
+fn same_download_resource(left: &str, right: &str) -> bool {
+    let Ok(left) = url::Url::parse(left) else {
+        return false;
+    };
+    let Ok(right) = url::Url::parse(right) else {
+        return false;
+    };
+    left.scheme().eq_ignore_ascii_case(right.scheme())
+        && left
+            .host()
+            .map(|host| host.to_string().to_ascii_lowercase())
+            == right
+                .host()
+                .map(|host| host.to_string().to_ascii_lowercase())
+        && left.port_or_known_default() == right.port_or_known_default()
+        && left.path() == right.path()
 }
 
 fn record_segment_start(segment: &mut SegmentState, unix_ms: u64) {

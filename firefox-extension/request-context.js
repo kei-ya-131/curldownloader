@@ -88,6 +88,20 @@
     return url;
   }
 
+  function sameResourceUrl(left, right) {
+    try {
+      const a = new URL(String(left));
+      const b = new URL(String(right));
+      return a.protocol === b.protocol
+        && a.hostname.toLowerCase() === b.hostname.toLowerCase()
+        && (a.port || (a.protocol === 'https:' ? '443' : '80'))
+          === (b.port || (b.protocol === 'https:' ? '443' : '80'))
+        && a.pathname === b.pathname;
+    } catch (_error) {
+      return false;
+    }
+  }
+
   function cloneHeaders(headers) {
     return headers.map((header) => ({ name: header.name, value: header.value }));
   }
@@ -112,10 +126,17 @@
     const ttlMs = Number.isFinite(options.ttlMs) ? Math.max(1, options.ttlMs) : 15_000;
     const maxEntries = Number.isInteger(options.maxEntries) ? Math.max(1, options.maxEntries) : 256;
     const entries = new Map();
+    const reauthorizationSessions = new Map();
+    let nextSessionId = 1;
 
     function prune(current = now()) {
       for (const [requestId, entry] of entries) {
         if (current - entry.capturedUnixMs > ttlMs) entries.delete(requestId);
+      }
+      for (const [sessionId, session] of reauthorizationSessions) {
+        if (current - session.startedUnixMs > session.ttlMs) {
+          reauthorizationSessions.delete(sessionId);
+        }
       }
     }
 
@@ -225,12 +246,82 @@
       return cloneEntry(entry, download);
     }
 
+    function beginReauthorization(criteria = {}) {
+      const current = now();
+      prune(current);
+      const sessionId = String(criteria.sessionId || `reauth-${current}-${nextSessionId++}`);
+      const resourceUrls = [criteria.initialUrl, criteria.finalUrl]
+        .map(safeUrl)
+        .filter(Boolean);
+      const sourcePageUrl = safeUrl(criteria.sourcePageUrl);
+      reauthorizationSessions.set(sessionId, {
+        sessionId,
+        startedUnixMs: current,
+        ttlMs: Number.isFinite(criteria.ttlMs) ? Math.max(1, criteria.ttlMs) : 5 * 60 * 1000,
+        tabId: Number.isInteger(criteria.tabId) ? criteria.tabId : null,
+        sourcePageUrl,
+        resourceUrls,
+        incognito: Boolean(criteria.incognito),
+        cookieStoreId: criteria.cookieStoreId === undefined || criteria.cookieStoreId === null
+          ? null
+          : String(criteria.cookieStoreId)
+      });
+      return sessionId;
+    }
+
+    function claimReauthorization(sessionId) {
+      const session = reauthorizationSessions.get(String(sessionId));
+      if (!session) return null;
+      const current = now();
+      if (current - session.startedUnixMs > session.ttlMs) {
+        reauthorizationSessions.delete(session.sessionId);
+        return null;
+      }
+      const candidates = [];
+      for (const entry of entries.values()) {
+        if (entry.capturedUnixMs < session.startedUnixMs) continue;
+        if (session.tabId !== null && entry.tabId !== session.tabId) continue;
+        if (session.sourcePageUrl && entry.sourcePageUrl
+            && !sameResourceUrl(session.sourcePageUrl, entry.sourcePageUrl)) continue;
+        if (session.resourceUrls.length > 0
+            && !session.resourceUrls.some((url) =>
+              sameResourceUrl(url, entry.initialUrl) || sameResourceUrl(url, entry.finalUrl))) {
+          continue;
+        }
+        candidates.push(entry);
+      }
+      if (candidates.length !== 1) return null;
+      const entry = candidates[0];
+      let requestId = null;
+      for (const [candidateId, candidate] of entries) {
+        if (candidate === entry) {
+          requestId = candidateId;
+          break;
+        }
+      }
+      if (requestId === null) return null;
+      entries.delete(requestId);
+      reauthorizationSessions.delete(session.sessionId);
+      return cloneEntry(entry, {
+        referrer: session.sourcePageUrl,
+        incognito: session.incognito,
+        cookieStoreId: session.cookieStoreId
+      });
+    }
+
+    function cancelReauthorization(sessionId) {
+      return reauthorizationSessions.delete(String(sessionId));
+    }
+
     return {
       observeSendHeaders,
       observeRedirect,
       observeComplete,
       observeError: observeComplete,
       claimDownload,
+      beginReauthorization,
+      claimReauthorization,
+      cancelReauthorization,
       prune,
       size: () => entries.size
     };

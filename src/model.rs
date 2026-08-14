@@ -430,6 +430,11 @@ pub enum EngineCommand {
         origin: TaskOrigin,
         response: Sender<Result<ConfiguredTaskAcceptance, String>>,
     },
+    RefreshFirefoxAuthorization {
+        id: TaskId,
+        request_context: PreparedRequestContext,
+        response: Sender<Result<(), String>>,
+    },
     ResolveFileConflict {
         id: TaskId,
         decision: FileDecision,

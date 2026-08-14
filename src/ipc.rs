@@ -174,6 +174,11 @@ pub enum IpcRequest {
         request_id: String,
         task_id: TaskId,
     },
+    RefreshFirefoxAuthorization {
+        request_id: String,
+        task_id: TaskId,
+        request_context: WireRequestContext,
+    },
     Enqueue {
         request_id: String,
         url: String,
@@ -205,6 +210,7 @@ impl fmt::Debug for IpcRequest {
             Self::OpenFile { .. } => "open_file",
             Self::OpenFolder { .. } => "open_folder",
             Self::CancelTask { .. } => "cancel_task",
+            Self::RefreshFirefoxAuthorization { .. } => "refresh_firefox_authorization",
             Self::Enqueue { .. } => "enqueue",
             Self::ResolveFileConflict { .. } => "resolve_file_conflict",
         };
@@ -228,6 +234,7 @@ impl IpcRequest {
             | Self::OpenFile { request_id, .. }
             | Self::OpenFolder { request_id, .. }
             | Self::CancelTask { request_id, .. }
+            | Self::RefreshFirefoxAuthorization { request_id, .. }
             | Self::Enqueue { request_id, .. }
             | Self::ResolveFileConflict { request_id, .. } => request_id,
         }
@@ -714,6 +721,7 @@ fn dispatch_request(
             | IpcRequest::OpenFile { request_id, .. }
             | IpcRequest::OpenFolder { request_id, .. }
             | IpcRequest::CancelTask { request_id, .. }
+            | IpcRequest::RefreshFirefoxAuthorization { request_id, .. }
             | IpcRequest::PickFolder { request_id }
             | IpcRequest::GetDefaults { request_id }
             | IpcRequest::ListTasks { request_id }
@@ -819,6 +827,45 @@ fn dispatch_request(
             match response_rx.recv_timeout(Duration::from_secs(5)) {
                 Ok(Ok(())) => action_success(request_id),
                 Ok(Err(message)) => action_error(request_id, "cancel_failed", &message),
+                Err(_) => action_error(request_id, "engine_timeout", "下載引擎回應逾時。"),
+            }
+        }
+        IpcRequest::RefreshFirefoxAuthorization {
+            request_id,
+            task_id,
+            request_context,
+        } => {
+            let prepared = match request_context::prepare(request_context) {
+                Ok(prepared) => prepared,
+                Err(_) => {
+                    return action_error(
+                        request_id,
+                        "invalid_request_context",
+                        "Firefox 授權資料無效或超出安全限制。",
+                    );
+                }
+            };
+            let (response_tx, response_rx) = std::sync::mpsc::channel();
+            if commands
+                .send(EngineCommand::RefreshFirefoxAuthorization {
+                    id: task_id,
+                    request_context: prepared,
+                    response: response_tx,
+                })
+                .is_err()
+            {
+                return action_error(request_id, "engine_unavailable", "下載引擎未能接收操作。");
+            }
+            match response_rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(Ok(())) => action_success(request_id),
+                Ok(Err(message)) => {
+                    let code = if message.contains("來源已變更") {
+                        "source_changed"
+                    } else {
+                        "reauthorization_failed"
+                    };
+                    action_error(request_id, code, &message)
+                }
                 Err(_) => action_error(request_id, "engine_timeout", "下載引擎回應逾時。"),
             }
         }

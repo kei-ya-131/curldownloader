@@ -14,6 +14,7 @@
     'pausing',
     'paused',
     'needs_proxy_password',
+    'needs_firefox_authorization',
     'awaiting_file_decision',
     'finalizing'
   ]);
@@ -29,11 +30,13 @@
     let downloadedBytes = 0;
     let hasFailure = false;
     let hasProxyPassword = false;
+    let hasFirefoxAuthorization = false;
 
     for (const task of Array.isArray(tasks) ? tasks : []) {
       const status = task && String(task.status || '');
       if (status === 'failed') hasFailure = true;
       if (status === 'needs_proxy_password') hasProxyPassword = true;
+      if (status === 'needs_firefox_authorization') hasFirefoxAuthorization = true;
       if (!ACTIVE_STATUSES.has(status)) continue;
 
       activeCount += 1;
@@ -54,6 +57,7 @@
       percent,
       hasFailure,
       hasProxyPassword,
+      hasFirefoxAuthorization,
       hasActive: activeCount > 0
     };
   }
@@ -62,6 +66,7 @@
     const activeCount = Number(summary && summary.activeCount) || 0;
     const hasFailure = Boolean(summary && summary.hasFailure);
     const hasProxyPassword = Boolean(summary && summary.hasProxyPassword);
+    const hasFirefoxAuthorization = Boolean(summary && summary.hasFirefoxAuthorization);
     if (activeCount <= 0) {
       return {
         text: '',
@@ -70,6 +75,8 @@
           ? 'Curl Downloader｜有失敗任務'
           : hasProxyPassword
             ? 'Curl Downloader｜需要 Proxy 密碼'
+            : hasFirefoxAuthorization
+              ? 'Curl Downloader｜需要 Firefox 重新授權'
             : 'Curl Downloader',
         progressStep: null
       };
@@ -77,11 +84,13 @@
 
     const percent = summary && Number.isInteger(summary.percent) ? summary.percent : null;
     const percentText = percent === null ? '—' : `${percent}%`;
-    const warning = hasFailure || hasProxyPassword;
+    const warning = hasFailure || hasProxyPassword || hasFirefoxAuthorization;
     const warningText = hasFailure
       ? '，有失敗任務'
       : hasProxyPassword
         ? '，需要 Proxy 密碼'
+        : hasFirefoxAuthorization
+          ? '，需要 Firefox 重新授權'
         : '';
     return {
       text: `${percentText}/${activeCount}`,

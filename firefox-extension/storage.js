@@ -18,6 +18,7 @@
       username: ''
     })
   });
+  const TASK_BINDINGS_KEY = 'curlDownloaderFirefoxTaskBindings';
 
   function cleanSegments(value) {
     const segments = Number(value);
@@ -58,5 +59,61 @@
     return cleaned;
   }
 
-  return { loadDefaults, saveDefaults, cleanDefaults, cleanSegments };
+  function cleanTaskBinding(value) {
+    const source = value && typeof value === 'object' ? value : {};
+    const tabId = Number(source.tabId);
+    return {
+      sourcePageUrl: typeof source.sourcePageUrl === 'string' ? source.sourcePageUrl : '',
+      sourceOrigin: typeof source.sourceOrigin === 'string' ? source.sourceOrigin : '',
+      resourceUrl: typeof source.resourceUrl === 'string' ? source.resourceUrl : '',
+      tabId: Number.isInteger(tabId) && tabId >= 0 ? tabId : null,
+      incognito: Boolean(source.incognito),
+      cookieStoreId: source.cookieStoreId === undefined || source.cookieStoreId === null
+        ? null
+        : String(source.cookieStoreId)
+    };
+  }
+
+  async function loadTaskBinding(taskId) {
+    if (!browserApi || !browserApi.storage || !browserApi.storage.local) return null;
+    const stored = await browserApi.storage.local.get(TASK_BINDINGS_KEY);
+    const bindings = stored && stored[TASK_BINDINGS_KEY] && typeof stored[TASK_BINDINGS_KEY] === 'object'
+      ? stored[TASK_BINDINGS_KEY]
+      : {};
+    const binding = bindings[String(taskId)];
+    return binding ? cleanTaskBinding(binding) : null;
+  }
+
+  async function saveTaskBinding(taskId, binding) {
+    const cleaned = cleanTaskBinding(binding);
+    if (!browserApi || !browserApi.storage || !browserApi.storage.local) return cleaned;
+    const stored = await browserApi.storage.local.get(TASK_BINDINGS_KEY);
+    const bindings = stored && stored[TASK_BINDINGS_KEY] && typeof stored[TASK_BINDINGS_KEY] === 'object'
+      ? { ...stored[TASK_BINDINGS_KEY] }
+      : {};
+    bindings[String(taskId)] = cleaned;
+    await browserApi.storage.local.set({ [TASK_BINDINGS_KEY]: bindings });
+    return cleaned;
+  }
+
+  async function removeTaskBinding(taskId) {
+    if (!browserApi || !browserApi.storage || !browserApi.storage.local) return;
+    const stored = await browserApi.storage.local.get(TASK_BINDINGS_KEY);
+    const bindings = stored && stored[TASK_BINDINGS_KEY] && typeof stored[TASK_BINDINGS_KEY] === 'object'
+      ? { ...stored[TASK_BINDINGS_KEY] }
+      : {};
+    delete bindings[String(taskId)];
+    await browserApi.storage.local.set({ [TASK_BINDINGS_KEY]: bindings });
+  }
+
+  return {
+    loadDefaults,
+    saveDefaults,
+    cleanDefaults,
+    cleanSegments,
+    cleanTaskBinding,
+    loadTaskBinding,
+    saveTaskBinding,
+    removeTaskBinding
+  };
 });

@@ -137,3 +137,38 @@ test('rejects overlarge values and caps the number of retained entries', () => {
     tabId: 1, incognito: false, cookieStoreId: 'firefox-default'
   }), null);
 });
+
+test('reauthorization captures one fresh same-tab resource request only', () => {
+  let now = 6_000;
+  const tracker = createRequestContextTracker({ now: () => now });
+  const session = tracker.beginReauthorization({
+    tabId: 7,
+    sourcePageUrl: 'https://app.test/chat?view=1',
+    initialUrl: 'https://files.test/download?sig=old',
+    finalUrl: 'https://cdn.test/file.pdf?sig=old',
+    incognito: true,
+    cookieStoreId: 'firefox-container-1'
+  });
+  tracker.observeSendHeaders({
+    requestId: 'wrong-tab', method: 'GET', url: 'https://files.test/download?sig=new', tabId: 8,
+    documentUrl: 'https://app.test/chat',
+    requestHeaders: [{ name: 'Cookie', value: 'wrong=1' }]
+  });
+  tracker.observeSendHeaders({
+    requestId: 'fresh', method: 'GET', url: 'https://files.test/download?sig=new', tabId: 7,
+    documentUrl: 'https://app.test/chat',
+    requestHeaders: [{ name: 'Cookie', value: 'fresh=1' }]
+  });
+  assert.deepEqual(tracker.claimReauthorization(session), {
+    headers: [{ name: 'Cookie', value: 'fresh=1' }],
+    sourcePageUrl: 'https://app.test/chat?view=1',
+    initialUrl: 'https://files.test/download?sig=new',
+    finalUrl: 'https://files.test/download?sig=new',
+    tabId: 7,
+    incognito: true,
+    cookieStoreId: 'firefox-container-1',
+    capturedUnixMs: 6_000
+  });
+  assert.equal(tracker.claimReauthorization(session), null);
+  now += 1;
+});

@@ -39,3 +39,10 @@ test('failed and cancelled tasks do not count as active but failures produce war
   assert.equal(summary.hasFailure, true);
   assert.equal(badgeState(summary).text, '');
 });
+
+test('Firefox authorization tasks remain visible as an actionable warning', () => {
+  const summary = summarizeTasks([{ status: 'needs_firefox_authorization', downloaded: 10, total_size: 100 }]);
+  assert.equal(summary.activeCount, 1);
+  assert.equal(summary.hasFirefoxAuthorization, true);
+  assert.match(badgeState(summary).title, /重新授權/);
+});

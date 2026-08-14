@@ -661,6 +661,24 @@ impl EngineHarness {
             .task_id
     }
 
+    pub fn refresh_firefox_authorization(
+        &mut self,
+        id: TaskId,
+        wire: WireRequestContext,
+    ) -> Result<(), String> {
+        let prepared = curl_downloader::request_context::prepare(wire).unwrap();
+        let (response_tx, response_rx) = std::sync::mpsc::channel();
+        self.engine
+            .commands
+            .send(EngineCommand::RefreshFirefoxAuthorization {
+                id,
+                request_context: prepared,
+                response: response_tx,
+            })
+            .unwrap();
+        response_rx.recv_timeout(Duration::from_secs(5)).unwrap()
+    }
+
     pub fn add_with_proxy(
         &mut self,
         url: &str,

@@ -104,6 +104,54 @@ fn firefox_auth_failure_waits_for_reauthorization_without_leaking_context() {
 }
 
 #[test]
+fn firefox_reauthorization_replaces_expired_context_and_resumes_task() {
+    let server = support::TestHttpServer::start(vec![support::Route {
+        path: "/private.pdf",
+        body: b"protected payload",
+        ranges: true,
+        etag: "private-v1",
+        filename: "private.pdf",
+        required_headers: vec![
+            ("cookie".into(), "session=fresh".into()),
+            ("referer".into(), "https://app.test/page".into()),
+        ],
+    }]);
+    let mut harness = support::EngineHarness::new(1);
+    let mut expired = protected_context_with_cookie("session=expired");
+    expired.initial_url = format!("{}/private.pdf", server.base_url);
+    expired.final_url = expired.initial_url.clone();
+    let source_url = expired.initial_url.clone();
+    let id = harness.add_firefox_configured_with_context(source_url, "private.pdf", expired);
+    harness.wait_for(
+        id,
+        TaskStatus::NeedsFirefoxAuthorization,
+        std::time::Duration::from_secs(60),
+    );
+
+    let mut changed = protected_context_with_cookie("session=fresh");
+    changed.initial_url = format!("{}/other.pdf", server.base_url);
+    changed.final_url = changed.initial_url.clone();
+    let error = harness
+        .refresh_firefox_authorization(id, changed)
+        .unwrap_err();
+    assert!(error.contains("來源已變更"));
+
+    let mut fresh = protected_context_with_cookie("session=fresh");
+    fresh.initial_url = format!("{}/private.pdf", server.base_url);
+    fresh.final_url = fresh.initial_url.clone();
+    harness.refresh_firefox_authorization(id, fresh).unwrap();
+    let completed = harness.wait_for(
+        id,
+        TaskStatus::Completed,
+        std::time::Duration::from_secs(60),
+    );
+    assert_eq!(
+        std::fs::read(completed.target_dir.join("private.pdf")).unwrap(),
+        b"protected payload"
+    );
+}
+
+#[test]
 fn completed_protected_download_clears_saved_authorization_material() {
     let server = support::TestHttpServer::start(vec![support::Route {
         path: "/private.pdf",

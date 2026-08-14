@@ -51,6 +51,8 @@
 
   const pendingDownloads = new Map();
   const settingsTabs = new Map();
+  const reauthorizationInFlight = new Map();
+  const taskBindings = new Map();
   const managedFallbackIds = new Set();
   const managedFallbackUrls = new Map();
   const nativeRetryOptions = {
@@ -500,6 +502,142 @@
     }
   }
 
+  async function focusFirefoxSource(binding) {
+    if (!binding) return null;
+    const matchesContainer = (tab) => {
+      if (!tab) return false;
+      if (Boolean(tab.incognito) !== Boolean(binding.incognito)) return false;
+      if (binding.cookieStoreId && tab.cookieStoreId && tab.cookieStoreId !== binding.cookieStoreId) {
+        return false;
+      }
+      return true;
+    };
+    if (Number.isInteger(binding.tabId) && browserApi.tabs && browserApi.tabs.get) {
+      try {
+        const tab = await browserApi.tabs.get(binding.tabId);
+        if (matchesContainer(tab)) {
+          if (browserApi.tabs.update) await browserApi.tabs.update(tab.id, { active: true });
+          return tab;
+        }
+        binding.tabId = null;
+      } catch (_error) {
+        // The original tab may have been closed; look for another tab below.
+        binding.tabId = null;
+      }
+    }
+    if (browserApi.tabs && browserApi.tabs.query && binding.sourceOrigin) {
+      try {
+        const tabs = await browserApi.tabs.query({ url: [`${binding.sourceOrigin}/*`] });
+        const tab = (Array.isArray(tabs) ? tabs : []).find(matchesContainer);
+        if (tab) {
+          if (browserApi.tabs.update) await browserApi.tabs.update(tab.id, { active: true });
+          return tab;
+        }
+      } catch (_error) {
+        // Query permissions vary across Firefox versions.
+      }
+    }
+    if (binding.incognito || !browserApi.tabs || !browserApi.tabs.create || !binding.sourcePageUrl) {
+      return null;
+    }
+    try {
+      const tab = await browserApi.tabs.create({ url: binding.sourcePageUrl, active: true });
+      if (tab && tab.id !== undefined) {
+        binding.tabId = tab.id;
+        taskBindings.set(binding.taskId, binding);
+      }
+      return tab || null;
+    } catch (_error) {
+      return null;
+    }
+  }
+
+  async function waitForFirefoxReauthorization(taskId, binding, sessionId) {
+    const deadline = now() + 5 * 60 * 1000;
+    try {
+      while (now() < deadline) {
+        const requestContext = requestTracker && requestTracker.claimReauthorization
+          ? requestTracker.claimReauthorization(sessionId)
+          : null;
+        if (requestContext) {
+          const wireContext = core.serializeRequestContext(requestContext, {
+            url: requestContext.finalUrl,
+            referrer: requestContext.sourcePageUrl
+          });
+          try {
+            const response = await sendNativeWithRetry({
+              type: 'refresh_firefox_authorization',
+              task_id: Number(taskId),
+              request_context: wireContext,
+              ...startupFields(true, now())
+            });
+            if (!response || response.type !== 'action_result' || !response.ok) {
+              const error = response && response.error && response.error.message
+                ? response.error.message
+                : 'Curl Downloader 未能套用 Firefox 重新授權。';
+              await notifyFailure(error);
+              return { ok: false, error };
+            }
+            await rememberTaskBinding(taskId, requestContext);
+            void refreshTaskStatus();
+            await notifyFailure('Firefox 重新授權成功，已恢復原任務下載。');
+            return { ok: true };
+          } catch (_error) {
+            const error = 'Native host 未能接收 Firefox 重新授權，請稍後重試。';
+            await notifyFailure(error);
+            return { ok: false, error };
+          }
+        }
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
+      const error = '等待 Firefox 重新授權已逾時（5 分鐘）；請重新按「重新授權」。';
+      await notifyFailure(error);
+      return { ok: false, error };
+    } finally {
+      if (requestTracker && requestTracker.cancelReauthorization) {
+        requestTracker.cancelReauthorization(sessionId);
+      }
+      reauthorizationInFlight.delete(Number(taskId));
+    }
+  }
+
+  async function startFirefoxReauthorization(taskId) {
+    const normalizedId = validTaskId(taskId);
+    if (normalizedId === null) return { ok: false, error: '任務編號無效。' };
+    if (reauthorizationInFlight.has(normalizedId)) {
+      return { ok: true, waiting: true, message: '已在等待 Firefox 重新授權，請在來源頁按一次下載。' };
+    }
+    if (!requestTracker || typeof requestTracker.beginReauthorization !== 'function') {
+      return { ok: false, error: '目前 Firefox 版本不支援重新授權追蹤。' };
+    }
+    const binding = await loadTaskBinding(normalizedId);
+    if (!binding) {
+      return { ok: false, error: '找不到原來源分頁；請先在 Firefox 開啟原下載頁，再重試。' };
+    }
+    binding.taskId = normalizedId;
+    const tab = await focusFirefoxSource(binding);
+    if (!tab && !Number.isInteger(binding.tabId)) {
+      return { ok: false, error: '找不到相同 Firefox 容器的來源分頁；請先開啟原下載頁。' };
+    }
+    if (tab && Number.isInteger(tab.id)) binding.tabId = tab.id;
+    const sessionId = requestTracker.beginReauthorization({
+      tabId: binding.tabId,
+      sourcePageUrl: binding.sourcePageUrl,
+      initialUrl: binding.resourceUrl,
+      finalUrl: binding.resourceUrl,
+      incognito: binding.incognito,
+      cookieStoreId: binding.cookieStoreId,
+      ttlMs: 5 * 60 * 1000
+    });
+    reauthorizationInFlight.set(normalizedId, sessionId);
+    void waitForFirefoxReauthorization(normalizedId, binding, sessionId);
+    return {
+      ok: true,
+      waiting: true,
+      message: '已切換至來源分頁；請在 Firefox 重新按一次原下載，等待最多 5 分鐘。'
+    };
+  }
+
   async function handleCreatedDownload(download) {
     if (consumeManagedFallback(download)) return { ignored: true };
     if (!core.isSupportedDownloadUrl(download.url)) return { ignored: true };
@@ -622,6 +760,9 @@
       }
       accepted = true;
       pending.acceptanceUnknown = false;
+      if (response.task_id !== undefined) {
+        await rememberTaskBinding(response.task_id, pending.requestContext);
+      }
       if (!pending.firefoxDownloadRemoved && !(await cancelAndEraseDownload(pending))) {
         await notifyFailure('Curl Downloader 已接收任務，但 Firefox 原下載未能清理。');
         const taskCancelled = await cancelAcceptedOrKeepPending(pending, response.task_id);
@@ -850,6 +991,9 @@
     if (message.type === 'get-task-summary') {
       return refreshTaskStatus({ fromPopup: true, startIntentUnixMs: message.startIntentUnixMs });
     }
+    if (message.type === 'reauthorize-firefox') {
+      return startFirefoxReauthorization(message.taskId);
+    }
     if (message.type === 'popup-open') {
       popupOpen = true;
       updateNativeKeepAlive();
@@ -879,6 +1023,66 @@
 
   if (browserApi && browserApi.downloads && browserApi.downloads.onCreated) {
     browserApi.downloads.onCreated.addListener((download) => { void handleCreatedDownload(download); });
+  }
+
+  function stripUrlQuery(value) {
+    try {
+      const url = new URL(String(value));
+      if (url.protocol !== 'http:' && url.protocol !== 'https:') return '';
+      url.search = '';
+      url.hash = '';
+      return url.toString();
+    } catch (_error) {
+      return '';
+    }
+  }
+
+  function urlOrigin(value) {
+    try {
+      const url = new URL(String(value));
+      return url.origin;
+    } catch (_error) {
+      return '';
+    }
+  }
+
+  function bindingFromRequestContext(requestContext) {
+    if (!requestContext || typeof requestContext !== 'object') return null;
+    const sourcePageUrl = stripUrlQuery(requestContext.sourcePageUrl || '');
+    const resourceUrl = stripUrlQuery(requestContext.finalUrl || requestContext.initialUrl || '');
+    if (!sourcePageUrl || !resourceUrl) return null;
+    return {
+      sourcePageUrl,
+      sourceOrigin: urlOrigin(sourcePageUrl),
+      resourceUrl,
+      tabId: Number.isInteger(requestContext.tabId) ? requestContext.tabId : null,
+      incognito: Boolean(requestContext.incognito),
+      cookieStoreId: requestContext.cookieStoreId === undefined || requestContext.cookieStoreId === null
+        ? null
+        : String(requestContext.cookieStoreId)
+    };
+  }
+
+  async function rememberTaskBinding(taskId, requestContext) {
+    const binding = bindingFromRequestContext(requestContext);
+    if (!binding || taskId === undefined || taskId === null) return;
+    taskBindings.set(Number(taskId), binding);
+    if (storage && typeof storage.saveTaskBinding === 'function') {
+      try { await storage.saveTaskBinding(taskId, binding); } catch (_error) { /* best effort */ }
+    }
+  }
+
+  async function loadTaskBinding(taskId) {
+    const normalizedId = Number(taskId);
+    if (taskBindings.has(normalizedId)) return taskBindings.get(normalizedId);
+    if (!storage || typeof storage.loadTaskBinding !== 'function') return null;
+    try {
+      const binding = await storage.loadTaskBinding(normalizedId);
+      if (binding) taskBindings.set(normalizedId, binding);
+      return binding;
+    } catch (_error) {
+      return null;
+    }
   }
   if (browserApi && browserApi.webRequest && requestTracker) {
     const filters = { urls: ['http://*/*', 'https://*/*'] };
@@ -937,6 +1141,7 @@
     handleCreatedDownload,
     restoreFirefoxDownload,
     submitExternalDownload,
+    startFirefoxReauthorization,
     handleRuntimeMessage,
     sendNativeWithRetry,
     refreshTaskStatus,
