@@ -38,3 +38,29 @@ test('fallback filename is a relative basename', () => {
   assert.equal(core.fallbackFilename('C:\\Downloads\\renamed.zip'), 'renamed.zip');
   assert.equal(core.fallbackFilename(''), 'download.bin');
 });
+
+test('enqueue message carries the Firefox request context separately from proxy settings', () => {
+  const context = {
+    headers: [{ name: 'Cookie', value: 'session=secret' }],
+    sourcePageUrl: 'https://app.test/page',
+    initialUrl: 'https://files.test/a.pdf',
+    finalUrl: 'https://files.test/a.pdf',
+    incognito: true,
+    cookieStoreId: 'firefox-container-2'
+  };
+  const message = core.buildEnqueueMessage(
+    { url: context.initialUrl, filename: 'a.pdf' },
+    { filename: 'a.pdf', targetDir: 'C:\\Downloads', proxy: { enabled: false } },
+    'request-context-1',
+    context
+  );
+  assert.deepEqual(message.request_context, {
+    headers: context.headers,
+    source_page_url: context.sourcePageUrl,
+    initial_url: context.initialUrl,
+    final_url: context.finalUrl,
+    incognito: context.incognito,
+    cookie_store_id: context.cookieStoreId
+  });
+  assert.equal(message.proxy.password, '');
+});

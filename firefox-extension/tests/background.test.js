@@ -11,12 +11,17 @@ function makeFakeBrowser({
   nativeDisconnect = false,
   nativeFailuresBeforeSuccess = 0,
   nativeDelayMs = 0,
-  nativeResponse = null
+  nativeResponse = null,
+  sourceTabs = []
 } = {}) {
   const events = {
     created: null,
     removed: null,
-    message: null
+    message: null,
+    sendHeaders: null,
+    redirect: null,
+    completed: null,
+    errorOccurred: null
   };
   const calls = {
     pause: [],
@@ -25,7 +30,9 @@ function makeFakeBrowser({
     erase: [],
     download: [],
     tabs: [],
+    tabUpdates: [],
     notifications: [],
+    webRequest: [],
     nativeMessages: [],
     nativeConnects: 0,
     nativeDisconnects: 0,
@@ -71,7 +78,23 @@ function makeFakeBrowser({
         const tab = { id: nextTabId++, ...details };
         calls.tabs.push(tab);
         return tab;
-      }
+      },
+      get: async (id) => {
+        const tab = sourceTabs.find((candidate) => candidate.id === id);
+        if (!tab) throw new Error('tab not found');
+        return tab;
+      },
+      update: async (id, details) => {
+        calls.tabUpdates.push({ id, details });
+        return { id, ...details };
+      },
+      query: async () => sourceTabs
+    },
+    webRequest: {
+      onSendHeaders: { addListener(listener) { events.sendHeaders = listener; calls.webRequest.push('sendHeaders'); } },
+      onBeforeRedirect: { addListener(listener) { events.redirect = listener; calls.webRequest.push('redirect'); } },
+      onCompleted: { addListener(listener) { events.completed = listener; calls.webRequest.push('completed'); } },
+      onErrorOccurred: { addListener(listener) { events.errorOccurred = listener; calls.webRequest.push('errorOccurred'); } }
     },
     browserAction: {
       async setBadgeText(details) { calls.badgeText.push(details); },
@@ -342,6 +365,105 @@ test('supported download pauses and opens one settings tab', async () => {
   assert.deepEqual(fake.calls.pause, [1]);
   assert.equal(fake.calls.tabs.length, 1);
   assert.match(fake.calls.tabs[0].url, /settings\.html\?downloadId=1$/);
+});
+
+test('sniffed Firefox request context is attached to the matching enqueue', async () => {
+  const fake = makeFakeBrowser({
+    nativeResponse: (message) => message.type === 'enqueue'
+      ? { type: 'enqueue_result', ok: true, task_id: 12 }
+      : { type: 'task_list', tasks: [] }
+  });
+  const background = createBackground(fake.browser, { attempts: 1, delayMs: 0, timers: false, now: () => 1000 });
+  fake.events.sendHeaders({
+    requestId: 'firefox-request-1',
+    method: 'GET',
+    url: 'https://files.example.test/a.pdf',
+    tabId: 4,
+    documentUrl: 'https://app.example.test/page',
+    requestHeaders: [
+      { name: 'Cookie', value: 'session=secret' },
+      { name: 'Referer', value: 'https://app.example.test/page' }
+    ]
+  });
+  await background.handleCreatedDownload({
+    id: 22,
+    url: 'https://files.example.test/a.pdf',
+    referrer: 'https://app.example.test/page',
+    tabId: 4,
+    incognito: false,
+    cookieStoreId: 'firefox-default',
+    filename: 'a.pdf'
+  });
+  const submitted = await background.submitExternalDownload(22, {
+    filename: 'a.pdf', targetDir: 'C:\\Downloads', proxy: { enabled: false }
+  });
+  assert.equal(submitted.ok, true);
+  const enqueue = fake.calls.nativeMessages.find((message) => message.type === 'enqueue');
+  assert.deepEqual(enqueue.request_context, {
+    headers: [
+      { name: 'Cookie', value: 'session=secret' },
+      { name: 'Referer', value: 'https://app.example.test/page' }
+    ],
+    source_page_url: 'https://app.example.test/page',
+    initial_url: 'https://files.example.test/a.pdf',
+    final_url: 'https://files.example.test/a.pdf',
+    incognito: false,
+    cookie_store_id: 'firefox-default'
+  });
+  assert.deepEqual(fake.calls.webRequest, ['sendHeaders', 'redirect', 'completed', 'errorOccurred']);
+});
+
+test('reauthorization focuses the original tab and forwards one fresh request', async () => {
+  const fake = makeFakeBrowser({
+    sourceTabs: [{ id: 4, incognito: false, cookieStoreId: 'firefox-default' }],
+    nativeResponse: (message) => {
+      if (message.type === 'enqueue') return { type: 'enqueue_result', ok: true, task_id: 42 };
+      if (message.type === 'refresh_firefox_authorization') return { type: 'action_result', ok: true };
+      if (message.type === 'get_defaults') return { type: 'defaults', target_dir: 'C:\\Downloads' };
+      return { type: 'task_list', tasks: [] };
+    }
+  });
+  const background = createBackground(fake.browser, { attempts: 1, delayMs: 0, timers: false });
+  fake.events.sendHeaders({
+    requestId: 'initial', method: 'GET', url: 'https://files.test/file.pdf?sig=old', tabId: 4,
+    documentUrl: 'https://app.test/page?view=1',
+    requestHeaders: [{ name: 'Cookie', value: 'session=old' }]
+  });
+  await background.handleCreatedDownload({
+    id: 5,
+    url: 'https://files.test/file.pdf?sig=old',
+    referrer: 'https://app.test/page?view=1',
+    tabId: 4,
+    incognito: false,
+    cookieStoreId: 'firefox-default',
+    filename: 'file.pdf'
+  });
+  await background.submitExternalDownload(5, {
+    filename: 'file.pdf', targetDir: 'C:\\Downloads', proxy: { enabled: false }
+  });
+
+  const started = await background.handleRuntimeMessage({
+    type: 'reauthorize-firefox', taskId: 42
+  });
+  assert.equal(started.ok, true);
+  assert.equal(started.waiting, true);
+  assert.deepEqual(fake.calls.tabUpdates, [{ id: 4, details: { active: true } }]);
+
+  fake.events.sendHeaders({
+    requestId: 'fresh', method: 'GET', url: 'https://files.test/file.pdf?sig=new', tabId: 4,
+    documentUrl: 'https://app.test/page?view=1',
+    requestHeaders: [{ name: 'Cookie', value: 'session=fresh' }]
+  });
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    if (fake.calls.nativeMessages.some((message) => message.type === 'refresh_firefox_authorization')) break;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  const refresh = fake.calls.nativeMessages.find((message) => message.type === 'refresh_firefox_authorization');
+  assert.ok(refresh);
+  assert.equal(refresh.task_id, 42);
+  assert.deepEqual(refresh.request_context.headers, [
+    { name: 'Cookie', value: 'session=fresh' }
+  ]);
 });
 
 test('closing settings after an enqueue timeout does not restore Firefox blindly', async () => {

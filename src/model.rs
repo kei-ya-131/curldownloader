@@ -3,6 +3,8 @@ use std::{fmt, path::PathBuf, sync::mpsc::Sender};
 use url::Host;
 use zeroize::Zeroizing;
 
+use crate::request_context::{PreparedRequestContext, SourceAuthorization, StoredRequestContext};
+
 pub type TaskId = u64;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -133,6 +135,7 @@ pub enum TaskStatus {
     Pausing,
     Paused,
     NeedsProxyPassword,
+    NeedsFirefoxAuthorization,
     AwaitingFileDecision,
     Finalizing,
     Completed,
@@ -179,7 +182,7 @@ pub enum RangeSupport {
     Unsupported,
 }
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 3;
+pub const CURRENT_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SegmentState {
@@ -244,6 +247,12 @@ pub struct DownloadTask {
     pub proxy: ProxySettings,
     pub status: TaskStatus,
     #[serde(default)]
+    pub request_context: StoredRequestContext,
+    #[serde(default)]
+    pub authorization: SourceAuthorization,
+    #[serde(default)]
+    pub reauthorization_requested: bool,
+    #[serde(default)]
     pub origin: TaskOrigin,
     /// Native-messaging request id used to make Firefox retries idempotent.
     #[serde(default)]
@@ -286,6 +295,9 @@ impl DownloadTask {
             range_support: RangeSupport::Unknown,
             proxy: ProxySettings::default(),
             status: TaskStatus::Queued,
+            request_context: StoredRequestContext::default(),
+            authorization: SourceAuthorization::Public,
+            reauthorization_requested: false,
             origin,
             external_request_id: None,
             overwrite_approval: None,
@@ -308,6 +320,8 @@ impl DownloadTask {
             TaskStatus::Cancelled
         } else if self.status == TaskStatus::AwaitingFileDecision {
             TaskStatus::AwaitingFileDecision
+        } else if self.status == TaskStatus::NeedsFirefoxAuthorization {
+            TaskStatus::NeedsFirefoxAuthorization
         } else {
             TaskStatus::Paused
         };
@@ -363,6 +377,8 @@ pub struct TaskSnapshot {
     pub filename: String,
     pub target_dir: PathBuf,
     pub status: TaskStatus,
+    pub authorization: SourceAuthorization,
+    pub reauthorization_requested: bool,
     pub origin: TaskOrigin,
     pub requested_segments: u8,
     pub actual_segments: u8,
@@ -393,6 +409,7 @@ pub struct ConfiguredTask {
     pub requested_segments: u8,
     pub proxy: ProxySettings,
     pub request_id: Option<String>,
+    pub request_context: Option<PreparedRequestContext>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -412,6 +429,11 @@ pub enum EngineCommand {
         task: ConfiguredTask,
         origin: TaskOrigin,
         response: Sender<Result<ConfiguredTaskAcceptance, String>>,
+    },
+    RefreshFirefoxAuthorization {
+        id: TaskId,
+        request_context: PreparedRequestContext,
+        response: Sender<Result<(), String>>,
     },
     ResolveFileConflict {
         id: TaskId,

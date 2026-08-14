@@ -2,6 +2,7 @@ use crate::{
     curl::{self, CurlCommandSpec, CurlOutcome, CurlRuntime},
     filename,
     model::*,
+    request_context::{self, RequestContext, SourceAuthorization},
     storage,
 };
 use std::{
@@ -325,6 +326,7 @@ struct Engine {
     state_path: PathBuf,
     settings: GlobalSettings,
     tasks: Vec<DownloadTask>,
+    runtime_contexts: HashMap<TaskId, RequestContext>,
     active: HashMap<u64, ActiveJob>,
     next_job_id: u64,
     queue: VecDeque<TaskId>,
@@ -345,6 +347,8 @@ impl Engine {
         events: Sender<EngineEvent>,
         metrics: Arc<EngineMetrics>,
     ) -> Self {
+        let mut runtime_contexts = HashMap::new();
+        let mut state_dirty = false;
         for task in &mut state.tasks {
             task.sanitize_persisted_filename();
             if !matches!(task.status, TaskStatus::Completed | TaskStatus::Cancelled) {
@@ -353,19 +357,64 @@ impl Engine {
                     task.last_error = Some(error);
                     task.status = TaskStatus::Failed;
                 }
+                if task.request_context.public.is_some() || task.request_context.encrypted.is_some()
+                {
+                    match request_context::restore(&task.request_context) {
+                        Ok(Some(context)) => {
+                            runtime_contexts.insert(task.id, context);
+                            if task.request_context.encrypted.is_some()
+                                && task.authorization == SourceAuthorization::Public
+                            {
+                                task.authorization = SourceAuthorization::Encrypted;
+                                state_dirty = true;
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(_) => {
+                            task.status = TaskStatus::NeedsFirefoxAuthorization;
+                            task.authorization = SourceAuthorization::DecryptionFailed;
+                            task.reauthorization_requested = false;
+                            task.last_error = Some(task_error(
+                                ErrorKind::Http,
+                                "授權資料無法解密",
+                                "Windows 使用者資料保護無法解密 Firefox 授權資料",
+                                "在 Firefox 重新授權",
+                            ));
+                            state_dirty = true;
+                        }
+                    }
+                }
             }
         }
-        for task in state
-            .tasks
-            .iter()
-            .filter(|task| matches!(task.status, TaskStatus::Completed | TaskStatus::Cancelled))
-        {
+        for task in &mut state.tasks {
+            if !matches!(task.status, TaskStatus::Completed | TaskStatus::Cancelled) {
+                continue;
+            }
             let _ = storage::cleanup_task_work_dir(task);
+            if task.request_context.public.is_some() || task.request_context.encrypted.is_some() {
+                let protected = task.request_context.was_protected
+                    || task.request_context.encrypted.is_some()
+                    || matches!(
+                        task.authorization,
+                        SourceAuthorization::Encrypted
+                            | SourceAuthorization::NeedsFirefox
+                            | SourceAuthorization::DecryptionFailed
+                    );
+                request_context::clear_secret_material(&mut task.request_context);
+                if protected {
+                    task.authorization = SourceAuthorization::ProtectedCleared;
+                }
+                state_dirty = true;
+            }
+        }
+        if state_dirty {
+            let _ = storage::save_state(&state_path, &state);
         }
         Self {
             state_path,
             settings: state.settings,
             tasks: state.tasks,
+            runtime_contexts,
             active: HashMap::new(),
             next_job_id: 1,
             queue: VecDeque::new(),
@@ -463,6 +512,18 @@ impl Engine {
                     let _ = response.send(Err(error));
                 }
             },
+            EngineCommand::RefreshFirefoxAuthorization {
+                id,
+                request_context,
+                response,
+            } => {
+                let result = self.refresh_firefox_authorization(id, request_context);
+                let ok = result.is_ok();
+                let _ = response.send(result);
+                if ok {
+                    self.request_start(id);
+                }
+            }
             EngineCommand::ResolveFileConflict {
                 id,
                 decision,
@@ -607,6 +668,14 @@ impl Engine {
         let filename = filename::sanitize_filename(&new_task.filename, id);
         let mut task =
             DownloadTask::new_with_origin(id, &new_task.url, filename, new_task.target_dir, origin);
+        let runtime_context = new_task
+            .request_context
+            .as_ref()
+            .map(|context| context.runtime.clone());
+        if let Some(context) = new_task.request_context {
+            task.request_context = context.stored;
+            task.authorization = context.authorization;
+        }
         task.external_request_id = new_task.request_id;
         task.requested_segments = new_task.requested_segments.clamp(1, 8);
         task.proxy = new_task.proxy;
@@ -622,6 +691,9 @@ impl Engine {
         let id = task.id;
         let awaiting_file_decision = task.status == TaskStatus::AwaitingFileDecision;
         self.tasks.push(task);
+        if let Some(context) = runtime_context {
+            self.runtime_contexts.insert(id, context);
+        }
         self.settings.last_download_dir = target_dir;
         self.persist()
             .map_err(|error| format!("無法保存下載任務：{error}"))?;
@@ -630,6 +702,62 @@ impl Engine {
             task_id: id,
             awaiting_file_decision,
         })
+    }
+
+    fn refresh_firefox_authorization(
+        &mut self,
+        id: TaskId,
+        prepared: crate::request_context::PreparedRequestContext,
+    ) -> Result<(), String> {
+        let Some(task) = self.task(id).cloned() else {
+            return Err("找不到下載任務。".into());
+        };
+        if task.origin != TaskOrigin::Firefox
+            || task.status != TaskStatus::NeedsFirefoxAuthorization
+        {
+            return Err("此任務目前不需要 Firefox 重新授權。".into());
+        }
+        let new_initial = prepared.runtime.initial_url().to_owned();
+        let new_final = prepared.runtime.final_url().to_owned();
+        let old_urls = [
+            task.original_url.as_str(),
+            task.effective_url
+                .as_deref()
+                .unwrap_or(task.original_url.as_str()),
+        ];
+        if !old_urls.iter().any(|old| {
+            same_download_resource(old, &new_initial) || same_download_resource(old, &new_final)
+        }) {
+            return Err("來源已變更，為避免合併不同來源，請另建新任務。".into());
+        }
+
+        let crate::request_context::PreparedRequestContext {
+            stored,
+            runtime,
+            authorization,
+        } = prepared;
+        self.stop_task_jobs(id);
+        self.queue.retain(|queued| *queued != id);
+        self.pending_start.remove(&id);
+        self.range_probe.remove(&id);
+        if let Some(task) = self.task_mut(id) {
+            task.original_url = new_initial;
+            task.effective_url = None;
+            task.total_size = None;
+            task.etag = None;
+            task.last_modified = None;
+            task.range_support = RangeSupport::Unknown;
+            task.request_context = stored;
+            task.authorization = authorization;
+            task.reauthorization_requested = false;
+            task.last_error = None;
+            task.status = TaskStatus::Queued;
+        }
+        self.runtime_contexts.insert(id, runtime);
+        self.persist()
+            .map_err(|error| format!("重新授權後無法保存狀態：{error}"))?;
+        self.publish_snapshot();
+        Ok(())
     }
 
     fn update_draft(
@@ -894,6 +1022,7 @@ impl Engine {
                     task.pending_target_fingerprint = None;
                     task.status = TaskStatus::Cancelled;
                 }
+                self.clear_task_request_context(id);
                 self.persist().map_err(|error| error.to_string())?;
                 self.publish_snapshot();
                 Ok(())
@@ -1000,6 +1129,7 @@ impl Engine {
             task.pending_target_fingerprint = None;
             task.status = TaskStatus::Cancelled;
         }
+        self.clear_task_request_context(id);
         self.persist()
             .map_err(|error| format!("取消任務後無法保存狀態：{error}"))?;
         Ok(())
@@ -1007,6 +1137,7 @@ impl Engine {
 
     fn remove_task(&mut self, id: TaskId) {
         let _ = self.cancel_task(id);
+        self.clear_task_request_context(id);
         let can_remove = self
             .task(id)
             .is_some_and(|task| storage::cleanup_task_work_dir(task).is_ok());
@@ -1031,6 +1162,7 @@ impl Engine {
             self.range_probe.remove(&task.id);
             self.meters.remove(&task.id);
             let _ = storage::cleanup_task_work_dir(task);
+            self.clear_task_request_context(task.id);
         }
         self.tasks.retain(|task| {
             if !matches!(task.status, TaskStatus::Completed | TaskStatus::Cancelled) {
@@ -1279,19 +1411,30 @@ impl Engine {
         };
         let mut metadata_path = None;
         let mut spec: CurlCommandSpec;
+        let request_context = self.runtime_contexts.get(&task.id);
         let stdout = match kind {
             JobKind::HeadProbe => {
                 let path = work.join("probe-head.json");
                 metadata_path = Some(path.clone());
-                spec = curl::build_head_probe(&task.proxy, &task.original_url, &header_path)
-                    .map_err(io::Error::other)?;
+                spec = curl::build_head_probe(
+                    &task.proxy,
+                    request_context,
+                    &task.original_url,
+                    &header_path,
+                )
+                .map_err(io::Error::other)?;
                 Stdio::from(File::create(path)?)
             }
             JobKind::RangeProbe => {
                 let path = work.join("probe-range.json");
                 metadata_path = Some(path.clone());
-                spec = curl::build_range_probe(&task.proxy, &task.original_url, &header_path)
-                    .map_err(io::Error::other)?;
+                spec = curl::build_range_probe(
+                    &task.proxy,
+                    request_context,
+                    &task.original_url,
+                    &header_path,
+                )
+                .map_err(io::Error::other)?;
                 Stdio::from(File::create(path)?)
             }
             JobKind::Single => {
@@ -1301,6 +1444,7 @@ impl Engine {
                     .unwrap_or(0);
                 spec = curl::build_single_transfer(
                     &task.proxy,
+                    request_context,
                     task.effective_url.as_deref().unwrap_or(&task.original_url),
                     &output,
                     existing,
@@ -1323,6 +1467,7 @@ impl Engine {
                     .unwrap_or(0);
                 spec = curl::build_segment_transfer(
                     &task.proxy,
+                    request_context,
                     task.effective_url.as_deref().unwrap_or(&task.original_url),
                     segment_state.start,
                     segment_state.end,
@@ -1448,6 +1593,9 @@ impl Engine {
                 }),
         );
         if outcome.exit_code != 0 || parsed.is_err() {
+            if self.mark_firefox_authorization_required(job.task_id, &outcome.headers) {
+                return;
+            }
             if fallback {
                 self.range_probe.insert(job.task_id);
                 self.queue.push_back(job.task_id);
@@ -1513,6 +1661,9 @@ impl Engine {
 
     fn finish_single(&mut self, job: ActiveJob, outcome: CurlOutcome) {
         if outcome.exit_code != 0 {
+            if self.mark_firefox_authorization_required(job.task_id, &outcome.headers) {
+                return;
+            }
             let kind = self
                 .task(job.task_id)
                 .map(|task| transfer_error_kind(task, outcome.exit_code, &outcome.headers))
@@ -1554,6 +1705,9 @@ impl Engine {
 
     fn finish_segment(&mut self, job: ActiveJob, outcome: CurlOutcome) {
         if outcome.exit_code != 0 {
+            if self.mark_firefox_authorization_required(job.task_id, &outcome.headers) {
+                return;
+            }
             let kind = self
                 .task(job.task_id)
                 .map(|task| transfer_error_kind(task, outcome.exit_code, &outcome.headers))
@@ -1618,6 +1772,42 @@ impl Engine {
         } else if self.task_has_incomplete_segments(job.task_id) {
             self.queue.push_back(job.task_id);
         }
+    }
+
+    fn mark_firefox_authorization_required(&mut self, id: TaskId, headers: &str) -> bool {
+        let Some(status) =
+            curl::parse_last_http_status(headers).filter(|status| matches!(status, 401 | 403))
+        else {
+            return false;
+        };
+        let should_mark = self.task(id).is_some_and(|task| {
+            task.origin == TaskOrigin::Firefox
+                && task.request_context.encrypted.is_some()
+                && !matches!(task.authorization, SourceAuthorization::ProtectedCleared)
+        });
+        if !should_mark {
+            return false;
+        }
+        self.stop_task_jobs(id);
+        self.queue.retain(|queued| *queued != id);
+        self.pending_start.remove(&id);
+        self.range_probe.remove(&id);
+        if let Some(task) = self.task_mut(id) {
+            let mut error = task_error(
+                ErrorKind::Http,
+                "需要 Firefox 重新授權",
+                &format!("HTTP {status}"),
+                "在 Firefox 重新授權",
+            );
+            error.code = Some(i32::from(status));
+            task.status = TaskStatus::NeedsFirefoxAuthorization;
+            task.authorization = SourceAuthorization::NeedsFirefox;
+            task.reauthorization_requested = false;
+            task.last_error = Some(error);
+        }
+        let _ = self.persist();
+        self.publish_snapshot();
+        true
     }
 
     fn finalize_task(&mut self, id: TaskId) {
@@ -1685,6 +1875,7 @@ impl Engine {
             return;
         }
         let _ = storage::cleanup_task_work_dir(&task);
+        self.clear_task_request_context(id);
         if let Some(task) = self.task_mut(id) {
             task.proxy.clear_password();
             task.overwrite_approval = None;
@@ -1724,6 +1915,28 @@ impl Engine {
     fn stop_task_jobs(&mut self, id: TaskId) {
         for job in self.active.values_mut().filter(|job| job.task_id == id) {
             job.stop = true;
+        }
+    }
+
+    fn clear_task_request_context(&mut self, id: TaskId) {
+        self.runtime_contexts.remove(&id);
+        if let Some(task) = self.task_mut(id) {
+            let protected = task.request_context.was_protected
+                || task.request_context.encrypted.is_some()
+                || matches!(
+                    task.authorization,
+                    SourceAuthorization::Encrypted
+                        | SourceAuthorization::NeedsFirefox
+                        | SourceAuthorization::DecryptionFailed
+                );
+            let has_context =
+                task.request_context.public.is_some() || task.request_context.encrypted.is_some();
+            if has_context {
+                request_context::clear_secret_material(&mut task.request_context);
+            }
+            if protected {
+                task.authorization = SourceAuthorization::ProtectedCleared;
+            }
         }
     }
 
@@ -1817,6 +2030,8 @@ impl Engine {
                     filename: task.filename.clone(),
                     target_dir: task.target_dir.clone(),
                     status: task.status,
+                    authorization: task.authorization,
+                    reauthorization_requested: task.reauthorization_requested,
                     origin: task.origin,
                     requested_segments: task.requested_segments,
                     actual_segments: task.actual_segments,
@@ -1895,6 +2110,24 @@ fn fingerprints_match(
         }
         _ => false,
     }
+}
+
+fn same_download_resource(left: &str, right: &str) -> bool {
+    let Ok(left) = url::Url::parse(left) else {
+        return false;
+    };
+    let Ok(right) = url::Url::parse(right) else {
+        return false;
+    };
+    left.scheme().eq_ignore_ascii_case(right.scheme())
+        && left
+            .host()
+            .map(|host| host.to_string().to_ascii_lowercase())
+            == right
+                .host()
+                .map(|host| host.to_string().to_ascii_lowercase())
+        && left.port_or_known_default() == right.port_or_known_default()
+        && left.path() == right.path()
 }
 
 fn record_segment_start(segment: &mut SegmentState, unix_ms: u64) {

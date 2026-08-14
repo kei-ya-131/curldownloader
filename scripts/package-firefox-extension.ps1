@@ -13,6 +13,7 @@ $runtimeFiles = @(
     'storage.js',
     'status.js',
     'native-session.js',
+    'request-context.js',
     'background.js',
     'settings.html',
     'settings.css',

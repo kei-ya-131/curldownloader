@@ -14,6 +14,36 @@ use std::{
 };
 
 #[test]
+fn enqueue_accepts_a_firefox_request_context_without_echoing_secrets() {
+    let value = serde_json::json!({
+        "type": "enqueue",
+        "request_id": "auth-1",
+        "url": "https://files.test/a.pdf",
+        "filename": "a.pdf",
+        "target_dir": "C:\\Downloads",
+        "requested_segments": 4,
+        "proxy": WireProxy::direct(),
+        "request_context": {
+            "headers": [{"name":"Cookie","value":"session=secret"}],
+            "source_page_url":"https://app.test/page",
+            "initial_url":"https://files.test/a.pdf",
+            "final_url":"https://files.test/a.pdf",
+            "incognito":false,
+            "cookie_store_id":"firefox-default"
+        }
+    });
+    let request: IpcRequest = serde_json::from_value(value).unwrap();
+    assert!(!format!("{request:?}").contains("session=secret"));
+    let IpcRequest::Enqueue {
+        request_context, ..
+    } = request
+    else {
+        panic!("expected enqueue request");
+    };
+    assert!(request_context.is_some());
+}
+
+#[test]
 fn pipe_enqueue_reaches_the_single_download_engine() {
     let server = support::TestHttpServer::start(vec![support::Route {
         path: "/bridge.bin",
@@ -21,6 +51,7 @@ fn pipe_enqueue_reaches_the_single_download_engine() {
         ranges: false,
         etag: "bridge-v1",
         filename: "server.bin",
+        required_headers: Vec::new(),
     }]);
     let mut harness = support::EngineHarness::new(1);
     let stop = Arc::new(AtomicBool::new(false));
@@ -46,6 +77,7 @@ fn pipe_enqueue_reaches_the_single_download_engine() {
         target_dir: target.to_string_lossy().into_owned(),
         requested_segments: 8,
         proxy: WireProxy::direct(),
+        request_context: None,
     };
     let response = curl_downloader::ipc::call_pipe(&request, Duration::from_secs(5)).unwrap();
     let IpcResponse::EnqueueResult {
@@ -74,6 +106,7 @@ fn pipe_enqueue_reaches_the_single_download_engine() {
             target_dir: target.to_string_lossy().into_owned(),
             requested_segments: 9,
             proxy: WireProxy::direct(),
+            request_context: None,
         },
         Duration::from_secs(5),
     )

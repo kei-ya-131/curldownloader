@@ -269,6 +269,7 @@ fn segment_status_label(task_status: TaskStatus, segment: &SegmentSnapshot) -> &
         TaskStatus::Downloading => "等待中",
         TaskStatus::Finalizing => "整合中",
         TaskStatus::NeedsProxyPassword => "等待密碼",
+        TaskStatus::NeedsFirefoxAuthorization => "需要 Firefox 重新授權",
         TaskStatus::AwaitingFileDecision => "等待檔案決定",
         TaskStatus::Completed => "未完成",
     }
@@ -1111,6 +1112,10 @@ impl CurlDownloaderApp {
                                 egui::RichText::new(status_label(task.status)).strong(),
                             );
                             ui.weak(format!("下載工具：{}", curl_source_label(task.curl_source)));
+                            ui.weak(format!(
+                                "來源授權：{}",
+                                authorization_label(task.authorization)
+                            ));
                         });
                     });
                 });
@@ -1144,6 +1149,18 @@ impl CurlDownloaderApp {
                         let mut pending_last_dir = None;
                         let mut pending_password = None;
                         let mut pending_error = None;
+                        if task.status == TaskStatus::NeedsFirefoxAuthorization {
+                            ui.add_space(12.0);
+                            card_frame(ui).show(ui, |ui| {
+                                ui.heading("Firefox 重新授權");
+                                ui.label(
+                                    "請開啟 Firefox 的 Curl Downloader 彈窗，按「在 Firefox 重新授權」。"
+                                );
+                                ui.weak(
+                                    "系統會聚焦原來源分頁（不會自動重載），請在同一分頁/容器重新按一次原下載；只會接收同一資源的新請求。",
+                                );
+                            });
+                        }
                         if task.status == TaskStatus::AwaitingFileDecision {
                             ui.add_space(12.0);
                             card_frame(ui).show(ui, |ui| {
@@ -1361,6 +1378,7 @@ fn status_color(ui: &egui::Ui, status: TaskStatus) -> egui::Color32 {
         TaskStatus::Pausing
         | TaskStatus::Finalizing
         | TaskStatus::NeedsProxyPassword
+        | TaskStatus::NeedsFirefoxAuthorization
         | TaskStatus::AwaitingFileDecision => visuals.warn_fg_color,
         TaskStatus::Completed => visuals.widgets.active.fg_stroke.color,
         TaskStatus::Failed => visuals.error_fg_color,
@@ -1707,6 +1725,7 @@ fn show_basic_info_card(
         ui.heading("基本資料");
         show_detail_value(ui, "狀態", status_label(task.status));
         show_detail_value(ui, "下載工具", curl_source_label(task.curl_source));
+        show_detail_value(ui, "來源授權", authorization_label(task.authorization));
         show_url_detail_value(
             ui,
             "來源 URL",
@@ -1798,12 +1817,23 @@ fn status_label(status: TaskStatus) -> &'static str {
         TaskStatus::Pausing => "暫停中",
         TaskStatus::Paused => "已暫停",
         TaskStatus::NeedsProxyPassword => "需要 Proxy 密碼",
+        TaskStatus::NeedsFirefoxAuthorization => "需要 Firefox 重新授權",
         TaskStatus::AwaitingFileDecision => "等待檔案決定",
         TaskStatus::Finalizing => "整合中",
         TaskStatus::Completed => "已完成",
         TaskStatus::Failed => "失敗",
         TaskStatus::Cancelled => "已取消",
         TaskStatus::Unknown => "已暫停",
+    }
+}
+
+fn authorization_label(authorization: crate::request_context::SourceAuthorization) -> &'static str {
+    match authorization {
+        crate::request_context::SourceAuthorization::Public => "公開（無加密資料）",
+        crate::request_context::SourceAuthorization::Encrypted => "Firefox 授權（DPAPI 加密）",
+        crate::request_context::SourceAuthorization::NeedsFirefox => "需要 Firefox 重新授權",
+        crate::request_context::SourceAuthorization::DecryptionFailed => "授權資料無法解密",
+        crate::request_context::SourceAuthorization::ProtectedCleared => "受保護（授權資料已清除）",
     }
 }
 
@@ -1820,6 +1850,7 @@ fn status_icon(status: TaskStatus) -> &'static str {
         TaskStatus::Downloading => "↓",
         TaskStatus::Pausing | TaskStatus::Paused => "Ⅱ",
         TaskStatus::NeedsProxyPassword => "?",
+        TaskStatus::NeedsFirefoxAuthorization => "!",
         TaskStatus::AwaitingFileDecision => "!",
         TaskStatus::Finalizing => "…",
         TaskStatus::Completed => "✓",
@@ -2058,6 +2089,22 @@ mod tests {
     }
 
     #[test]
+    fn labels_public_and_protected_source_authorization() {
+        assert_eq!(
+            authorization_label(crate::request_context::SourceAuthorization::Public),
+            "公開（無加密資料）"
+        );
+        assert_eq!(
+            authorization_label(crate::request_context::SourceAuthorization::Encrypted),
+            "Firefox 授權（DPAPI 加密）"
+        );
+        assert_eq!(
+            authorization_label(crate::request_context::SourceAuthorization::ProtectedCleared),
+            "受保護（授權資料已清除）"
+        );
+    }
+
+    #[test]
     fn only_editable_tasks_can_receive_bulk_proxy_settings() {
         assert!(can_edit_proxy_in_bulk(TaskStatus::Queued));
         assert!(can_edit_proxy_in_bulk(TaskStatus::Paused));
@@ -2247,6 +2294,8 @@ mod tests {
             filename: "file.bin".into(),
             target_dir: PathBuf::from("C:\\Downloads"),
             status,
+            authorization: crate::request_context::SourceAuthorization::Public,
+            reauthorization_requested: false,
             origin: TaskOrigin::Gui,
             requested_segments: 1,
             actual_segments: 1,

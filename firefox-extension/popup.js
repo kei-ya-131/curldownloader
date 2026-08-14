@@ -16,11 +16,19 @@
     pausing: '暫停中',
     paused: '已暫停',
     needs_proxy_password: '需要 Proxy 密碼',
+    needs_firefox_authorization: '需要 Firefox 重新授權',
     awaiting_file_decision: '等待檔案決定',
     finalizing: '整理中',
     completed: '已完成',
     failed: '失敗',
     cancelled: '已取消'
+  };
+  const authorizationLabels = {
+    public: '公開（無加密資料）',
+    encrypted: 'Firefox 授權（DPAPI 加密）',
+    needs_firefox_authorization: '需要 Firefox 重新授權',
+    decryption_failed: '授權資料無法解密',
+    protected_cleared: '受保護（授權資料已清除）'
   };
 
   function numberOrZero(value) {
@@ -105,6 +113,10 @@
       filenameElement,
       textElement(documentApi, 'span', 'status', statusLabel(task.status))
     );
+    const authorizationLabel = authorizationLabels[String(task.authorization)];
+    if (authorizationLabel) {
+      main.append(textElement(documentApi, 'span', 'authorization', authorizationLabel));
+    }
     card.append(main);
 
     const total = Number(task.total_size);
@@ -177,6 +189,13 @@
       cancel.textContent = '取消任務';
       bindOpenAction(cancel, 'resolve-file-conflict', 'cancel');
       actions.append(cancel);
+    }
+    if (task.status === 'needs_firefox_authorization' && task.origin === 'firefox') {
+      const reauthorize = documentApi.createElement('button');
+      reauthorize.type = 'button';
+      reauthorize.textContent = '在 Firefox 重新授權';
+      bindOpenAction(reauthorize, 'reauthorize-firefox');
+      actions.append(reauthorize);
     }
     if (actions.childElementCount > 0) card.append(actions);
 

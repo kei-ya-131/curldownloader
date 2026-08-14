@@ -5,8 +5,10 @@ use curl_downloader::{
     download::{EngineHandle, spawn_engine},
     model::{
         CURRENT_SCHEMA_VERSION, ConfiguredTask, EngineCommand, EngineEvent, GlobalSettings,
-        NewTask, PersistedState, ProxySettings, SegmentSnapshot, TaskId, TaskSnapshot, TaskStatus,
+        NewTask, PersistedState, ProxySettings, SegmentSnapshot, TaskId, TaskOrigin, TaskSnapshot,
+        TaskStatus,
     },
+    request_context::{PreparedRequestContext, WireRequestContext},
 };
 use std::{
     io::{Read, Write},
@@ -272,6 +274,7 @@ pub struct Route {
     pub ranges: bool,
     pub etag: &'static str,
     pub filename: &'static str,
+    pub required_headers: Vec<(String, String)>,
 }
 
 impl TestHttpServer {
@@ -280,6 +283,14 @@ impl TestHttpServer {
     }
 
     pub fn start_slow(body: &'static [u8], delay_ms: u64) -> Self {
+        Self::start_slow_with_required_headers(body, delay_ms, Vec::new())
+    }
+
+    pub fn start_slow_with_required_headers(
+        body: &'static [u8],
+        delay_ms: u64,
+        required_headers: Vec<(String, String)>,
+    ) -> Self {
         Self::start_with_delay(
             vec![Route {
                 path: "/slow.bin",
@@ -287,6 +298,7 @@ impl TestHttpServer {
                 ranges: true,
                 etag: "v1",
                 filename: "slow.bin",
+                required_headers,
             }],
             delay_ms,
         )
@@ -316,6 +328,7 @@ impl TestHttpServer {
                                     ranges: route.ranges,
                                     etag: route.etag,
                                     filename: route.filename,
+                                    required_headers: route.required_headers.clone(),
                                 })
                                 .collect::<Vec<_>>();
                             let _ = thread::Builder::new()
@@ -386,6 +399,22 @@ fn serve_connection(mut stream: TcpStream, routes: &[Route], delay_ms: u64) {
         let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
         return;
     };
+    let authorized = route
+        .required_headers
+        .iter()
+        .all(|(required_name, required_value)| {
+            request.lines().any(|line| {
+                let Some((name, value)) = line.split_once(':') else {
+                    return false;
+                };
+                name.trim().eq_ignore_ascii_case(required_name) && value.trim() == required_value
+            })
+        });
+    if !authorized {
+        let _ = stream
+            .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        return;
+    }
     let range = request.lines().find_map(|line| {
         let (name, value) = line.split_once(':')?;
         if !name.eq_ignore_ascii_case("range") {
@@ -553,6 +582,7 @@ impl EngineHarness {
                     requested_segments: 1,
                     proxy,
                     request_id: None,
+                    request_context: None,
                 },
                 response: response_tx,
             })
@@ -561,6 +591,92 @@ impl EngineHarness {
             .recv_timeout(Duration::from_secs(5))
             .unwrap()
             .unwrap()
+    }
+
+    pub fn add_firefox_configured_with_context(
+        &mut self,
+        url: String,
+        filename: &str,
+        wire: WireRequestContext,
+    ) -> TaskId {
+        self.add_firefox_configured_with_context_segments(url, filename, wire, 1)
+    }
+
+    pub fn add_firefox_configured_with_context_segments(
+        &mut self,
+        url: String,
+        filename: &str,
+        wire: WireRequestContext,
+        segments: u8,
+    ) -> TaskId {
+        let prepared = curl_downloader::request_context::prepare(wire).unwrap();
+        self.add_configured_with_origin_segments(
+            url,
+            filename.to_owned(),
+            TaskOrigin::Firefox,
+            Some(prepared),
+            segments,
+        )
+    }
+
+    pub fn add_configured_with_origin(
+        &mut self,
+        url: String,
+        filename: String,
+        origin: TaskOrigin,
+        request_context: Option<PreparedRequestContext>,
+    ) -> TaskId {
+        self.add_configured_with_origin_segments(url, filename, origin, request_context, 1)
+    }
+
+    pub fn add_configured_with_origin_segments(
+        &mut self,
+        url: String,
+        filename: String,
+        origin: TaskOrigin,
+        request_context: Option<PreparedRequestContext>,
+        requested_segments: u8,
+    ) -> TaskId {
+        let (response_tx, response_rx) = std::sync::mpsc::channel();
+        self.engine
+            .commands
+            .send(EngineCommand::AddConfiguredWithOrigin {
+                task: ConfiguredTask {
+                    url,
+                    filename,
+                    target_dir: self.download_dir.clone(),
+                    requested_segments,
+                    proxy: ProxySettings::default(),
+                    request_id: None,
+                    request_context,
+                },
+                origin,
+                response: response_tx,
+            })
+            .unwrap();
+        response_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap()
+            .task_id
+    }
+
+    pub fn refresh_firefox_authorization(
+        &mut self,
+        id: TaskId,
+        wire: WireRequestContext,
+    ) -> Result<(), String> {
+        let prepared = curl_downloader::request_context::prepare(wire).unwrap();
+        let (response_tx, response_rx) = std::sync::mpsc::channel();
+        self.engine
+            .commands
+            .send(EngineCommand::RefreshFirefoxAuthorization {
+                id,
+                request_context: prepared,
+                response: response_tx,
+            })
+            .unwrap();
+        response_rx.recv_timeout(Duration::from_secs(5)).unwrap()
     }
 
     pub fn add_with_proxy(

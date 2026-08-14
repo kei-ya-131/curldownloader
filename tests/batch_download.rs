@@ -11,6 +11,7 @@ fn batch_additions_remain_queued_until_explicitly_started() {
             ranges: true,
             etag: "one-v1",
             filename: "one.bin",
+            required_headers: Vec::new(),
         },
         support::Route {
             path: "/two.bin",
@@ -18,6 +19,7 @@ fn batch_additions_remain_queued_until_explicitly_started() {
             ranges: true,
             etag: "two-v1",
             filename: "two.bin",
+            required_headers: Vec::new(),
         },
     ]);
     let mut harness = support::EngineHarness::new(1);
