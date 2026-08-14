@@ -51,6 +51,7 @@ fn pipe_enqueue_reaches_the_single_download_engine() {
         ranges: false,
         etag: "bridge-v1",
         filename: "server.bin",
+        required_headers: Vec::new(),
     }]);
     let mut harness = support::EngineHarness::new(1);
     let stop = Arc::new(AtomicBool::new(false));

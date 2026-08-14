@@ -2,7 +2,7 @@ use crate::{
     curl::{self, CurlCommandSpec, CurlOutcome, CurlRuntime},
     filename,
     model::*,
-    request_context::RequestContext,
+    request_context::{self, RequestContext, SourceAuthorization},
     storage,
 };
 use std::{
@@ -347,6 +347,8 @@ impl Engine {
         events: Sender<EngineEvent>,
         metrics: Arc<EngineMetrics>,
     ) -> Self {
+        let mut runtime_contexts = HashMap::new();
+        let mut state_dirty = false;
         for task in &mut state.tasks {
             task.sanitize_persisted_filename();
             if !matches!(task.status, TaskStatus::Completed | TaskStatus::Cancelled) {
@@ -355,20 +357,64 @@ impl Engine {
                     task.last_error = Some(error);
                     task.status = TaskStatus::Failed;
                 }
+                if task.request_context.public.is_some() || task.request_context.encrypted.is_some()
+                {
+                    match request_context::restore(&task.request_context) {
+                        Ok(Some(context)) => {
+                            runtime_contexts.insert(task.id, context);
+                            if task.request_context.encrypted.is_some()
+                                && task.authorization == SourceAuthorization::Public
+                            {
+                                task.authorization = SourceAuthorization::Encrypted;
+                                state_dirty = true;
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(_) => {
+                            task.status = TaskStatus::NeedsFirefoxAuthorization;
+                            task.authorization = SourceAuthorization::DecryptionFailed;
+                            task.reauthorization_requested = false;
+                            task.last_error = Some(task_error(
+                                ErrorKind::Http,
+                                "授權資料無法解密",
+                                "Windows 使用者資料保護無法解密 Firefox 授權資料",
+                                "在 Firefox 重新授權",
+                            ));
+                            state_dirty = true;
+                        }
+                    }
+                }
             }
         }
-        for task in state
-            .tasks
-            .iter()
-            .filter(|task| matches!(task.status, TaskStatus::Completed | TaskStatus::Cancelled))
-        {
+        for task in &mut state.tasks {
+            if !matches!(task.status, TaskStatus::Completed | TaskStatus::Cancelled) {
+                continue;
+            }
             let _ = storage::cleanup_task_work_dir(task);
+            if task.request_context.public.is_some() || task.request_context.encrypted.is_some() {
+                let protected = task.request_context.was_protected
+                    || task.request_context.encrypted.is_some()
+                    || matches!(
+                        task.authorization,
+                        SourceAuthorization::Encrypted
+                            | SourceAuthorization::NeedsFirefox
+                            | SourceAuthorization::DecryptionFailed
+                    );
+                request_context::clear_secret_material(&mut task.request_context);
+                if protected {
+                    task.authorization = SourceAuthorization::ProtectedCleared;
+                }
+                state_dirty = true;
+            }
+        }
+        if state_dirty {
+            let _ = storage::save_state(&state_path, &state);
         }
         Self {
             state_path,
             settings: state.settings,
             tasks: state.tasks,
-            runtime_contexts: HashMap::new(),
+            runtime_contexts,
             active: HashMap::new(),
             next_job_id: 1,
             queue: VecDeque::new(),
@@ -908,6 +954,7 @@ impl Engine {
                     task.pending_target_fingerprint = None;
                     task.status = TaskStatus::Cancelled;
                 }
+                self.clear_task_request_context(id);
                 self.persist().map_err(|error| error.to_string())?;
                 self.publish_snapshot();
                 Ok(())
@@ -1014,6 +1061,7 @@ impl Engine {
             task.pending_target_fingerprint = None;
             task.status = TaskStatus::Cancelled;
         }
+        self.clear_task_request_context(id);
         self.persist()
             .map_err(|error| format!("取消任務後無法保存狀態：{error}"))?;
         Ok(())
@@ -1021,6 +1069,7 @@ impl Engine {
 
     fn remove_task(&mut self, id: TaskId) {
         let _ = self.cancel_task(id);
+        self.clear_task_request_context(id);
         let can_remove = self
             .task(id)
             .is_some_and(|task| storage::cleanup_task_work_dir(task).is_ok());
@@ -1045,6 +1094,7 @@ impl Engine {
             self.range_probe.remove(&task.id);
             self.meters.remove(&task.id);
             let _ = storage::cleanup_task_work_dir(task);
+            self.clear_task_request_context(task.id);
         }
         self.tasks.retain(|task| {
             if !matches!(task.status, TaskStatus::Completed | TaskStatus::Cancelled) {
@@ -1475,6 +1525,9 @@ impl Engine {
                 }),
         );
         if outcome.exit_code != 0 || parsed.is_err() {
+            if self.mark_firefox_authorization_required(job.task_id, &outcome.headers) {
+                return;
+            }
             if fallback {
                 self.range_probe.insert(job.task_id);
                 self.queue.push_back(job.task_id);
@@ -1540,6 +1593,9 @@ impl Engine {
 
     fn finish_single(&mut self, job: ActiveJob, outcome: CurlOutcome) {
         if outcome.exit_code != 0 {
+            if self.mark_firefox_authorization_required(job.task_id, &outcome.headers) {
+                return;
+            }
             let kind = self
                 .task(job.task_id)
                 .map(|task| transfer_error_kind(task, outcome.exit_code, &outcome.headers))
@@ -1581,6 +1637,9 @@ impl Engine {
 
     fn finish_segment(&mut self, job: ActiveJob, outcome: CurlOutcome) {
         if outcome.exit_code != 0 {
+            if self.mark_firefox_authorization_required(job.task_id, &outcome.headers) {
+                return;
+            }
             let kind = self
                 .task(job.task_id)
                 .map(|task| transfer_error_kind(task, outcome.exit_code, &outcome.headers))
@@ -1645,6 +1704,42 @@ impl Engine {
         } else if self.task_has_incomplete_segments(job.task_id) {
             self.queue.push_back(job.task_id);
         }
+    }
+
+    fn mark_firefox_authorization_required(&mut self, id: TaskId, headers: &str) -> bool {
+        let Some(status) =
+            curl::parse_last_http_status(headers).filter(|status| matches!(status, 401 | 403))
+        else {
+            return false;
+        };
+        let should_mark = self.task(id).is_some_and(|task| {
+            task.origin == TaskOrigin::Firefox
+                && task.request_context.encrypted.is_some()
+                && !matches!(task.authorization, SourceAuthorization::ProtectedCleared)
+        });
+        if !should_mark {
+            return false;
+        }
+        self.stop_task_jobs(id);
+        self.queue.retain(|queued| *queued != id);
+        self.pending_start.remove(&id);
+        self.range_probe.remove(&id);
+        if let Some(task) = self.task_mut(id) {
+            let mut error = task_error(
+                ErrorKind::Http,
+                "需要 Firefox 重新授權",
+                &format!("HTTP {status}"),
+                "在 Firefox 重新授權",
+            );
+            error.code = Some(i32::from(status));
+            task.status = TaskStatus::NeedsFirefoxAuthorization;
+            task.authorization = SourceAuthorization::NeedsFirefox;
+            task.reauthorization_requested = false;
+            task.last_error = Some(error);
+        }
+        let _ = self.persist();
+        self.publish_snapshot();
+        true
     }
 
     fn finalize_task(&mut self, id: TaskId) {
@@ -1712,6 +1807,7 @@ impl Engine {
             return;
         }
         let _ = storage::cleanup_task_work_dir(&task);
+        self.clear_task_request_context(id);
         if let Some(task) = self.task_mut(id) {
             task.proxy.clear_password();
             task.overwrite_approval = None;
@@ -1751,6 +1847,28 @@ impl Engine {
     fn stop_task_jobs(&mut self, id: TaskId) {
         for job in self.active.values_mut().filter(|job| job.task_id == id) {
             job.stop = true;
+        }
+    }
+
+    fn clear_task_request_context(&mut self, id: TaskId) {
+        self.runtime_contexts.remove(&id);
+        if let Some(task) = self.task_mut(id) {
+            let protected = task.request_context.was_protected
+                || task.request_context.encrypted.is_some()
+                || matches!(
+                    task.authorization,
+                    SourceAuthorization::Encrypted
+                        | SourceAuthorization::NeedsFirefox
+                        | SourceAuthorization::DecryptionFailed
+                );
+            let has_context =
+                task.request_context.public.is_some() || task.request_context.encrypted.is_some();
+            if has_context {
+                request_context::clear_secret_material(&mut task.request_context);
+            }
+            if protected {
+                task.authorization = SourceAuthorization::ProtectedCleared;
+            }
         }
     }
 

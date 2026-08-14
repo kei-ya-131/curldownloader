@@ -1734,6 +1734,7 @@ mod tests {
         ));
     }
 
+    use crate::request_context::WireRequestHeader;
     use crate::{
         controller::{ControllerCommand, LifecycleState, SharedControllerState},
         model::{
@@ -1742,7 +1743,6 @@ mod tests {
         },
         shell_foreground::OpenTargetOutcome,
     };
-    use crate::request_context::WireRequestHeader;
     #[test]
     fn frame_round_trip_handles_partial_reader() {
         let body = br#"{"type":"ping","request_id":"1"}"#;

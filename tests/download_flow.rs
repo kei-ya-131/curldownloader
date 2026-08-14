@@ -3,6 +3,188 @@ mod support;
 use curl_downloader::model::{
     CurlSource, EngineCommand, FileDecision, NewTask, ProxySettings, TaskError, TaskStatus,
 };
+use curl_downloader::request_context::{
+    SourceAuthorization, WireRequestContext, WireRequestHeader,
+};
+
+fn protected_context_with_cookie(cookie: &str) -> WireRequestContext {
+    WireRequestContext {
+        headers: vec![
+            WireRequestHeader::new("Cookie", cookie),
+            WireRequestHeader::new("Referer", "https://app.test/page"),
+        ],
+        source_page_url: Some("https://app.test/page".into()),
+        initial_url: "http://files.test/private.pdf".into(),
+        final_url: "http://files.test/private.pdf".into(),
+        incognito: false,
+        cookie_store_id: Some("firefox-default".into()),
+    }
+}
+
+fn protected_context() -> WireRequestContext {
+    protected_context_with_cookie("session=valid")
+}
+
+#[test]
+fn firefox_cookie_and_referer_complete_a_protected_download() {
+    let server = support::TestHttpServer::start(vec![support::Route {
+        path: "/private.pdf",
+        body: b"protected payload",
+        ranges: true,
+        etag: "private-v1",
+        filename: "private.pdf",
+        required_headers: vec![
+            ("cookie".into(), "session=valid".into()),
+            ("referer".into(), "https://app.test/page".into()),
+        ],
+    }]);
+    let mut harness = support::EngineHarness::new(2);
+    let mut context = protected_context();
+    context.initial_url = format!("{}/private.pdf", server.base_url);
+    context.final_url = context.initial_url.clone();
+    let id = harness.add_firefox_configured_with_context(
+        context.initial_url.clone(),
+        "private.pdf",
+        context,
+    );
+    let completed = harness.wait_for(
+        id,
+        TaskStatus::Completed,
+        std::time::Duration::from_secs(60),
+    );
+    assert_eq!(
+        std::fs::read(completed.target_dir.join("private.pdf")).unwrap(),
+        b"protected payload"
+    );
+}
+
+#[test]
+fn firefox_auth_failure_waits_for_reauthorization_without_leaking_context() {
+    let server = support::TestHttpServer::start(vec![support::Route {
+        path: "/private.pdf",
+        body: b"protected payload",
+        ranges: true,
+        etag: "private-v1",
+        filename: "private.pdf",
+        required_headers: vec![
+            ("cookie".into(), "session=fresh".into()),
+            ("referer".into(), "https://app.test/page".into()),
+        ],
+    }]);
+    let mut harness = support::EngineHarness::new(1);
+    let mut context = protected_context_with_cookie("session=expired");
+    context.initial_url = format!("{}/private.pdf", server.base_url);
+    context.final_url = context.initial_url.clone();
+    let source_url = context.initial_url.clone();
+    let id =
+        harness.add_firefox_configured_with_context(source_url.clone(), "private.pdf", context);
+
+    let failed = harness.wait_for(
+        id,
+        curl_downloader::model::TaskStatus::NeedsFirefoxAuthorization,
+        std::time::Duration::from_secs(60),
+    );
+    assert_eq!(failed.authorization, SourceAuthorization::NeedsFirefox);
+    assert!(!failed.reauthorization_requested);
+    assert_eq!(
+        failed.error.as_ref().and_then(|error| error.code),
+        Some(403)
+    );
+    let diagnostic = harness.last_diagnostic(id);
+    assert!(!diagnostic.contains("session=expired"));
+    assert!(!diagnostic.contains(&source_url));
+
+    let state_path = harness.shutdown_keep_files();
+    let raw = std::fs::read_to_string(&state_path).unwrap();
+    assert!(!raw.contains("session=expired"));
+    let persisted = curl_downloader::storage::load_state(&state_path).unwrap();
+    let task = persisted.tasks.iter().find(|task| task.id == id).unwrap();
+    assert!(task.request_context.encrypted.is_some());
+    assert!(task.request_context.public.is_none());
+}
+
+#[test]
+fn completed_protected_download_clears_saved_authorization_material() {
+    let server = support::TestHttpServer::start(vec![support::Route {
+        path: "/private.pdf",
+        body: b"protected payload",
+        ranges: false,
+        etag: "private-v1",
+        filename: "private.pdf",
+        required_headers: vec![("cookie".into(), "session=valid".into())],
+    }]);
+    let mut harness = support::EngineHarness::new(1);
+    let mut context = protected_context();
+    context.initial_url = format!("{}/private.pdf", server.base_url);
+    context.final_url = context.initial_url.clone();
+    let source_url = context.initial_url.clone();
+    let id = harness.add_firefox_configured_with_context(source_url, "private.pdf", context);
+    let completed = harness.wait_for(
+        id,
+        curl_downloader::model::TaskStatus::Completed,
+        std::time::Duration::from_secs(60),
+    );
+    assert_eq!(
+        completed.authorization,
+        SourceAuthorization::ProtectedCleared
+    );
+
+    let state_path = harness.shutdown_keep_files();
+    let raw = std::fs::read_to_string(&state_path).unwrap();
+    assert!(!raw.contains("session=valid"));
+    let persisted = curl_downloader::storage::load_state(&state_path).unwrap();
+    let task = persisted.tasks.iter().find(|task| task.id == id).unwrap();
+    assert!(task.request_context.public.is_none());
+    assert!(task.request_context.encrypted.is_none());
+    assert!(task.request_context.was_protected);
+}
+
+#[test]
+fn restart_restores_encrypted_firefox_context_for_resume() {
+    static BODY: [u8; 1024] = [b'x'; 1024];
+    let server = support::TestHttpServer::start_slow_with_required_headers(
+        &BODY,
+        50,
+        vec![
+            ("cookie".into(), "session=valid".into()),
+            ("referer".into(), "https://app.test/page".into()),
+        ],
+    );
+    let mut harness = support::EngineHarness::new(1);
+    let mut context = protected_context();
+    context.initial_url = format!("{}/slow.bin", server.base_url);
+    context.final_url = context.initial_url.clone();
+    let id = harness.add_firefox_configured_with_context_segments(
+        context.initial_url.clone(),
+        "slow.bin",
+        context,
+        2,
+    );
+    harness.wait_until_downloaded(id, 8, std::time::Duration::from_secs(20));
+    let state_path = harness.shutdown_keep_files();
+    let before = support::part_lengths(harness.download_dir(), id);
+    assert!(before.iter().any(|length| *length > 0));
+    let raw = std::fs::read_to_string(&state_path).unwrap();
+    assert!(!raw.contains("session=valid"));
+    let persisted = curl_downloader::storage::load_state(&state_path).unwrap();
+    let stopped = persisted.tasks.iter().find(|task| task.id == id).unwrap();
+    assert_eq!(stopped.status, TaskStatus::Paused);
+    assert!(stopped.request_context.encrypted.is_some());
+
+    let mut restarted =
+        support::EngineHarness::from_state(state_path, harness.download_dir().to_path_buf());
+    restarted.resume(id);
+    let completed = restarted.wait_for(
+        id,
+        TaskStatus::Completed,
+        std::time::Duration::from_secs(60),
+    );
+    assert_eq!(
+        std::fs::read(completed.target_dir.join("slow.bin")).unwrap(),
+        BODY,
+    );
+    restarted.shutdown_keep_files();
+}
 
 #[test]
 fn curl_runtime_is_lazy_until_download_starts() {
@@ -12,6 +194,7 @@ fn curl_runtime_is_lazy_until_download_starts() {
         ranges: false,
         etag: "lazy-v1",
         filename: "lazy.bin",
+        required_headers: Vec::new(),
     }]);
     let mut harness = support::EngineHarness::new(1);
     let queued = harness.add_batch(&[format!("{}/lazy.bin", server.base_url)])[0].clone();
@@ -38,6 +221,7 @@ fn successful_download_clears_previous_error() {
         ranges: false,
         etag: "retry-v1",
         filename: "retry.bin",
+        required_headers: Vec::new(),
     }]);
     let mut harness = support::EngineHarness::new(1);
     let queued = harness
@@ -76,6 +260,7 @@ fn applies_one_proxy_configuration_to_multiple_queued_tasks() {
             ranges: false,
             etag: "first-v1",
             filename: "first.bin",
+            required_headers: Vec::new(),
         },
         support::Route {
             path: "/second.bin",
@@ -83,6 +268,7 @@ fn applies_one_proxy_configuration_to_multiple_queued_tasks() {
             ranges: false,
             etag: "second-v1",
             filename: "second.bin",
+            required_headers: Vec::new(),
         },
     ]);
     let mut harness = support::EngineHarness::new(1);
@@ -119,6 +305,7 @@ fn reports_applied_and_skipped_tasks_for_mixed_bulk_proxy_update() {
             ranges: false,
             etag: "completed-v1",
             filename: "completed.bin",
+            required_headers: Vec::new(),
         },
         support::Route {
             path: "/queued.bin",
@@ -126,6 +313,7 @@ fn reports_applied_and_skipped_tasks_for_mixed_bulk_proxy_update() {
             ranges: false,
             etag: "queued-v1",
             filename: "queued.bin",
+            required_headers: Vec::new(),
         },
     ]);
     let mut harness = support::EngineHarness::new(1);
@@ -170,6 +358,7 @@ fn downloads_four_ranges_and_merges_exact_bytes() {
         ranges: true,
         etag: "v1",
         filename: "range.bin",
+        required_headers: Vec::new(),
     }]);
     let mut harness = support::EngineHarness::new(4);
     let id = harness.add_and_start(format!("{}/range.bin", server.base_url), 4);
@@ -228,6 +417,7 @@ fn server_without_ranges_falls_back_to_single_stream() {
         ranges: false,
         etag: "v1",
         filename: "single.bin",
+        required_headers: Vec::new(),
     }]);
     let mut harness = support::EngineHarness::new(4);
     let id = harness.add_and_start(format!("{}/single.bin", server.base_url), 4);
@@ -326,6 +516,7 @@ fn completed_history_can_be_cleared_without_removing_target_file() {
         ranges: true,
         etag: "history-v1",
         filename: "history.bin",
+        required_headers: Vec::new(),
     }]);
     let mut harness = support::EngineHarness::new(1);
     let completed_id = harness.add_and_start(format!("{}/history.bin", server.base_url), 1);
@@ -373,6 +564,7 @@ fn completed_progress_remains_full_after_work_dir_cleanup() {
         ranges: true,
         etag: "progress-v1",
         filename: "progress.bin",
+        required_headers: Vec::new(),
     }]);
     let mut harness = support::EngineHarness::new(1);
     let id = harness.add_and_start(format!("{}/progress.bin", server.base_url), 1);
@@ -398,6 +590,7 @@ fn configured_task_uses_external_filename_directory_and_proxy() {
         ranges: false,
         etag: "configured-v1",
         filename: "server-name.bin",
+        required_headers: Vec::new(),
     }]);
     let mut harness = support::EngineHarness::new(1);
     let target_dir = harness.download_dir().join("external-target");
@@ -433,6 +626,7 @@ fn existing_target_waits_for_overwrite_and_replaces_only_after_completion() {
         ranges: false,
         etag: "overwrite-v1",
         filename: "overwrite.bin",
+        required_headers: Vec::new(),
     }]);
     let mut harness = support::EngineHarness::new(1);
     let target_dir = harness.download_dir().to_path_buf();
@@ -483,6 +677,7 @@ fn existing_target_can_cancel_without_touching_old_file() {
         ranges: false,
         etag: "cancel-v1",
         filename: "cancel.bin",
+        required_headers: Vec::new(),
     }]);
     let mut harness = support::EngineHarness::new(1);
     let target_dir = harness.download_dir().to_path_buf();

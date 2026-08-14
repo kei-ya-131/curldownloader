@@ -445,6 +445,21 @@ pub fn parse_probe(headers: &str, fallback_url: &str) -> Result<ProbeMetadata, S
     Ok(meta)
 }
 
+pub fn parse_last_http_status(headers: &str) -> Option<u16> {
+    headers
+        .replace("\r\n", "\n")
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let version = parts.next()?;
+            if !version.starts_with("HTTP/") {
+                return None;
+            }
+            parts.next()?.parse().ok()
+        })
+        .next_back()
+}
+
 fn parse_content_range(value: &str) -> Option<(u64, u64, u64)> {
     let rest = value.strip_prefix("bytes ")?;
     let (range, total) = rest.split_once('/')?;
@@ -521,6 +536,13 @@ mod tests {
             meta.content_disposition.as_deref(),
             Some("attachment; filename=real.bin")
         );
+    }
+
+    #[test]
+    fn parses_last_http_status_from_redirects_and_metadata() {
+        let headers = "HTTP/1.1 302 Found\r\nLocation: /login\r\n\r\nHTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n{\"http_code\":403}\n";
+        assert_eq!(parse_last_http_status(headers), Some(403));
+        assert_eq!(parse_last_http_status("{\"http_code\":403}\n"), None);
     }
 
     #[test]
