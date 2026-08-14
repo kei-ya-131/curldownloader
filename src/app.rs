@@ -4,8 +4,9 @@ use crate::{
     download::spawn_engine,
     ipc,
     model::{
-        CURRENT_SCHEMA_VERSION, CurlSource, EngineCommand, GlobalSettings, NewTask, PersistedState,
-        ProxyProtocol, ProxySettings, SegmentSnapshot, TaskId, TaskSnapshot, TaskStatus,
+        CURRENT_SCHEMA_VERSION, CurlSource, EngineCommand, FileDecision, GlobalSettings, NewTask,
+        PersistedState, ProxyProtocol, ProxySettings, SegmentSnapshot, TaskId, TaskSnapshot,
+        TaskStatus,
     },
     shell_foreground, storage, tray,
     window_control::{EguiMainWindow, MainWindowControl},
@@ -125,7 +126,10 @@ enum OverviewLayout {
     OneColumn([OverviewCard; 4]),
 }
 
-const INSPECTOR_TWO_COLUMN_MIN_WIDTH: f32 = 720.0;
+// Two cards need roughly 400 px each plus the column gap and card margins;
+// using a conservative threshold prevents the narrow inspector from drawing
+// controls on top of one another.
+const INSPECTOR_TWO_COLUMN_MIN_WIDTH: f32 = 840.0;
 
 fn overview_layout(width: f32) -> OverviewLayout {
     if width >= INSPECTOR_TWO_COLUMN_MIN_WIDTH {
@@ -257,7 +261,7 @@ fn segment_status_label(task_status: TaskStatus, segment: &SegmentSnapshot) -> &
         return "下載中";
     }
     match task_status {
-        TaskStatus::Paused | TaskStatus::Pausing => "已暫停",
+        TaskStatus::Paused | TaskStatus::Pausing | TaskStatus::Unknown => "已暫停",
         TaskStatus::Failed => "失敗",
         TaskStatus::Cancelled => "已取消",
         TaskStatus::Queued => "排隊中",
@@ -265,6 +269,7 @@ fn segment_status_label(task_status: TaskStatus, segment: &SegmentSnapshot) -> &
         TaskStatus::Downloading => "等待中",
         TaskStatus::Finalizing => "整合中",
         TaskStatus::NeedsProxyPassword => "等待密碼",
+        TaskStatus::AwaitingFileDecision => "等待檔案決定",
         TaskStatus::Completed => "未完成",
     }
 }
@@ -424,7 +429,10 @@ impl CurlDownloaderApp {
             controller_events,
             window_control,
             tasks: tasks.clone(),
-            selected: tasks.first().map(|task| task.id),
+            selected: tasks
+                .iter()
+                .max_by_key(|task| (task.created_unix_ms, task.id))
+                .map(|task| task.id),
             checked_tasks: HashSet::new(),
             url_input: String::new(),
             queue_search: String::new(),
@@ -475,6 +483,16 @@ impl CurlDownloaderApp {
     }
 
     fn apply_tasks(&mut self, tasks: Vec<TaskSnapshot>) {
+        let previous_ids = self
+            .tasks
+            .iter()
+            .map(|task| task.id)
+            .collect::<HashSet<_>>();
+        let newest_added = tasks
+            .iter()
+            .filter(|task| !previous_ids.contains(&task.id))
+            .max_by_key(|task| (task.created_unix_ms, task.id))
+            .map(|task| task.id);
         self.tasks = tasks;
         let draft_proxy_is_stale = self
             .draft
@@ -489,7 +507,10 @@ impl CurlDownloaderApp {
         if draft_proxy_is_stale {
             self.draft = None;
         }
-        if self.selected.is_none() {
+        if let Some(newest_added) = newest_added {
+            self.selected = Some(newest_added);
+            self.draft = None;
+        } else if self.selected.is_none() {
             self.selected = self.tasks.first().map(|task| task.id);
         }
         if let Some(selected) = self.selected {
@@ -615,6 +636,17 @@ impl CurlDownloaderApp {
             requested_segments: draft.segments,
             proxy,
         });
+    }
+
+    fn resolve_file_conflict(&mut self, id: TaskId, decision: FileDecision) {
+        let (response, _ignored) = std::sync::mpsc::channel();
+        let _ = self
+            .engine_commands
+            .send(EngineCommand::ResolveFileConflict {
+                id,
+                decision,
+                response,
+            });
     }
 
     fn flush_draft(&mut self, id: TaskId) {
@@ -968,6 +1000,14 @@ impl CurlDownloaderApp {
                 ui.weak(format!("剩餘 {}", format_eta(task.eta_seconds)));
             });
             ui.horizontal_wrapped(|ui| {
+                if task.status == TaskStatus::AwaitingFileDecision {
+                    if ui.button("覆蓋").clicked() {
+                        self.resolve_file_conflict(task.id, FileDecision::Overwrite);
+                    }
+                    if ui.button("取消任務").clicked() {
+                        self.resolve_file_conflict(task.id, FileDecision::Cancel);
+                    }
+                }
                 if matches!(
                     task.status,
                     TaskStatus::Queued | TaskStatus::Paused | TaskStatus::Failed
@@ -981,8 +1021,12 @@ impl CurlDownloaderApp {
                 {
                     let _ = self.engine_commands.send(EngineCommand::Pause(task.id));
                 }
-                if !matches!(task.status, TaskStatus::Completed | TaskStatus::Cancelled)
-                    && ui.button("取消").clicked()
+                if !matches!(
+                    task.status,
+                    TaskStatus::Completed
+                        | TaskStatus::Cancelled
+                        | TaskStatus::AwaitingFileDecision
+                ) && ui.button("取消").clicked()
                 {
                     let _ = self.engine_commands.send(EngineCommand::Cancel(task.id));
                 }
@@ -1100,6 +1144,24 @@ impl CurlDownloaderApp {
                         let mut pending_last_dir = None;
                         let mut pending_password = None;
                         let mut pending_error = None;
+                        if task.status == TaskStatus::AwaitingFileDecision {
+                            ui.add_space(12.0);
+                            card_frame(ui).show(ui, |ui| {
+                                ui.heading("檔案已存在");
+                                ui.label("目標位置已有同名檔案，請選擇如何處理。");
+                                ui.horizontal_wrapped(|ui| {
+                                    if ui.button("覆蓋（完成後替換）").clicked() {
+                                        self.resolve_file_conflict(
+                                            task.id,
+                                            FileDecision::Overwrite,
+                                        );
+                                    }
+                                    if ui.button("取消任務").clicked() {
+                                        self.resolve_file_conflict(task.id, FileDecision::Cancel);
+                                    }
+                                });
+                            });
+                        }
                         let needs_password = task.status == TaskStatus::NeedsProxyPassword;
                         let can_edit = matches!(
                             task.status,
@@ -1292,13 +1354,14 @@ fn task_card_frame(ui: &egui::Ui, selected: bool) -> egui::Frame {
 fn status_color(ui: &egui::Ui, status: TaskStatus) -> egui::Color32 {
     let visuals = ui.visuals();
     match status {
-        TaskStatus::Queued | TaskStatus::Paused | TaskStatus::Cancelled => {
+        TaskStatus::Queued | TaskStatus::Paused | TaskStatus::Cancelled | TaskStatus::Unknown => {
             visuals.weak_text_color()
         }
         TaskStatus::Probing | TaskStatus::Downloading => visuals.hyperlink_color,
-        TaskStatus::Pausing | TaskStatus::Finalizing | TaskStatus::NeedsProxyPassword => {
-            visuals.warn_fg_color
-        }
+        TaskStatus::Pausing
+        | TaskStatus::Finalizing
+        | TaskStatus::NeedsProxyPassword
+        | TaskStatus::AwaitingFileDecision => visuals.warn_fg_color,
         TaskStatus::Completed => visuals.widgets.active.fg_stroke.color,
         TaskStatus::Failed => visuals.error_fg_color,
     }
@@ -1735,10 +1798,12 @@ fn status_label(status: TaskStatus) -> &'static str {
         TaskStatus::Pausing => "暫停中",
         TaskStatus::Paused => "已暫停",
         TaskStatus::NeedsProxyPassword => "需要 Proxy 密碼",
+        TaskStatus::AwaitingFileDecision => "等待檔案決定",
         TaskStatus::Finalizing => "整合中",
         TaskStatus::Completed => "已完成",
         TaskStatus::Failed => "失敗",
         TaskStatus::Cancelled => "已取消",
+        TaskStatus::Unknown => "已暫停",
     }
 }
 
@@ -1755,10 +1820,12 @@ fn status_icon(status: TaskStatus) -> &'static str {
         TaskStatus::Downloading => "↓",
         TaskStatus::Pausing | TaskStatus::Paused => "Ⅱ",
         TaskStatus::NeedsProxyPassword => "?",
+        TaskStatus::AwaitingFileDecision => "!",
         TaskStatus::Finalizing => "…",
         TaskStatus::Completed => "✓",
         TaskStatus::Failed => "!",
         TaskStatus::Cancelled => "×",
+        TaskStatus::Unknown => "Ⅱ",
     }
 }
 
@@ -1903,7 +1970,7 @@ fn open_location(_path: PathBuf) {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::SegmentSnapshot;
+    use crate::model::{SegmentSnapshot, TaskOrigin};
 
     #[test]
     fn formats_bytes_and_speed() {
@@ -2058,7 +2125,7 @@ mod tests {
     #[test]
     fn wide_overview_uses_fixed_semantic_columns() {
         assert_eq!(
-            overview_layout(720.0),
+            overview_layout(840.0),
             OverviewLayout::TwoColumn {
                 left: [OverviewCard::Progress, OverviewCard::Storage],
                 right: [OverviewCard::Basic],
@@ -2070,7 +2137,7 @@ mod tests {
     #[test]
     fn narrow_overview_uses_stable_single_column_order() {
         assert_eq!(
-            overview_layout(719.9),
+            overview_layout(839.9),
             OverviewLayout::OneColumn([
                 OverviewCard::Progress,
                 OverviewCard::Basic,
@@ -2180,6 +2247,7 @@ mod tests {
             filename: "file.bin".into(),
             target_dir: PathBuf::from("C:\\Downloads"),
             status,
+            origin: TaskOrigin::Gui,
             requested_segments: 1,
             actual_segments: 1,
             segments: Vec::new(),

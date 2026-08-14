@@ -88,3 +88,12 @@ button:not(.secondary):not(.link) { background: Highlight; color: HighlightText;
 button.secondary { background: ButtonFace; color: ButtonText; }
 button.link { border-color: transparent; background: transparent; color: LinkText; }
 button:disabled { cursor: wait; opacity: .6; }
+.file-conflict {
+  margin-top: 1.5rem;
+  padding: 1rem;
+  border: 1px solid color-mix(in srgb, #d38b22 65%, ButtonShadow);
+  border-radius: .65rem;
+  background: color-mix(in srgb, #d38b22 10%, Canvas);
+}
+.file-conflict h2 { margin: 0 0 .45rem; font-size: 1.1rem; }
+.file-conflict p { margin: 0 0 1rem; }

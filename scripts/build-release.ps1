@@ -24,6 +24,17 @@ if (Test-Path -LiteralPath 'dist') { Remove-Item -LiteralPath 'dist' -Recurse -F
 New-Item -ItemType Directory -Path 'dist' | Out-Null
 Copy-Item -LiteralPath "target/$target/release/curl-downloader.exe" -Destination 'dist/CurlDownloader.exe'
 
+$smokeTargetDirectory = 'target/smoke-native-auth-msvc'
+cargo build --release --features smoke-test-native-auth --target-dir $smokeTargetDirectory --target $target --bin curl-downloader
+if ($LASTEXITCODE -ne 0) { throw "cargo build smoke probe failed with exit code $LASTEXITCODE." }
+$smokeExecutable = Join-Path $smokeTargetDirectory "$target\release\curl-downloader.exe"
+$scriptHost = (Get-Command pwsh -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Source)
+if ([string]::IsNullOrWhiteSpace($scriptHost)) { $scriptHost = (Get-Command powershell).Source }
+& $scriptHost -NoProfile -ExecutionPolicy Bypass -File 'scripts/test-minimized-background-controller.ps1' -ExecutablePath 'dist/CurlDownloader.exe' -SkipNativeMessaging
+if ($LASTEXITCODE -ne 0) { throw 'Release GUI smoke test failed.' }
+& $scriptHost -NoProfile -ExecutionPolicy Bypass -File 'scripts/test-minimized-background-controller.ps1' -ExecutablePath $smokeExecutable
+if ($LASTEXITCODE -ne 0) { throw 'Minimized background controller smoke test failed.' }
+
 $executables = @(Get-ChildItem -LiteralPath 'dist' -Filter '*.exe' -File)
 if ($executables.Count -ne 1 -or $executables[0].Name -ne 'CurlDownloader.exe') {
     throw 'Release must contain exactly one CurlDownloader.exe.'

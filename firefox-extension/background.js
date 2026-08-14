@@ -75,6 +75,7 @@
       filename: pending.filename,
       targetDir: pending.targetDir || '',
       forceRecreate: Boolean(pending.forceRecreate),
+      firefoxDownloadRemoved: Boolean(pending.firefoxDownloadRemoved),
       proxy: {
         enabled: Boolean(pending.proxy && pending.proxy.enabled),
         protocol: (pending.proxy && pending.proxy.protocol) || 'http',
@@ -286,12 +287,21 @@
   }
 
   async function restoreFirefoxDownload(pending) {
+    if (pending.firefoxDownloadRemoved === false && pending.forceRecreate) {
+      const removed = await cancelAndEraseDownload(pending);
+      if (!removed) {
+        pending.forceRecreate = false;
+      }
+    }
     if (!pending.forceRecreate) {
       try {
         await browserApi.downloads.resume(pending.downloadId);
         return { ok: true, recreated: false };
       } catch (_error) {
         // The item may have disappeared or Firefox may reject resume after a pause failure.
+        if (pending.firefoxDownloadRemoved === false) {
+          return { ok: false, recreated: false };
+        }
       }
     }
 
@@ -311,7 +321,108 @@
     }
   }
 
+  async function restorePendingAfterTabClose(pending) {
+    if (pending.operation) {
+      pending.closeRequested = true;
+      return {
+        ok: false,
+        deferred: true,
+        error: '此下載仍在處理中；請稍後重新開啟設定頁。'
+      };
+    }
+    if (pending.acceptanceUnknown) {
+      pending.operation = 'reopen-settings';
+      try {
+        await openRetrySettingsTab(pending.downloadId);
+        return {
+          ok: false,
+          deferred: true,
+          error: 'Curl Downloader 任務狀態尚未確認；已重新開啟設定頁，請按「提交」重試。'
+        };
+      } finally {
+        if (pendingDownloads.get(pending.downloadId) === pending) {
+          pending.operation = null;
+        }
+      }
+    }
+    pending.operation = 'restore-on-close';
+    try {
+      if (pending.acceptedTaskId !== undefined) {
+        const cancelled = await cancelPendingCurlTask(pending);
+        if (!cancelled) {
+          await notifyFailure('Curl Downloader 任務尚未取消；為避免重複下載，請重新開啟設定頁重試。');
+          await openRetrySettingsTab(pending.downloadId);
+          return { ok: false, error: 'Curl Downloader 任務尚未取消。' };
+        }
+      }
+      return await restoreFirefoxDownload(pending);
+    } finally {
+      if (pendingDownloads.get(pending.downloadId) === pending) {
+        pending.operation = null;
+      }
+    }
+  }
+
+  async function processCloseRequest(pending) {
+    if (pendingDownloads.get(pending.downloadId) !== pending
+        || !pending.closeRequested
+        || pending.operation) {
+      return null;
+    }
+    pending.closeRequested = false;
+    const result = await restorePendingAfterTabClose(pending);
+    if (result.ok) {
+      pendingDownloads.delete(pending.downloadId);
+    } else {
+      await notifyFailure(result.error || 'Firefox 下載未能恢復；請重新開啟設定頁後重試。');
+    }
+    return result;
+  }
+
+  async function restoreAfterInterceptionFailure(pending) {
+    if (pending.firefoxDownloadRemoved) {
+      pending.forceRecreate = true;
+      return restoreFirefoxDownload(pending);
+    }
+    const removed = await cancelAndEraseDownload(pending);
+    if (removed) {
+      pending.forceRecreate = true;
+      return restoreFirefoxDownload(pending);
+    }
+    pending.forceRecreate = false;
+    return restoreFirefoxDownload(pending);
+  }
+
+  // Firefox displays its native download panel as soon as onCreated fires.
+  // Remove the original item immediately; a Firefox fallback is recreated
+  // only when the user explicitly chooses it.
+  async function cancelAndEraseDownload(pending) {
+    let cancelled = true;
+    try {
+      await browserApi.downloads.cancel(pending.downloadId);
+    } catch (_error) {
+      cancelled = false;
+    }
+    if (!cancelled) return false;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        await browserApi.downloads.erase({ id: pending.downloadId });
+        pending.firefoxDownloadRemoved = true;
+        return true;
+      } catch (_error) {
+        // Firefox can finish cancelling the item just after cancel() resolves.
+        // A few immediate retries avoid reopening the native download panel.
+        if (attempt < 2) await Promise.resolve();
+      }
+    }
+    return false;
+  }
+
   async function cancelFirefoxDownload(pending) {
+    if (pending.firefoxDownloadRemoved) {
+      pendingDownloads.delete(pending.downloadId);
+      return { ok: true };
+    }
     try {
       await browserApi.downloads.cancel(pending.downloadId);
     } catch (_error) {
@@ -320,14 +431,72 @@
     try {
       await browserApi.downloads.erase({ id: pending.downloadId });
     } catch (_error) {
-      // Cancellation succeeded; failure to erase history must not keep the task pending.
+      return { ok: false, error: 'Firefox 下載已取消，但未能隱藏下載項目。' };
     }
     return { ok: true };
+  }
+
+  async function restoreAndReport(pending) {
+    const result = await restoreFirefoxDownload(pending);
+    if (!result.ok) {
+      return {
+        ok: false,
+        error: 'Firefox 下載未能恢復；請保留此設定頁並稍後重試。'
+      };
+    }
+    return result;
+  }
+
+  async function cancelAcceptedTask(taskId) {
+    if (taskId === undefined || taskId === null) return false;
+    try {
+      const response = await sendNativeWithRetry({
+        type: 'cancel_task',
+        task_id: Number(taskId),
+        ...passiveStartupFields()
+      });
+      return Boolean(response && response.type === 'action_result' && response.ok);
+    } catch (_error) {
+      return false;
+    }
+  }
+
+  async function cancelAcceptedOrKeepPending(pending, taskId) {
+    const cancelled = await cancelAcceptedTask(taskId);
+    pending.acceptedTaskId = taskId;
+    pending.acceptedTaskCancelled = cancelled;
+    return cancelled;
+  }
+
+  async function cancelPendingCurlTask(pending) {
+    if (pending.acceptedTaskId === undefined || pending.acceptedTaskCancelled) return true;
+    return cancelAcceptedTask(pending.acceptedTaskId);
+  }
+
+  async function openSettingsTab(downloadId) {
+    const getUrl = browserApi.runtime.getURL
+      ? browserApi.runtime.getURL('settings.html')
+      : 'settings.html';
+    const tab = await browserApi.tabs.create({
+      url: `${getUrl}?downloadId=${encodeURIComponent(downloadId)}`
+    });
+    if (tab && tab.id !== undefined) settingsTabs.set(tab.id, downloadId);
+    return tab;
+  }
+
+  async function openRetrySettingsTab(downloadId) {
+    try {
+      return await openSettingsTab(downloadId);
+    } catch (_error) {
+      await notifyFailure('Firefox 下載仍待處理；請從擴充功能重新開啟下載設定頁。');
+      return null;
+    }
   }
 
   async function handleCreatedDownload(download) {
     if (consumeManagedFallback(download)) return { ignored: true };
     if (!core.isSupportedDownloadUrl(download.url)) return { ignored: true };
+    if (download.state && download.state !== 'in_progress') return { ignored: true };
     if (pendingDownloads.has(download.id)) return { ignored: true };
 
     let defaults = { targetDir: '', proxy: defaultProxy() };
@@ -342,75 +511,189 @@
       filename: core.fallbackFilename(download.filename || 'download.bin'),
       targetDir: defaults.targetDir || '',
       proxy: defaults.proxy || defaultProxy(),
-      forceRecreate: false
+      forceRecreate: true,
+      firefoxDownloadRemoved: false,
+      externalRequestId: null,
+      acceptanceUnknown: false,
+      closeRequested: false,
+      operation: 'intercept'
     };
     pendingDownloads.set(download.id, pending);
 
     try {
-      await browserApi.downloads.pause(download.id);
-    } catch (_error) {
-      pending.forceRecreate = true;
-      await restoreFirefoxDownload(pending);
-      pendingDownloads.delete(download.id);
-      return { restored: true };
-    }
-
-    try {
-      const getUrl = browserApi.runtime.getURL
-        ? browserApi.runtime.getURL('settings.html')
-        : 'settings.html';
-      const tab = await browserApi.tabs.create({
-        url: `${getUrl}?downloadId=${encodeURIComponent(download.id)}`
-      });
-      if (tab && tab.id !== undefined) settingsTabs.set(tab.id, download.id);
+      // Pause first so Firefox stops writing while the native item is being
+      // cancelled; cancellation/erase immediately afterwards removes the
+      // native download panel before the settings tab is shown.
+      try { await browserApi.downloads.pause(download.id); } catch (_error) {
+        pending.forceRecreate = false;
+        const restored = await restoreAndReport(pending);
+        if (!restored.ok) {
+          restored.error = 'Firefox 下載未能恢復；請重新開啟下載設定頁後重試。';
+          await notifyFailure(restored.error);
+          await openRetrySettingsTab(download.id);
+        }
+        if (restored.ok) pendingDownloads.delete(download.id);
+        pending.operation = null;
+        return restored.ok ? { restored: true } : { restored: false, error: restored.error };
+      }
+      // Open the decision page before erasing the native item.  If tab
+      // creation fails, the original download is still available to resume;
+      // if erasing fails, the already-open page remains a retry path.
+      const tab = await openSettingsTab(download.id);
+      const removed = await cancelAndEraseDownload(pending);
+      if (!removed && !pending.firefoxDownloadRemoved) {
+        await notifyFailure('Firefox 原生下載視窗未能隱藏，請在設定頁重試。');
+      }
+      pending.operation = null;
+      const closeResult = await processCloseRequest(pending);
+      if (closeResult) {
+        return closeResult.ok
+          ? { restored: true }
+          : { restored: false, error: closeResult.error };
+      }
       return { paused: true, tabId: tab && tab.id };
     } catch (_error) {
-      await restoreFirefoxDownload(pending);
-      pendingDownloads.delete(download.id);
-      return { restored: true };
+      // A settings tab failure happens before the native item is handed off;
+      // restore the original item and never create an invisible fallback.
+      pending.forceRecreate = false;
+      const restored = await restoreAndReport(pending);
+      if (!restored.ok) {
+        restored.error = 'Firefox 下載未能恢復；請重新開啟下載設定頁後重試。';
+        await notifyFailure(restored.error);
+        await openRetrySettingsTab(download.id);
+      }
+      if (restored.ok) pendingDownloads.delete(download.id);
+      pending.operation = null;
+      return restored.ok ? { restored: true } : { restored: false, error: restored.error };
     }
   }
 
   async function submitExternalDownload(downloadId, form, startIntentUnixMs) {
     const pending = pendingDownloads.get(Number(downloadId));
     if (!pending) return { ok: false, error: '找不到暫停中的下載。' };
+    if (pending.operation) return { ok: false, error: '此下載仍在處理中，請稍候再試。' };
     const validationError = validateForm(form);
     if (validationError) return { ok: false, error: validationError };
+    pending.operation = 'submit';
 
+    if (!pending.externalRequestId) {
+      pending.externalRequestId = `enqueue-${pending.downloadId}-${now()}-${Math.random().toString(36).slice(2)}`;
+    }
     const request = {
-      ...core.buildEnqueueMessage(pending, form, 'pending'),
+      ...core.buildEnqueueMessage(
+        pending,
+        form,
+        pending.externalRequestId
+      ),
       ...startupFields(true, startIntentUnixMs)
     };
     let accepted = false;
     try {
       const response = await sendNativeWithRetry(request);
       if (!response || response.type !== 'enqueue_result' || !response.ok) {
+        if (response && response.type === 'enqueue_result'
+            && response.error && response.error.code === 'engine_timeout') {
+          // The engine may still persist the task after the IPC wait expires.
+          // Keep the settings page and the request id so retrying reconciles
+          // with the persisted task instead of restoring Firefox and creating
+          // a duplicate download.
+          await notifyFailure('Curl Downloader 仍在處理此任務；請保留設定頁並稍後重試。');
+          pending.acceptanceUnknown = true;
+          return {
+            ok: false,
+            code: 'enqueue_pending',
+            error: 'Curl Downloader 仍在處理此任務；請保留設定頁並稍後重試。'
+          };
+        }
         throw new Error('Curl Downloader 未接收任務');
       }
       accepted = true;
-      try {
-        await browserApi.downloads.cancel(pending.downloadId);
-        await browserApi.downloads.erase({ id: pending.downloadId });
-      } catch (_error) {
+      pending.acceptanceUnknown = false;
+      if (!pending.firefoxDownloadRemoved && !(await cancelAndEraseDownload(pending))) {
         await notifyFailure('Curl Downloader 已接收任務，但 Firefox 原下載未能清理。');
+        const taskCancelled = await cancelAcceptedOrKeepPending(pending, response.task_id);
+        return {
+          ok: false,
+          code: 'firefox_cleanup_failed',
+          taskId: response.task_id,
+          taskCancelled,
+          error: taskCancelled
+            ? 'Curl Downloader 任務已取消，但 Firefox 原下載仍未能隱藏；請按「使用 Firefox」重試。'
+            : 'Firefox 原下載仍未能隱藏，且 Curl Downloader 任務未能取消；請勿恢復 Firefox，稍後重試。'
+        };
+      }
+      let awaitingFileDecision = response.awaiting_file_decision;
+      if (awaitingFileDecision === undefined && response.task_id !== undefined) {
+        try {
+          const summary = await sendNativeWithRetry({
+            type: 'list_tasks',
+            ...passiveStartupFields()
+          });
+          const task = summary && Array.isArray(summary.tasks)
+            ? summary.tasks.find((item) => Number(item.task_id) === Number(response.task_id))
+            : null;
+          awaitingFileDecision = task && (
+            task.status === 'awaiting_file_decision' ||
+            task.status === 'AwaitingFileDecision'
+          );
+        } catch (_error) {
+          awaitingFileDecision = false;
+        }
       }
       pendingDownloads.delete(pending.downloadId);
       restartDelayMs = 500;
       restartCooldownUntil = 0;
+      if (!awaitingFileDecision && response.task_id !== undefined) {
+        try {
+          await sendNativeWithRetry({
+            type: 'show_task',
+            task_id: Number(response.task_id),
+            ...passiveStartupFields()
+          });
+        } catch (_error) {
+          // The task is already accepted; showing its page is best effort.
+        }
+      }
       void refreshTaskStatus();
       try {
         await storage.saveDefaults(form);
       } catch (_error) {
         // Saving defaults must never change the already accepted download.
       }
-      return { ok: true, taskId: response.task_id };
+      return {
+        ok: true,
+        taskId: response.task_id,
+        awaitingFileDecision: Boolean(awaitingFileDecision)
+      };
     } catch (_error) {
       if (!accepted) {
+        if (pending.acceptanceUnknown) {
+          await notifyFailure('Curl Downloader 任務狀態仍未確認；請保留設定頁並稍後重試。');
+          return {
+            ok: false,
+            code: 'enqueue_pending',
+            error: 'Curl Downloader 任務狀態仍未確認；請保留設定頁並稍後重試。'
+          };
+        }
         await notifyFailure('Native host 未能接收下載，已恢復 Firefox。');
-        await restoreFirefoxDownload(pending);
-        pendingDownloads.delete(pending.downloadId);
+        // Try resuming first for compatibility with a Firefox item that was
+        // cancelled too late; restoreFirefoxDownload falls back to a fresh
+        // Firefox item if resume is rejected after erase.
+        pending.forceRecreate = false;
+        const restored = await restoreAndReport(pending);
+        if (restored.ok) pendingDownloads.delete(pending.downloadId);
+        else await notifyFailure(restored.error);
       }
-      return { ok: false, code: 'native_unavailable', error: 'Native host 未能接收下載，已恢復 Firefox。' };
+      return {
+        ok: false,
+        code: 'native_unavailable',
+        error: 'Native host 未能接收下載；請保留此設定頁並稍後重試。'
+      };
+    } finally {
+      if (pendingDownloads.get(pending.downloadId) === pending && pending.operation === 'submit') {
+        pending.operation = null;
+        await processCloseRequest(pending);
+      }
     }
   }
 
@@ -452,10 +735,13 @@
     const nativeType = {
       'show-task': 'show_task',
       'open-file': 'open_file',
-      'open-folder': 'open_folder'
+      'open-folder': 'open_folder',
+      'resolve-file-conflict': 'resolve_file_conflict'
     }[message.type];
     try {
-      const response = await sendNativeWithRetry({ type: nativeType, task_id: taskId, ...passiveStartupFields() });
+      const request = { type: nativeType, task_id: taskId, ...passiveStartupFields() };
+      if (message.type === 'resolve-file-conflict') request.decision = message.decision;
+      const response = await sendNativeWithRetry(request);
       if (!response || response.type !== 'action_result') {
         return { ok: false, error: 'Curl Downloader 未能完成操作。' };
       }
@@ -484,16 +770,54 @@
     if (message.type === 'restore-firefox' || message.type === 'fallback') {
       const pending = pendingDownloads.get(id);
       if (!pending) return { ok: false, error: '找不到下載項目。' };
-      const result = await restoreFirefoxDownload(pending);
-      pendingDownloads.delete(id);
-      return result;
+      if (pending.operation) return { ok: false, error: '此下載仍在處理中，請稍候再試。' };
+      if (pending.acceptanceUnknown) {
+        return { ok: false, error: 'Curl Downloader 任務狀態尚未確認，請先按「提交」重試。' };
+      }
+      pending.operation = message.type === 'restore-firefox' ? 'restore' : 'fallback';
+      try {
+        if (pending.acceptedTaskId !== undefined) {
+          const cancelled = await cancelPendingCurlTask(pending);
+          if (!cancelled) {
+            await openRetrySettingsTab(id);
+            return { ok: false, error: 'Curl Downloader 任務尚未取消，為避免重複下載請稍後重試。' };
+          }
+        }
+        const result = await restoreFirefoxDownload(pending);
+        if (result.ok) pendingDownloads.delete(id);
+        return result;
+      } finally {
+        if (pendingDownloads.get(id) === pending) {
+          pending.operation = null;
+          await processCloseRequest(pending);
+        }
+      }
     }
     if (message.type === 'cancel-download') {
       const pending = pendingDownloads.get(id);
       if (!pending) return { ok: false, error: '找不到下載項目。' };
-      const result = await cancelFirefoxDownload(pending);
-      if (result.ok) pendingDownloads.delete(id);
-      return result;
+      if (pending.operation) return { ok: false, error: '此下載仍在處理中，請稍候再試。' };
+      if (pending.acceptanceUnknown) {
+        return { ok: false, error: 'Curl Downloader 任務狀態尚未確認，請先按「提交」重試。' };
+      }
+      pending.operation = 'cancel';
+      try {
+        if (pending.acceptedTaskId !== undefined) {
+          const cancelled = await cancelPendingCurlTask(pending);
+          if (!cancelled) {
+            await openRetrySettingsTab(id);
+            return { ok: false, error: 'Curl Downloader 任務尚未取消，請稍後重試。' };
+          }
+        }
+        const result = await cancelFirefoxDownload(pending);
+        if (result.ok) pendingDownloads.delete(id);
+        return result;
+      } finally {
+        if (pendingDownloads.get(id) === pending) {
+          pending.operation = null;
+          await processCloseRequest(pending);
+        }
+      }
     }
     if (message.type === 'pick-folder') {
       try {
@@ -526,6 +850,7 @@
     if (message.type === 'show-task' || message.type === 'open-file' || message.type === 'open-folder') {
       return sendTaskAction(message);
     }
+    if (message.type === 'resolve-file-conflict') return sendTaskAction(message);
     if (message.type === 'get-defaults') {
       try {
         const response = await sendNativeWithRetry({ type: 'get_defaults', ...startupFields(Boolean(message.autoStart), message.startIntentUnixMs) });
@@ -549,7 +874,14 @@
       settingsTabs.delete(tabId);
       const pending = pendingDownloads.get(downloadId);
       if (pending) {
-        void restoreFirefoxDownload(pending).finally(() => pendingDownloads.delete(downloadId));
+        if (pending.operation) {
+          pending.closeRequested = true;
+          return;
+        }
+        void restorePendingAfterTabClose(pending).then((result) => {
+          if (result.ok) pendingDownloads.delete(downloadId);
+          else void notifyFailure(result.error || 'Firefox 下載未能恢復；請重新開啟設定頁後重試。');
+        });
       }
     });
   }

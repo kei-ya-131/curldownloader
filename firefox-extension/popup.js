@@ -16,6 +16,7 @@
     pausing: '暫停中',
     paused: '已暫停',
     needs_proxy_password: '需要 Proxy 密碼',
+    awaiting_file_decision: '等待檔案決定',
     finalizing: '整理中',
     completed: '已完成',
     failed: '失敗',
@@ -135,14 +136,14 @@
 
     const actions = documentApi.createElement('div');
     actions.className = 'task-actions';
-    const bindOpenAction = (button, type) => {
+    const bindOpenAction = (button, type, decision) => {
       let inFlight = false;
       button.addEventListener('click', (event) => {
         event.stopPropagation();
         if (inFlight) return;
         inFlight = true;
         button.disabled = true;
-        Promise.resolve(sendAction(type, task.task_id))
+        Promise.resolve(sendAction(type, task.task_id, decision))
           .catch(showError)
           .finally(() => {
             inFlight = false;
@@ -163,6 +164,19 @@
       button.textContent = '開啟資料夾';
       bindOpenAction(button, 'open-folder');
       actions.append(button);
+    }
+    if (task.status === 'awaiting_file_decision' && task.origin === 'firefox') {
+      const overwrite = documentApi.createElement('button');
+      overwrite.type = 'button';
+      overwrite.textContent = '覆蓋';
+      bindOpenAction(overwrite, 'resolve-file-conflict', 'overwrite');
+      actions.append(overwrite);
+      const cancel = documentApi.createElement('button');
+      cancel.type = 'button';
+      cancel.className = 'secondary';
+      cancel.textContent = '取消任務';
+      bindOpenAction(cancel, 'resolve-file-conflict', 'cancel');
+      actions.append(cancel);
     }
     if (actions.childElementCount > 0) card.append(actions);
 
@@ -217,8 +231,10 @@
       error.hidden = false;
     }
 
-    async function sendAction(type, taskId) {
-      const response = await api.runtime.sendMessage({ type, taskId });
+    async function sendAction(type, taskId, decision) {
+      const message = { type, taskId };
+      if (decision) message.decision = decision;
+      const response = await api.runtime.sendMessage(message);
       if (!response || !response.ok) throw new Error(response && response.error || 'Curl Downloader 操作失敗。');
       return response;
     }

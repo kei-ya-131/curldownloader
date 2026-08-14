@@ -36,7 +36,7 @@ Windows 下載只會在背景啟動隱藏的 curl 子程序，不會顯示 CMD �
 
 ## Firefox extension
 
-Firefox extension 會攔截 HTTP/HTTPS 下載，先暫停原生下載並開啟設定頁。設定頁可調整下載名稱、Windows 絕對目錄、Proxy 類型／主機／連接埠／帳號及本次密碼；「使用 Firefox」會恢復原生下載，「取消」會取消並清理原生下載。
+Firefox extension 會攔截 HTTP/HTTPS 下載，先取消並清理原生下載項目（避免原生下載視窗遮擋設定頁），再開啟設定頁。設定頁可調整下載名稱、Windows 絕對目錄、Proxy 類型／主機／連接埠／帳號及本次密碼；同名檔案出現時可直接選擇「覆蓋」或「取消任務」，覆蓋只會在新檔案完整下載並驗證後替換舊檔。「使用 Firefox」會重新建立 Firefox 下載，「取消」會清理該項目。
 
 ### 程式生命週期
 
@@ -92,7 +92,7 @@ portable 目錄只包含 `CurlDownloader.exe`、`curl-downloader.xpi` 及 `porta
 
 - 一般模式：`%APPDATA%\CurlDownloader\state.json`
 - Portable 模式：portable 目錄內的 `data\state.json`
-- 下載部分檔：目的地內的 `.curl-downloader` 目錄
+- 下載部分檔：目的地內的隱藏 `.curl-downloader` 目錄；任務完成、取消或清除記錄後，若目錄已空會自動移除
 
 ## Security software warning
 

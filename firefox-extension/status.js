@@ -14,6 +14,7 @@
     'pausing',
     'paused',
     'needs_proxy_password',
+    'awaiting_file_decision',
     'finalizing'
   ]);
 

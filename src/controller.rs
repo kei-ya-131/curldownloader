@@ -266,6 +266,7 @@ fn run_controller(
     app_events: Sender<AppEvent>,
 ) {
     let mut shutdown_deadline = None;
+    let mut pending_show_task = None;
     loop {
         while let Ok(command) = command_receiver.try_recv() {
             handle_command(
@@ -277,6 +278,7 @@ fn run_controller(
                 &ipc_stop,
                 &app_events,
                 &mut shutdown_deadline,
+                &mut pending_show_task,
             );
         }
         while let Ok(event) = tray_events.try_recv() {
@@ -299,6 +301,10 @@ fn run_controller(
             Ok(EngineEvent::Snapshot(tasks)) => {
                 state.replace_tasks(tasks);
                 state.mark_engine_ready();
+                if pending_show_task.is_some_and(|task_id| state.task_exists(task_id)) {
+                    let task_id = pending_show_task.take().expect("task id was checked");
+                    show_window(&state, &window, &app_events, Some(task_id));
+                }
                 let _ = app_events.send(AppEvent::SnapshotChanged);
             }
             Ok(EngineEvent::BatchProxyApplied { applied, skipped }) => {
@@ -334,13 +340,17 @@ fn handle_command(
     ipc_stop: &Arc<AtomicBool>,
     app_events: &Sender<AppEvent>,
     shutdown_deadline: &mut Option<Instant>,
+    pending_show_task: &mut Option<TaskId>,
 ) {
     match command {
         ControllerCommand::ShowWindow => show_window(state, window, app_events, None),
-        ControllerCommand::ShowTask { task_id } if state.task_exists(task_id) => {
-            show_window(state, window, app_events, Some(task_id))
+        ControllerCommand::ShowTask { task_id } => {
+            if state.task_exists(task_id) {
+                show_window(state, window, app_events, Some(task_id));
+            } else {
+                *pending_show_task = Some(task_id);
+            }
         }
-        ControllerCommand::ShowTask { .. } => {}
         ControllerCommand::WindowHidden => {
             if state.lifecycle() == LifecycleState::RunningVisible {
                 state.set_lifecycle(LifecycleState::RunningHidden);
@@ -417,7 +427,8 @@ fn begin_shutdown(
 mod tests {
     use super::*;
     use crate::model::{
-        CurlSource, ProxyProtocol, ProxySnapshot, RangeSupport, TaskSnapshot, TaskStatus,
+        CurlSource, ProxyProtocol, ProxySnapshot, RangeSupport, TaskOrigin, TaskSnapshot,
+        TaskStatus,
     };
     use std::{path::PathBuf, time::Duration};
 
@@ -429,6 +440,7 @@ mod tests {
             filename: "file.bin".into(),
             target_dir: PathBuf::from(r"C:\Downloads"),
             status,
+            origin: TaskOrigin::Gui,
             requested_segments: 1,
             actual_segments: 1,
             segments: Vec::new(),
@@ -488,7 +500,7 @@ mod runtime_tests {
     use crate::{
         model::{
             CurlSource, EngineCommand, EngineEvent, ProxyProtocol, ProxySnapshot, RangeSupport,
-            TaskSnapshot, TaskStatus,
+            TaskOrigin, TaskSnapshot, TaskStatus,
         },
         startup_policy,
         tray::{TrayController, TrayEvent},
@@ -582,6 +594,7 @@ mod runtime_tests {
                 filename: "file.bin".into(),
                 target_dir: PathBuf::from(r"C:\Downloads"),
                 status,
+                origin: TaskOrigin::Gui,
                 requested_segments: 1,
                 actual_segments: 1,
                 segments: Vec::new(),
@@ -643,6 +656,25 @@ mod runtime_tests {
         fixture
             .commands
             .send(ControllerCommand::ShowWindow)
+            .unwrap();
+        fixture.wait_for(|| fixture.window.shown.load(Ordering::Acquire) == 1);
+        assert_eq!(fixture.state.lifecycle(), LifecycleState::RunningVisible);
+    }
+
+    #[test]
+    fn show_task_waits_for_the_snapshot_after_enqueue() {
+        let fixture = ControllerFixture::hidden();
+        fixture
+            .commands
+            .send(ControllerCommand::ShowTask { task_id: 42 })
+            .unwrap();
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(fixture.window.shown.load(Ordering::Acquire), 0);
+        fixture
+            .engine_events
+            .send(EngineEvent::Snapshot(vec![
+                fixture.snapshot(42, TaskStatus::Queued),
+            ]))
             .unwrap();
         fixture.wait_for(|| fixture.window.shown.load(Ordering::Acquire) == 1);
         assert_eq!(fixture.state.lifecycle(), LifecycleState::RunningVisible);

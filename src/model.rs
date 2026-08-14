@@ -133,10 +133,42 @@ pub enum TaskStatus {
     Pausing,
     Paused,
     NeedsProxyPassword,
+    AwaitingFileDecision,
     Finalizing,
     Completed,
     Failed,
     Cancelled,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Where a task was created.  The origin is persisted for recovery and for
+/// future UI routing decisions.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub enum TaskOrigin {
+    #[default]
+    Gui,
+    Firefox,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum FileDecision {
+    Overwrite,
+    Cancel,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TargetFingerprint {
+    pub length: u64,
+    #[serde(default)]
+    pub modified_unix_nanos: Option<u128>,
+    /// Stable file identity when the platform exposes one.  This catches a
+    /// replacement with identical size and timestamps without hashing the
+    /// entire file during task creation.
+    #[serde(default)]
+    pub file_identity: Option<[u64; 2]>,
+    #[serde(default)]
+    pub content_digest: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -147,7 +179,7 @@ pub enum RangeSupport {
     Unsupported,
 }
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+pub const CURRENT_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SegmentState {
@@ -211,6 +243,15 @@ pub struct DownloadTask {
     pub range_support: RangeSupport,
     pub proxy: ProxySettings,
     pub status: TaskStatus,
+    #[serde(default)]
+    pub origin: TaskOrigin,
+    /// Native-messaging request id used to make Firefox retries idempotent.
+    #[serde(default)]
+    pub external_request_id: Option<String>,
+    #[serde(default)]
+    pub overwrite_approval: Option<FileDecision>,
+    #[serde(default)]
+    pub pending_target_fingerprint: Option<TargetFingerprint>,
     pub segments: Vec<SegmentState>,
     pub active_millis: u64,
     pub created_unix_ms: u64,
@@ -221,6 +262,16 @@ pub struct DownloadTask {
 
 impl DownloadTask {
     pub fn new(id: TaskId, url: &str, filename: String, target_dir: PathBuf) -> Self {
+        Self::new_with_origin(id, url, filename, target_dir, TaskOrigin::Gui)
+    }
+
+    pub fn new_with_origin(
+        id: TaskId,
+        url: &str,
+        filename: String,
+        target_dir: PathBuf,
+        origin: TaskOrigin,
+    ) -> Self {
         Self {
             id,
             original_url: url.into(),
@@ -235,6 +286,10 @@ impl DownloadTask {
             range_support: RangeSupport::Unknown,
             proxy: ProxySettings::default(),
             status: TaskStatus::Queued,
+            origin,
+            external_request_id: None,
+            overwrite_approval: None,
+            pending_target_fingerprint: None,
             segments: Vec::new(),
             active_millis: 0,
             created_unix_ms: 0,
@@ -249,9 +304,22 @@ impl DownloadTask {
             TaskStatus::NeedsProxyPassword
         } else if self.status == TaskStatus::Completed {
             TaskStatus::Completed
+        } else if self.status == TaskStatus::Cancelled {
+            TaskStatus::Cancelled
+        } else if self.status == TaskStatus::AwaitingFileDecision {
+            TaskStatus::AwaitingFileDecision
         } else {
             TaskStatus::Paused
         };
+    }
+
+    pub fn sanitize_persisted_filename(&mut self) {
+        let safe = crate::filename::sanitize_filename(&self.filename, self.id);
+        if safe != self.filename {
+            self.filename = safe;
+            self.overwrite_approval = None;
+            self.pending_target_fingerprint = None;
+        }
     }
 }
 
@@ -295,6 +363,7 @@ pub struct TaskSnapshot {
     pub filename: String,
     pub target_dir: PathBuf,
     pub status: TaskStatus,
+    pub origin: TaskOrigin,
     pub requested_segments: u8,
     pub actual_segments: u8,
     pub segments: Vec<SegmentSnapshot>,
@@ -323,6 +392,13 @@ pub struct ConfiguredTask {
     pub target_dir: PathBuf,
     pub requested_segments: u8,
     pub proxy: ProxySettings,
+    pub request_id: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConfiguredTaskAcceptance {
+    pub task_id: TaskId,
+    pub awaiting_file_decision: bool,
 }
 
 pub enum EngineCommand {
@@ -332,9 +408,23 @@ pub enum EngineCommand {
         task: ConfiguredTask,
         response: Sender<Result<TaskId, String>>,
     },
+    AddConfiguredWithOrigin {
+        task: ConfiguredTask,
+        origin: TaskOrigin,
+        response: Sender<Result<ConfiguredTaskAcceptance, String>>,
+    },
+    ResolveFileConflict {
+        id: TaskId,
+        decision: FileDecision,
+        response: Sender<Result<(), String>>,
+    },
     Start(TaskId),
     Pause(TaskId),
     Cancel(TaskId),
+    CancelWithResponse {
+        id: TaskId,
+        response: Sender<Result<(), String>>,
+    },
     Remove(TaskId),
     ClearHistory,
     StartAll,
@@ -421,6 +511,40 @@ mod tests {
         assert_eq!(segment.started_unix_ms, None);
         assert_eq!(segment.completed_unix_ms, None);
         assert_eq!(segment.active_millis, 0);
+    }
+
+    #[test]
+    fn legacy_task_defaults_to_gui_without_file_decision() {
+        let mut value = serde_json::to_value(DownloadTask::new(
+            1,
+            "https://example.test/file.bin",
+            "file.bin".into(),
+            "C:\\Downloads".into(),
+        ))
+        .unwrap();
+        value.as_object_mut().unwrap().remove("origin");
+        value.as_object_mut().unwrap().remove("overwrite_approval");
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("pending_target_fingerprint");
+        let task: DownloadTask = serde_json::from_value(value).unwrap();
+        assert_eq!(task.origin, TaskOrigin::Gui);
+        assert_eq!(task.overwrite_approval, None);
+        assert_eq!(task.pending_target_fingerprint, None);
+    }
+
+    #[test]
+    fn waiting_file_decision_survives_state_recovery() {
+        let mut task = DownloadTask::new(
+            1,
+            "https://example.test/file.bin",
+            "file.bin".into(),
+            "C:\\Downloads".into(),
+        );
+        task.status = TaskStatus::AwaitingFileDecision;
+        task.recover_after_load();
+        assert_eq!(task.status, TaskStatus::AwaitingFileDecision);
     }
 
     #[test]

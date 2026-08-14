@@ -552,6 +552,7 @@ impl EngineHarness {
                     target_dir,
                     requested_segments: 1,
                     proxy,
+                    request_id: None,
                 },
                 response: response_tx,
             })

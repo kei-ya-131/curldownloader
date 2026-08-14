@@ -1,7 +1,7 @@
 mod support;
 
 use curl_downloader::model::{
-    CurlSource, EngineCommand, NewTask, ProxySettings, TaskError, TaskStatus,
+    CurlSource, EngineCommand, FileDecision, NewTask, ProxySettings, TaskError, TaskStatus,
 };
 
 #[test]
@@ -423,4 +423,98 @@ fn configured_task_uses_external_filename_directory_and_proxy() {
     );
     let saved = curl_downloader::storage::load_state(harness.state_path()).unwrap();
     assert_eq!(saved.settings.last_download_dir, target_dir);
+}
+
+#[test]
+fn existing_target_waits_for_overwrite_and_replaces_only_after_completion() {
+    let server = support::TestHttpServer::start(vec![support::Route {
+        path: "/overwrite.bin",
+        body: b"new payload",
+        ranges: false,
+        etag: "overwrite-v1",
+        filename: "overwrite.bin",
+    }]);
+    let mut harness = support::EngineHarness::new(1);
+    let target_dir = harness.download_dir().to_path_buf();
+    let target = target_dir.join("overwrite.bin");
+    std::fs::write(&target, b"old payload").unwrap();
+    let id = harness.add_configured(
+        format!("{}/overwrite.bin", server.base_url),
+        "overwrite.bin".into(),
+        target_dir.clone(),
+        ProxySettings::default(),
+    );
+    let waiting = harness.wait_for(
+        id,
+        TaskStatus::AwaitingFileDecision,
+        std::time::Duration::from_secs(5),
+    );
+    assert_eq!(std::fs::read(&target).unwrap(), b"old payload");
+
+    let (response_tx, response_rx) = std::sync::mpsc::channel();
+    harness
+        .engine
+        .commands
+        .send(EngineCommand::ResolveFileConflict {
+            id,
+            decision: FileDecision::Overwrite,
+            response: response_tx,
+        })
+        .unwrap();
+    response_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    let _completed = harness.wait_for(
+        id,
+        TaskStatus::Completed,
+        std::time::Duration::from_secs(60),
+    );
+    assert_eq!(std::fs::read(&target).unwrap(), b"new payload");
+    assert!(!target_dir.join(".curl-downloader").exists());
+    assert_eq!(waiting.filename, "overwrite.bin");
+}
+
+#[test]
+fn existing_target_can_cancel_without_touching_old_file() {
+    let server = support::TestHttpServer::start(vec![support::Route {
+        path: "/cancel.bin",
+        body: b"new payload",
+        ranges: false,
+        etag: "cancel-v1",
+        filename: "cancel.bin",
+    }]);
+    let mut harness = support::EngineHarness::new(1);
+    let target_dir = harness.download_dir().to_path_buf();
+    let target = target_dir.join("cancel.bin");
+    std::fs::write(&target, b"old payload").unwrap();
+    let id = harness.add_configured(
+        format!("{}/cancel.bin", server.base_url),
+        "cancel.bin".into(),
+        target_dir.clone(),
+        ProxySettings::default(),
+    );
+    harness.wait_for(
+        id,
+        TaskStatus::AwaitingFileDecision,
+        std::time::Duration::from_secs(5),
+    );
+
+    let (response_tx, response_rx) = std::sync::mpsc::channel();
+    harness
+        .engine
+        .commands
+        .send(EngineCommand::ResolveFileConflict {
+            id,
+            decision: FileDecision::Cancel,
+            response: response_tx,
+        })
+        .unwrap();
+    response_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    harness.wait_for(id, TaskStatus::Cancelled, std::time::Duration::from_secs(5));
+    assert_eq!(std::fs::read(&target).unwrap(), b"old payload");
+    assert!(!target_dir.join(".curl-downloader").exists());
 }

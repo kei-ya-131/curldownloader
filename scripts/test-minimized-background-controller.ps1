@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)][string]$ExecutablePath
+    [Parameter(Mandatory = $true)][string]$ExecutablePath,
+    [switch]$SkipNativeMessaging
 )
 
 Set-StrictMode -Version Latest
@@ -242,6 +243,7 @@ $renamedExecutable = Join-Path $temporaryDirectory 'CurlDownloader.probe.exe'
 $probeProcess = $null
 $nativeSession = $null
 $oldTestEnvironment = [Environment]::GetEnvironmentVariable('CURL_DOWNLOADER_TEST_SHUTDOWN_MANUAL', 'Process')
+$oldNativeClientEnvironment = [Environment]::GetEnvironmentVariable('CURL_DOWNLOADER_TEST_NATIVE_CLIENT', 'Process')
 $fakeShellStarted = $false
 
 function Read-Exact {
@@ -379,9 +381,19 @@ try {
     )
 
     $env:CURL_DOWNLOADER_TEST_SHUTDOWN_MANUAL = '1'
+    $env:CURL_DOWNLOADER_TEST_NATIVE_CLIENT = '1'
     $probeProcess = Start-Process -FilePath $probeExecutable -ArgumentList @('--minimized', '--skip-native-registration') -WorkingDirectory $temporaryDirectory -WindowStyle Hidden -PassThru
     Wait-For -FailureMessage '最小化 CurlDownloader 未能在 5 秒內啟動。' -Condition {
         -not $probeProcess.HasExited
+    }
+
+    if ($SkipNativeMessaging) {
+        Wait-For -FailureMessage '最小化啟動後 GUI 沒有隱藏。' -Condition {
+            $main = Get-ProcessWindow -ProcessId $probeProcess.Id
+            $main -ne [IntPtr]::Zero -and -not [CurlDownloaderSmokeWin32]::IsWindowVisible($main)
+        }
+        Write-Output '最小化背景控制器 smoke test 通過：release EXE 已啟動並維持隱藏。Native Messaging 驗證由受控 smoke probe 執行。'
+        return
     }
 
     $nativeSession = Start-NativeSession -Executable $probeExecutable
@@ -564,6 +576,11 @@ try {
         Remove-Item Env:CURL_DOWNLOADER_TEST_SHUTDOWN_MANUAL -ErrorAction SilentlyContinue
     } else {
         $env:CURL_DOWNLOADER_TEST_SHUTDOWN_MANUAL = $oldTestEnvironment
+    }
+    if ($null -eq $oldNativeClientEnvironment) {
+        Remove-Item Env:CURL_DOWNLOADER_TEST_NATIVE_CLIENT -ErrorAction SilentlyContinue
+    } else {
+        $env:CURL_DOWNLOADER_TEST_NATIVE_CLIENT = $oldNativeClientEnvironment
     }
     if (Test-Path -LiteralPath $temporaryDirectory) {
         $resolvedTemporaryDirectory = [IO.Path]::GetFullPath($temporaryDirectory)

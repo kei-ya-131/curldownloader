@@ -145,8 +145,12 @@ fn run_native_host_io_with_processor<
                 return Ok(());
             }
         };
+        // Idempotency is owned by the GUI engine, which persists the request
+        // id with the task.  Keeping a host-local replay cache would replay a
+        // stale success after the task had been cancelled.
         let response = process(&body);
-        write_response(&mut output, &response)?;
+        let encoded = serde_json::to_vec(&response).map_err(io::Error::other)?;
+        ipc::write_frame(&mut output, &encoded)?;
         let manually_stopped = matches!(
             &response,
             IpcResponse::Error { error, .. } if error.code == "manually_stopped"
@@ -415,6 +419,7 @@ mod tests {
         .unwrap();
         assert_eq!(calls, 1);
     }
+
     #[test]
     fn manually_stopped_error_has_a_stable_wire_code() {
         assert_eq!(

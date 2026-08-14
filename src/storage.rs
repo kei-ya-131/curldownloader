@@ -1,4 +1,4 @@
-use crate::model::{DownloadTask, PersistedState};
+use crate::model::{DownloadTask, PersistedState, TargetFingerprint};
 use std::{
     env, fs,
     io::{self, Write},
@@ -91,9 +91,132 @@ pub fn quarantine_corrupt(path: &Path) -> io::Result<PathBuf> {
 }
 
 pub fn task_work_dir(task: &DownloadTask) -> PathBuf {
-    task.target_dir
-        .join(".curl-downloader")
-        .join(task.id.to_string())
+    task_work_dir_for(&task.target_dir, task.id)
+}
+
+pub fn task_work_root(target_dir: &Path) -> PathBuf {
+    target_dir.join(".curl-downloader")
+}
+
+pub fn task_work_dir_for(target_dir: &Path, id: u64) -> PathBuf {
+    task_work_root(target_dir).join(id.to_string())
+}
+
+/// Create the task's temporary directory and keep the implementation folder
+/// out of normal Explorer views on Windows.
+pub fn ensure_task_work_dir(task: &DownloadTask) -> io::Result<PathBuf> {
+    let root = task_work_root(&task.target_dir);
+    fs::create_dir_all(&root)?;
+    mark_hidden(&root)?;
+    let dir = task_work_dir(task);
+    fs::create_dir_all(&dir)?;
+    mark_hidden(&dir)?;
+    Ok(dir)
+}
+
+/// Remove a task's temporary directory.  Once the implementation root is
+/// empty, remove it as well so completed/cancelled tasks leave no residue.
+pub fn cleanup_task_work_dir(task: &DownloadTask) -> io::Result<()> {
+    let root = task_work_root(&task.target_dir);
+    let dir = task_work_dir(task);
+    if dir.exists() {
+        fs::remove_dir_all(&dir)?;
+    }
+    if root.is_dir() {
+        let mut entries = fs::read_dir(&root)?;
+        if entries.next().transpose()?.is_none() {
+            fs::remove_dir(&root)?;
+        }
+    }
+    Ok(())
+}
+
+pub fn target_fingerprint(path: &Path) -> io::Result<Option<TargetFingerprint>> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => metadata,
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "目標路徑不是檔案",
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let modified_unix_nanos = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos());
+    #[cfg(windows)]
+    let file_identity = {
+        // The stable Windows MetadataExt file-index APIs are still gated on
+        // older toolchains.  Creation time is a fast, replacement-sensitive
+        // identity fallback; the final digest check remains authoritative.
+        metadata
+            .created()
+            .ok()
+            .and_then(|created| created.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| {
+                let value = duration.as_nanos();
+                [value as u64, (value >> 64) as u64]
+            })
+    };
+    #[cfg(unix)]
+    let file_identity = {
+        use std::os::unix::fs::MetadataExt;
+        Some([metadata.dev(), metadata.ino()])
+    };
+    #[cfg(not(any(windows, unix)))]
+    let file_identity = None;
+    Ok(Some(TargetFingerprint {
+        length: metadata.len(),
+        modified_unix_nanos,
+        file_identity,
+        content_digest: None,
+    }))
+}
+
+pub fn target_fingerprint_with_digest(path: &Path) -> io::Result<Option<TargetFingerprint>> {
+    let Some(mut fingerprint) = target_fingerprint(path)? else {
+        return Ok(None);
+    };
+    use sha2::{Digest, Sha256};
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    io::copy(&mut file, &mut hasher)?;
+    fingerprint.content_digest = Some(hasher.finalize().into());
+    Ok(Some(fingerprint))
+}
+
+#[cfg(windows)]
+fn mark_hidden(path: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_HIDDEN, GetFileAttributesW, INVALID_FILE_ATTRIBUTES, SetFileAttributesW,
+    };
+
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    // SAFETY: `wide` is a null-terminated UTF-16 path that remains alive for
+    // both Win32 calls.
+    let attributes = unsafe { GetFileAttributesW(wide.as_ptr()) };
+    if attributes == INVALID_FILE_ATTRIBUTES {
+        return Err(io::Error::last_os_error());
+    }
+    if attributes & FILE_ATTRIBUTE_HIDDEN != 0 {
+        return Ok(());
+    }
+    let updated = attributes | FILE_ATTRIBUTE_HIDDEN;
+    // SAFETY: the path is valid for the duration of the call.
+    if unsafe { SetFileAttributesW(wide.as_ptr(), updated) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn mark_hidden(_path: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -145,7 +268,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_schema_v1_segment_loads_and_resaves_as_v2() {
+    fn legacy_schema_v1_segment_loads_and_resaves_with_current_schema() {
         let dir = test_dir("legacy-segment");
         let path = dir.join("state.json");
         let raw = serde_json::json!({
