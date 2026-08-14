@@ -43,6 +43,7 @@ Firefox 原生下載會沿用瀏覽器實際發出請求時的 Cookie、Authoriz
 - `Proxy-Authorization`
 - `Range`
 - `If-Range`
+- `Accept-Encoding`
 - hop-by-hop headers
 
 標頭名稱及值必須拒絕 NUL、CR 與 LF。IPC 對單一值、標頭數量及整體 request context 設上限，並保持在 Native Messaging frame 上限以內。
@@ -55,7 +56,7 @@ Firefox 原生下載會沿用瀏覽器實際發出請求時的 Cookie、Authoriz
 - 存在 Cookie、Authorization 或任何 token／credential 類標頭：整份經篩選 request context 視為敏感並加密。
 - Referer 含 userinfo 或 query、任何無法可靠判定的自訂標頭均採保守策略視為敏感，優先避免明文保存。
 
-可明文保存的安全子集只容許固定 allowlist，例如 User-Agent、Accept、Accept-Encoding、Accept-Language，以及不含 userinfo／query 的 Origin 或 Referer。只要 request context 內有一項敏感或未知標頭，便不拆出可推斷背景的明文副本，而是加密保存整份經篩選 context。
+可明文保存的安全子集只容許固定 allowlist，例如 User-Agent、Accept、Accept-Language，以及不含 userinfo／query 的 Origin 或 Referer。`Accept-Encoding` 由 curl 自行管理，避免把 gzip／br 傳輸內容誤當原檔寫入。只要 request context 內有一項敏感或未知標頭，便不拆出可推斷背景的明文副本，而是加密保存整份經篩選 context。
 
 公開網站若順帶送出 session cookie，可能被保守分類為敏感；這只增加很小的本機加密成本，不影響下載成功率。分類不會以「先匿名請求再重試」判定，避免一次性或短效 URL 的額外風險。
 
@@ -108,14 +109,16 @@ Proxy 認證與網站認證維持分離。啟用 Proxy 不移除來源 request c
 
 系統不會因 401／403 自動開分頁、重播舊 URL 或點擊頁面。主程式按鈕先把 task ID 設為「等待 Firefox 重傳」；Firefox 背景程序透過現有任務狀態同步取得待辦操作。Firefox 未開啟時，主程式只顯示等待狀態；待 Firefox 下次啟動及擴充功能連線後才處理，不使用其他瀏覽器代替。
 
-任務在首次交接時保存原始來源頁面 URL。一般 URL 按 request context 分類規則處理；含 userinfo、query 或其他敏感資訊的來源頁面 URL 必須連同敏感 context 以 DPAPI 加密，不可明文保存或顯示。
+任務在首次交接時保存原始來源頁面 URL、是否來自私人視窗，以及 Firefox Container 的 cookie store ID。一般 URL 按 request context 分類規則處理；含 userinfo、query 或其他敏感資訊的來源頁面 URL 必須連同敏感 context 以 DPAPI 加密，不可明文保存或顯示。私人視窗及 Container 資料只用於回到相同瀏覽身份，不顯示在任務 UI。
 
 Firefox 收到重新授權操作後按以下順序處理：
 
 1. 尋找仍存在且 URL 與原始來源頁面相符的分頁；找到時只聚焦該分頁，不強制重新整理。
-2. 沒有現存分頁而保存的來源頁面是有效 HTTP/HTTPS URL 時，建立新分頁。
+2. 沒有現存分頁而保存的來源頁面是有效 HTTP/HTTPS URL 時，在相同 Firefox Container 建立新分頁；私人來源只可在現有私人視窗開啟。
 3. 缺少來源頁面、URL 不安全或無法解密時，開啟擴充功能內部說明頁，提示使用者自行返回來源網站。
 4. 建立綁定 task ID 的五分鐘重新授權 session，等待使用者登入並再次按原下載連結。
+
+如果原任務來自私人視窗但當前沒有私人視窗，系統不得把來源 URL 開到普通視窗；改為提示使用者先建立私人視窗，再由 Popup 繼續重新授權。
 
 重新授權 session 以 task ID、來源網域、預期檔名、原始／最終 URL 背景及建立時間配對新下載。匹配不確定時必須顯示確認，不可自動把新身份資料交給原任務；不相符下載按一般新下載流程處理。五分鐘逾時、使用者取消、任務已取消或已完成時，session 立即失效。
 
@@ -135,7 +138,8 @@ Firefox 收到重新授權操作後按以下順序處理：
 - `公開（無加密資料）`：任務沒有敏感 request context 或 DPAPI 密文；
 - `Firefox 授權（DPAPI 加密）`：任務已加密保存敏感 request context；
 - `需要 Firefox 重新授權`：保存的身份已失效或來源拒絕；
-- `授權資料無法解密`：DPAPI 密文損壞、移至其他帳戶或無法由目前帳戶解密。
+- `授權資料無法解密`：DPAPI 密文損壞、移至其他帳戶或無法由目前帳戶解密；
+- `受保護（授權資料已清除）`：受保護任務已完成、取消或被清除，DPAPI 密文已刪除，只保留不含秘密的來源分類旗標。
 
 不顯示標頭名稱清單、Cookie、token、密文或可推斷秘密長度的詳細資料。401／403 且任務具有 request context 時，主要動作提示重新由 Firefox 授權；沒有 request context 時維持一般來源存取錯誤提示。
 
@@ -161,6 +165,7 @@ Firefox 收到重新授權操作後按以下順序處理：
 - CR/LF、過大資料及禁止標頭被拒絕。
 - 建立 enqueue message 時正確包含或省略 request context。
 - 重新授權優先聚焦現存來源分頁，沒有時才開新分頁，且不自動重新整理或點擊。
+- Container 任務重用相同 cookie store；私人任務沒有私人視窗時不會把來源 URL 洩漏到普通視窗。
 - 五分鐘 session 只接受相符下載；不相符下載、逾時、取消及重複點擊不會更新原任務。
 - 匹配成功顯示「更新授權並續傳」並傳送 `refresh_task_source`，不建立重複任務。
 
@@ -171,7 +176,7 @@ Firefox 收到重新授權操作後按以下順序處理：
 - Windows DPAPI round-trip，密文不含明文；不可解密資料產生已清理錯誤。
 - 任務刪除、取消、完成及清除後不再保存密文。
 - 任務快照及診斷不含秘密。
-- 任務詳細資料按公開、已加密、需要重新授權及解密失敗狀態顯示正確的「來源授權」文字。
+- 任務詳細資料按公開、已加密、需要重新授權、解密失敗及授權資料已清除狀態顯示正確的「來源授權」文字。
 - 等待 Firefox 重傳狀態、task ID 綁定、逾時與取消可跨 IPC 正確轉移，重複操作保持冪等。
 
 ### curl 規格測試
@@ -200,7 +205,7 @@ Firefox 收到重新授權操作後按以下順序處理：
 - 直接及 Proxy 模式都使用相同網站身份資料。
 - 受保護任務中斷並重啟主程式後，可由既有部分檔安全續傳。
 - 公開、沒有敏感標頭的任務不保存 DPAPI 密文。
-- 任務詳細資料可直接辨識來源是公開、DPAPI 加密、需要重新授權或無法解密。
+- 任務詳細資料可直接辨識來源是公開、DPAPI 加密、需要重新授權、無法解密，或受保護但授權資料已按安全規則清除。
 - 使用者可由任務 Details 或 Firefox Popup 主動重新授權；系統重用或重開原始來源頁面，並把相符的新下載身份安全更新到原任務。
 - 重新授權不自動重播舊 URL、不自動點擊頁面，亦不會把不確定匹配套用到原任務。
 - 不新增匿名分類請求。
