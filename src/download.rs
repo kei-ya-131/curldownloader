@@ -1293,19 +1293,30 @@ impl Engine {
         };
         let mut metadata_path = None;
         let mut spec: CurlCommandSpec;
+        let request_context = self.runtime_contexts.get(&task.id);
         let stdout = match kind {
             JobKind::HeadProbe => {
                 let path = work.join("probe-head.json");
                 metadata_path = Some(path.clone());
-                spec = curl::build_head_probe(&task.proxy, &task.original_url, &header_path)
-                    .map_err(io::Error::other)?;
+                spec = curl::build_head_probe(
+                    &task.proxy,
+                    request_context,
+                    &task.original_url,
+                    &header_path,
+                )
+                .map_err(io::Error::other)?;
                 Stdio::from(File::create(path)?)
             }
             JobKind::RangeProbe => {
                 let path = work.join("probe-range.json");
                 metadata_path = Some(path.clone());
-                spec = curl::build_range_probe(&task.proxy, &task.original_url, &header_path)
-                    .map_err(io::Error::other)?;
+                spec = curl::build_range_probe(
+                    &task.proxy,
+                    request_context,
+                    &task.original_url,
+                    &header_path,
+                )
+                .map_err(io::Error::other)?;
                 Stdio::from(File::create(path)?)
             }
             JobKind::Single => {
@@ -1315,6 +1326,7 @@ impl Engine {
                     .unwrap_or(0);
                 spec = curl::build_single_transfer(
                     &task.proxy,
+                    request_context,
                     task.effective_url.as_deref().unwrap_or(&task.original_url),
                     &output,
                     existing,
@@ -1337,6 +1349,7 @@ impl Engine {
                     .unwrap_or(0);
                 spec = curl::build_segment_transfer(
                     &task.proxy,
+                    request_context,
                     task.effective_url.as_deref().unwrap_or(&task.original_url),
                     segment_state.start,
                     segment_state.end,

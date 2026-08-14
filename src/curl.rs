@@ -1,4 +1,5 @@
 use crate::model::{CurlSource, ProxyProtocol, ProxySettings};
+use crate::request_context::RequestContext;
 use sha2::{Digest, Sha256};
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -81,6 +82,31 @@ fn escape_config(value: &str) -> Result<String, String> {
         return Err("Proxy 認證含有不允許字元".into());
     }
     Ok(value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+fn add_request_context(
+    spec: &mut CurlCommandSpec,
+    request_context: Option<&RequestContext>,
+) -> Result<(), String> {
+    let Some(request_context) = request_context else {
+        return Ok(());
+    };
+    let config = spec
+        .stdin_config
+        .get_or_insert_with(|| Zeroizing::new(String::new()));
+    if !spec.args.iter().any(|argument| argument == "--config") {
+        spec.args.extend(["--config".into(), "-".into()]);
+    }
+    for (name, value) in request_context.iter_headers() {
+        let name = escape_config(name).map_err(|_| "請求標頭含有不允許字元".to_owned())?;
+        let value = escape_config(value).map_err(|_| "請求標頭含有不允許字元".to_owned())?;
+        config.push_str("header = \"");
+        config.push_str(&name);
+        config.push_str(": ");
+        config.push_str(&value);
+        config.push_str("\"\n");
+    }
+    Ok(())
 }
 
 pub struct CurlRuntime {
@@ -233,10 +259,12 @@ fn add_transfer_defaults(spec: &mut CurlCommandSpec) {
 
 pub fn build_head_probe(
     proxy: &ProxySettings,
+    request_context: Option<&RequestContext>,
     url: &str,
     headers: &Path,
 ) -> Result<CurlCommandSpec, String> {
     let mut spec = CurlCommandSpec::base(proxy)?;
+    add_request_context(&mut spec, request_context)?;
     add_transfer_defaults(&mut spec);
     spec.args.extend([
         "--head".into(),
@@ -253,10 +281,12 @@ pub fn build_head_probe(
 
 pub fn build_range_probe(
     proxy: &ProxySettings,
+    request_context: Option<&RequestContext>,
     url: &str,
     headers: &Path,
 ) -> Result<CurlCommandSpec, String> {
     let mut spec = CurlCommandSpec::base(proxy)?;
+    add_request_context(&mut spec, request_context)?;
     add_transfer_defaults(&mut spec);
     spec.args.extend([
         "--range".into(),
@@ -285,6 +315,7 @@ fn add_if_range(spec: &mut CurlCommandSpec, validator: Option<&str>) -> Result<(
 
 pub fn build_single_transfer(
     proxy: &ProxySettings,
+    request_context: Option<&RequestContext>,
     url: &str,
     output: &Path,
     existing: u64,
@@ -292,6 +323,7 @@ pub fn build_single_transfer(
     headers: &Path,
 ) -> Result<CurlCommandSpec, String> {
     let mut spec = CurlCommandSpec::base(proxy)?;
+    add_request_context(&mut spec, request_context)?;
     add_transfer_defaults(&mut spec);
     spec.args.extend([
         "--dump-header".into(),
@@ -309,6 +341,7 @@ pub fn build_single_transfer(
 
 pub fn build_segment_transfer(
     proxy: &ProxySettings,
+    request_context: Option<&RequestContext>,
     url: &str,
     start: u64,
     end: u64,
@@ -328,6 +361,7 @@ pub fn build_segment_transfer(
         .ok_or_else(|| "分段續傳偏移無效".to_owned())?;
     let remaining = length - existing;
     let mut spec = CurlCommandSpec::base(proxy)?;
+    add_request_context(&mut spec, request_context)?;
     add_transfer_defaults(&mut spec);
     add_if_range(&mut spec, if_range)?;
     spec.args.extend([
@@ -422,6 +456,7 @@ fn parse_content_range(value: &str) -> Option<(u64, u64, u64)> {
 mod tests {
     use super::*;
     use crate::model::*;
+    use crate::request_context::{WireRequestContext, WireRequestHeader, prepare};
 
     #[test]
     fn embedded_curl_has_pinned_hash() {
@@ -493,6 +528,7 @@ mod tests {
         let proxy = ProxySettings::default();
         let spec = build_segment_transfer(
             &proxy,
+            None,
             "https://example.test/a",
             100,
             199,
@@ -505,6 +541,39 @@ mod tests {
         assert!(args.contains("--range 125-199"));
         assert!(!args.contains("--continue-at"));
         assert!(args.contains("If-Range: \"v1\""));
+    }
+
+    #[test]
+    fn request_context_headers_are_written_only_to_stdin_config() {
+        let context = prepare(WireRequestContext {
+            headers: vec![
+                WireRequestHeader::new("Cookie", "session=secret"),
+                WireRequestHeader::new("Referer", "https://app.test/page"),
+                WireRequestHeader::new("Accept-Encoding", "gzip"),
+            ],
+            source_page_url: Some("https://app.test/page".into()),
+            initial_url: "https://files.test/a.pdf".into(),
+            final_url: "https://files.test/a.pdf".into(),
+            incognito: false,
+            cookie_store_id: Some("firefox-default".into()),
+        })
+        .unwrap();
+        let spec = build_single_transfer(
+            &ProxySettings::default(),
+            Some(&context.runtime),
+            "https://files.test/a.pdf",
+            std::path::Path::new("payload.part"),
+            0,
+            None,
+            std::path::Path::new("headers.txt"),
+        )
+        .unwrap();
+        let args = spec.arguments_text();
+        assert!(!args.contains("session=secret"));
+        let config = spec.stdin_config.as_deref().unwrap();
+        assert!(config.contains("Cookie: session=secret"));
+        assert!(config.contains("Referer: https://app.test/page"));
+        assert!(!config.contains("Accept-Encoding"));
     }
 
     #[test]

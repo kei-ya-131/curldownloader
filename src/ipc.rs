@@ -4,7 +4,7 @@ use crate::{
         ConfiguredTask, EngineCommand, FileDecision, ProxyProtocol, ProxySettings, TaskId,
         TaskOrigin, TaskSnapshot, TaskStatus,
     },
-    request_context::{self, SourceAuthorization, WireRequestContext, WireRequestHeader},
+    request_context::{self, SourceAuthorization, WireRequestContext},
     shell_foreground::{self, OpenTargetOutcome},
 };
 use serde::{Deserialize, Serialize};
@@ -1742,6 +1742,7 @@ mod tests {
         },
         shell_foreground::OpenTargetOutcome,
     };
+    use crate::request_context::WireRequestHeader;
     #[test]
     fn frame_round_trip_handles_partial_reader() {
         let body = br#"{"type":"ping","request_id":"1"}"#;
