@@ -37,7 +37,7 @@ Invoke-CargoChecked @('build', '--ignore-rust-version', '--release', '--target',
 # Keep that test-only feature in a separate optimized target directory so the
 # shipped, feature-free release binary is never replaced by the probe build.
 $smokeTargetDirectory = 'target/smoke-native-auth'
-Invoke-CargoChecked @('--target-dir', $smokeTargetDirectory, 'build', '--ignore-rust-version', '--release', '--features', 'smoke-test-native-auth', '--target', $target, '--bin', 'curl-downloader')
+Invoke-CargoChecked @('build', '--target-dir', $smokeTargetDirectory, '--ignore-rust-version', '--release', '--features', 'smoke-test-native-auth', '--target', $target, '--bin', 'curl-downloader')
 
 New-Item -ItemType Directory -Path 'dist' -Force | Out-Null
 Copy-Item -LiteralPath "target/$target/release/curl-downloader.exe" -Destination 'dist/CurlDownloader.exe'
