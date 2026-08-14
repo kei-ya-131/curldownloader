@@ -5,10 +5,13 @@ const path = require('node:path');
 
 const root = path.join(__dirname, '..');
 const manifest = JSON.parse(fs.readFileSync(path.join(root, 'manifest.json'), 'utf8'));
+const cargoManifest = fs.readFileSync(path.join(root, '..', 'Cargo.toml'), 'utf8');
+const packageVersion = cargoManifest.match(/^version\s*=\s*"([^"]+)"/m);
 
 test('manifest declares the fixed Firefox identity and bridge permissions', () => {
   assert.equal(manifest.manifest_version, 2);
-  assert.equal(manifest.version, '0.2.0');
+  assert.ok(packageVersion, 'Cargo.toml must declare a package version');
+  assert.equal(manifest.version, packageVersion[1]);
   assert.equal(manifest.applications.gecko.id, 'curl-downloader@kinkeil.local');
   assert.ok(manifest.permissions.includes('downloads'));
   assert.ok(manifest.permissions.includes('nativeMessaging'));

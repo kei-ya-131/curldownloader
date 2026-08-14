@@ -339,6 +339,7 @@ pub fn build_single_transfer(
     Ok(spec)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn build_segment_transfer(
     proxy: &ProxySettings,
     request_context: Option<&RequestContext>,
