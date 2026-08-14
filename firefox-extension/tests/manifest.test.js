@@ -8,7 +8,7 @@ const manifest = JSON.parse(fs.readFileSync(path.join(root, 'manifest.json'), 'u
 
 test('manifest declares the fixed Firefox identity and bridge permissions', () => {
   assert.equal(manifest.manifest_version, 2);
-  assert.equal(manifest.version, '0.1.4');
+  assert.equal(manifest.version, '0.2.0');
   assert.equal(manifest.applications.gecko.id, 'curl-downloader@kinkeil.local');
   assert.ok(manifest.permissions.includes('downloads'));
   assert.ok(manifest.permissions.includes('nativeMessaging'));
