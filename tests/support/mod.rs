@@ -553,6 +553,7 @@ impl EngineHarness {
                     requested_segments: 1,
                     proxy,
                     request_id: None,
+                    request_context: None,
                 },
                 response: response_tx,
             })

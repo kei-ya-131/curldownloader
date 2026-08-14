@@ -4,10 +4,12 @@ use crate::{
         ConfiguredTask, EngineCommand, FileDecision, ProxyProtocol, ProxySettings, TaskId,
         TaskOrigin, TaskSnapshot, TaskStatus,
     },
+    request_context::{self, SourceAuthorization, WireRequestContext, WireRequestHeader},
     shell_foreground::{self, OpenTargetOutcome},
 };
 use serde::{Deserialize, Serialize};
 use std::{
+    fmt,
     io::{self, Read, Write},
     path::PathBuf,
     sync::{
@@ -29,6 +31,8 @@ pub struct WireTaskSummary {
     pub filename: String,
     pub origin: String,
     pub status: String,
+    pub authorization: String,
+    pub reauthorization_requested: bool,
     pub downloaded: u64,
     pub total_size: Option<u64>,
     pub current_bps: f64,
@@ -71,6 +75,8 @@ fn task_summary(task: &TaskSnapshot) -> WireTaskSummary {
         filename: task.filename.clone(),
         origin: wire_origin_name(task.origin).into(),
         status: wire_status_name(task.status).into(),
+        authorization: wire_authorization_name(task.authorization).into(),
+        reauthorization_requested: task.reauthorization_requested,
         downloaded: task.downloaded,
         total_size: task.total_size,
         current_bps: task.current_bps,
@@ -90,12 +96,23 @@ fn wire_status_name(status: TaskStatus) -> &'static str {
         TaskStatus::Pausing => "pausing",
         TaskStatus::Paused => "paused",
         TaskStatus::NeedsProxyPassword => "needs_proxy_password",
+        TaskStatus::NeedsFirefoxAuthorization => "needs_firefox_authorization",
         TaskStatus::AwaitingFileDecision => "awaiting_file_decision",
         TaskStatus::Finalizing => "finalizing",
         TaskStatus::Completed => "completed",
         TaskStatus::Failed => "failed",
         TaskStatus::Cancelled => "cancelled",
         TaskStatus::Unknown => "paused",
+    }
+}
+
+fn wire_authorization_name(authorization: SourceAuthorization) -> &'static str {
+    match authorization {
+        SourceAuthorization::Public => "public",
+        SourceAuthorization::Encrypted => "encrypted",
+        SourceAuthorization::NeedsFirefox => "needs_firefox_authorization",
+        SourceAuthorization::DecryptionFailed => "decryption_failed",
+        SourceAuthorization::ProtectedCleared => "protected_cleared",
     }
 }
 
@@ -120,7 +137,7 @@ fn validate_requested_segments(value: u8) -> Result<u8, String> {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum IpcRequest {
     Ping {
@@ -165,12 +182,37 @@ pub enum IpcRequest {
         #[serde(default = "default_requested_segments")]
         requested_segments: u8,
         proxy: WireProxy,
+        #[serde(default)]
+        request_context: Option<WireRequestContext>,
     },
     ResolveFileConflict {
         request_id: String,
         task_id: TaskId,
         decision: String,
     },
+}
+
+impl fmt::Debug for IpcRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self {
+            Self::Ping { .. } => "ping",
+            Self::GetDefaults { .. } => "get_defaults",
+            Self::PickFolder { .. } => "pick_folder",
+            Self::ListTasks { .. } => "list_tasks",
+            Self::ShowWindow { .. } => "show_window",
+            Self::ShutdownManual { .. } => "shutdown_manual",
+            Self::ShowTask { .. } => "show_task",
+            Self::OpenFile { .. } => "open_file",
+            Self::OpenFolder { .. } => "open_folder",
+            Self::CancelTask { .. } => "cancel_task",
+            Self::Enqueue { .. } => "enqueue",
+            Self::ResolveFileConflict { .. } => "resolve_file_conflict",
+        };
+        f.debug_struct("IpcRequest")
+            .field("type", &kind)
+            .field("request_id", &self.request_id())
+            .finish()
+    }
 }
 
 impl IpcRequest {
@@ -252,7 +294,7 @@ pub struct WireError {
     pub message: String,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Deserialize, Serialize)]
 pub struct WireProxy {
     pub enabled: bool,
     pub protocol: String,
@@ -261,6 +303,19 @@ pub struct WireProxy {
     pub username: String,
     #[serde(default)]
     pub password: String,
+}
+
+impl fmt::Debug for WireProxy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WireProxy")
+            .field("enabled", &self.enabled)
+            .field("protocol", &self.protocol)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .finish()
+    }
 }
 
 impl WireProxy {
@@ -801,6 +856,7 @@ fn dispatch_request(
             target_dir,
             requested_segments,
             proxy,
+            request_context,
         } => {
             let requested_segments = match validate_requested_segments(requested_segments) {
                 Ok(value) => value,
@@ -821,6 +877,16 @@ fn dispatch_request(
                     };
                 }
             };
+            let request_context = match request_context.map(request_context::prepare).transpose() {
+                Ok(context) => context,
+                Err(_) => {
+                    return enqueue_error(
+                        request_id,
+                        "invalid_request_context",
+                        "Firefox 授權資料無效或超出安全限制。",
+                    );
+                }
+            };
             let target_dir = PathBuf::from(target_dir);
             let (response_tx, response_rx) = std::sync::mpsc::channel();
             if commands
@@ -832,6 +898,7 @@ fn dispatch_request(
                         requested_segments,
                         proxy,
                         request_id: Some(request_id.clone()),
+                        request_context,
                     },
                     origin: TaskOrigin::Firefox,
                     response: response_tx,
@@ -1582,6 +1649,40 @@ mod tests {
     }
 
     #[test]
+    fn invalid_request_context_has_a_stable_redacted_error() {
+        let state = SharedControllerState::new(LifecycleState::RunningHidden);
+        let (controller_tx, _controller_rx) = std::sync::mpsc::channel();
+        let response = dispatch_request_for_test(
+            IpcRequest::Enqueue {
+                request_id: "invalid-context".into(),
+                url: "https://example.test/file.bin".into(),
+                filename: "file.bin".into(),
+                target_dir: r"C:\Downloads".into(),
+                requested_segments: 1,
+                proxy: WireProxy::direct(),
+                request_context: Some(WireRequestContext {
+                    headers: vec![WireRequestHeader::new("X-Test", "bad\r\nvalue")],
+                    source_page_url: Some("https://app.test/page".into()),
+                    initial_url: "https://example.test/file.bin".into(),
+                    final_url: "https://example.test/file.bin".into(),
+                    incognito: false,
+                    cookie_store_id: Some("firefox-default".into()),
+                }),
+            },
+            &state,
+            &controller_tx,
+        );
+        assert!(matches!(
+            response,
+            IpcResponse::EnqueueResult {
+                ok: false,
+                error: Some(WireError { code, message }),
+                ..
+            } if code == "invalid_request_context" && !message.contains("bad")
+        ));
+    }
+
+    #[test]
     fn requested_segments_accepts_only_one_through_eight() {
         assert_eq!(validate_requested_segments(1), Ok(1));
         assert_eq!(validate_requested_segments(8), Ok(8));
@@ -1621,6 +1722,7 @@ mod tests {
             target_dir: r"C:\Downloads".into(),
             requested_segments: 1,
             proxy: WireProxy::direct(),
+            request_context: None,
         });
         assert!(matches!(
             response,
@@ -1837,6 +1939,8 @@ mod tests {
             filename: format!("file-{id}.bin"),
             target_dir: PathBuf::from(format!(r"C:\Downloads\{id}")),
             status,
+            authorization: SourceAuthorization::Public,
+            reauthorization_requested: false,
             origin: TaskOrigin::Gui,
             requested_segments: 4,
             actual_segments: 1,

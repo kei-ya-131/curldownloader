@@ -2,6 +2,7 @@ use crate::{
     curl::{self, CurlCommandSpec, CurlOutcome, CurlRuntime},
     filename,
     model::*,
+    request_context::RequestContext,
     storage,
 };
 use std::{
@@ -325,6 +326,7 @@ struct Engine {
     state_path: PathBuf,
     settings: GlobalSettings,
     tasks: Vec<DownloadTask>,
+    runtime_contexts: HashMap<TaskId, RequestContext>,
     active: HashMap<u64, ActiveJob>,
     next_job_id: u64,
     queue: VecDeque<TaskId>,
@@ -366,6 +368,7 @@ impl Engine {
             state_path,
             settings: state.settings,
             tasks: state.tasks,
+            runtime_contexts: HashMap::new(),
             active: HashMap::new(),
             next_job_id: 1,
             queue: VecDeque::new(),
@@ -607,6 +610,14 @@ impl Engine {
         let filename = filename::sanitize_filename(&new_task.filename, id);
         let mut task =
             DownloadTask::new_with_origin(id, &new_task.url, filename, new_task.target_dir, origin);
+        let runtime_context = new_task
+            .request_context
+            .as_ref()
+            .map(|context| context.runtime.clone());
+        if let Some(context) = new_task.request_context {
+            task.request_context = context.stored;
+            task.authorization = context.authorization;
+        }
         task.external_request_id = new_task.request_id;
         task.requested_segments = new_task.requested_segments.clamp(1, 8);
         task.proxy = new_task.proxy;
@@ -622,6 +633,9 @@ impl Engine {
         let id = task.id;
         let awaiting_file_decision = task.status == TaskStatus::AwaitingFileDecision;
         self.tasks.push(task);
+        if let Some(context) = runtime_context {
+            self.runtime_contexts.insert(id, context);
+        }
         self.settings.last_download_dir = target_dir;
         self.persist()
             .map_err(|error| format!("無法保存下載任務：{error}"))?;
@@ -1817,6 +1831,8 @@ impl Engine {
                     filename: task.filename.clone(),
                     target_dir: task.target_dir.clone(),
                     status: task.status,
+                    authorization: task.authorization,
+                    reauthorization_requested: task.reauthorization_requested,
                     origin: task.origin,
                     requested_segments: task.requested_segments,
                     actual_segments: task.actual_segments,

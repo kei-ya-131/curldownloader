@@ -269,6 +269,7 @@ fn segment_status_label(task_status: TaskStatus, segment: &SegmentSnapshot) -> &
         TaskStatus::Downloading => "等待中",
         TaskStatus::Finalizing => "整合中",
         TaskStatus::NeedsProxyPassword => "等待密碼",
+        TaskStatus::NeedsFirefoxAuthorization => "需要 Firefox 重新授權",
         TaskStatus::AwaitingFileDecision => "等待檔案決定",
         TaskStatus::Completed => "未完成",
     }
@@ -1361,6 +1362,7 @@ fn status_color(ui: &egui::Ui, status: TaskStatus) -> egui::Color32 {
         TaskStatus::Pausing
         | TaskStatus::Finalizing
         | TaskStatus::NeedsProxyPassword
+        | TaskStatus::NeedsFirefoxAuthorization
         | TaskStatus::AwaitingFileDecision => visuals.warn_fg_color,
         TaskStatus::Completed => visuals.widgets.active.fg_stroke.color,
         TaskStatus::Failed => visuals.error_fg_color,
@@ -1798,6 +1800,7 @@ fn status_label(status: TaskStatus) -> &'static str {
         TaskStatus::Pausing => "暫停中",
         TaskStatus::Paused => "已暫停",
         TaskStatus::NeedsProxyPassword => "需要 Proxy 密碼",
+        TaskStatus::NeedsFirefoxAuthorization => "需要 Firefox 重新授權",
         TaskStatus::AwaitingFileDecision => "等待檔案決定",
         TaskStatus::Finalizing => "整合中",
         TaskStatus::Completed => "已完成",
@@ -1820,6 +1823,7 @@ fn status_icon(status: TaskStatus) -> &'static str {
         TaskStatus::Downloading => "↓",
         TaskStatus::Pausing | TaskStatus::Paused => "Ⅱ",
         TaskStatus::NeedsProxyPassword => "?",
+        TaskStatus::NeedsFirefoxAuthorization => "!",
         TaskStatus::AwaitingFileDecision => "!",
         TaskStatus::Finalizing => "…",
         TaskStatus::Completed => "✓",
@@ -2247,6 +2251,8 @@ mod tests {
             filename: "file.bin".into(),
             target_dir: PathBuf::from("C:\\Downloads"),
             status,
+            authorization: crate::request_context::SourceAuthorization::Public,
+            reauthorization_requested: false,
             origin: TaskOrigin::Gui,
             requested_segments: 1,
             actual_segments: 1,
