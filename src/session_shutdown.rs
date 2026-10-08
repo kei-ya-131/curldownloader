@@ -1,4 +1,8 @@
-use std::{io, thread::JoinHandle};
+use std::{
+    io,
+    sync::{Arc, Mutex},
+    thread::JoinHandle,
+};
 
 pub const EVENT_NAME: &str = "Local\\CurlDownloader-Manual-Shutdown-v1";
 
@@ -12,6 +16,7 @@ mod windows_impl {
         io,
         os::windows::ffi::OsStrExt,
         ptr,
+        sync::{Arc, Mutex},
         thread::{self, JoinHandle},
     };
     use windows_sys::Win32::{
@@ -23,7 +28,17 @@ mod windows_impl {
     };
 
     fn event_name() -> Vec<u16> {
-        OsStr::new(EVENT_NAME)
+        #[cfg(test)]
+        let name = format!(
+            "{EVENT_NAME}-test-{}-{:?}",
+            std::process::id(),
+            thread::current().id()
+        );
+        #[cfg(not(test))]
+        let name = EVENT_NAME;
+        // Unit-test controllers must not signal each other or a real Native
+        // host running in the user's Windows session.
+        OsStr::new(&name)
             .encode_wide()
             .chain(std::iter::once(0))
             .collect()
@@ -83,7 +98,9 @@ mod windows_impl {
         Ok(())
     }
 
-    pub fn spawn_native_exit_monitor() -> io::Result<JoinHandle<()>> {
+    pub fn spawn_native_exit_monitor(
+        response_gate: Option<Arc<Mutex<()>>>,
+    ) -> io::Result<JoinHandle<()>> {
         let handle = open_event_for_modify_and_wait()?;
         let handle_value = handle as isize;
         thread::Builder::new()
@@ -92,6 +109,10 @@ mod windows_impl {
                 let handle = handle_value as HANDLE;
                 let result = unsafe { WaitForSingleObject(handle, INFINITE) };
                 if result == WAIT_OBJECT_0 {
+                    let _response_guard = response_gate.as_ref().map(|gate| {
+                        gate.lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    });
                     std::process::exit(0);
                 }
                 unsafe {
@@ -137,7 +158,11 @@ mod windows_impl {
     use super::EVENT_NAME;
     #[cfg(test)]
     use std::time::Duration;
-    use std::{io, thread};
+    use std::{
+        io,
+        sync::{Arc, Mutex},
+        thread,
+    };
 
     pub fn reset_for_gui_start() -> io::Result<()> {
         let _ = EVENT_NAME;
@@ -149,7 +174,9 @@ mod windows_impl {
         Ok(())
     }
 
-    pub fn spawn_native_exit_monitor() -> io::Result<std::thread::JoinHandle<()>> {
+    pub fn spawn_native_exit_monitor(
+        _response_gate: Option<Arc<Mutex<()>>>,
+    ) -> io::Result<std::thread::JoinHandle<()>> {
         thread::Builder::new()
             .name("curl-downloader-native-exit-monitor".into())
             .spawn(|| {})
@@ -180,7 +207,13 @@ pub fn signal_manual_shutdown() -> io::Result<()> {
 }
 
 pub fn spawn_native_exit_monitor() -> io::Result<JoinHandle<()>> {
-    windows_impl::spawn_native_exit_monitor()
+    spawn_native_exit_monitor_with_gate(None)
+}
+
+pub fn spawn_native_exit_monitor_with_gate(
+    response_gate: Option<Arc<Mutex<()>>>,
+) -> io::Result<JoinHandle<()>> {
+    windows_impl::spawn_native_exit_monitor(response_gate)
 }
 
 #[cfg(test)]

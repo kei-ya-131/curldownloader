@@ -5,6 +5,21 @@ const {
   filterRequestHeaders
 } = require('../request-context.js');
 
+test('long fetch retains exact credentials through completion without making old reauthorization fresh', () => {
+  let now = 1000;
+  const tracker = createRequestContextTracker({ now: () => now });
+  tracker.observeSendHeaders({ requestId: 'large-fetch', method: 'GET',
+    type: 'xmlhttprequest', url: 'https://files.test/large', tabId: 7, frameId: 0,
+    requestHeaders: [{ name: 'Authorization', value: 'Bearer fictional-large' }] });
+  now += 30000;
+  tracker.prune();
+  const reauth = tracker.beginReauthorization({ tabId: 7, finalUrl: 'https://files.test/large' });
+  tracker.observeComplete({ requestId: 'large-fetch' });
+  assert.equal(tracker.claimReauthorization(reauth), null);
+  const claimed = tracker.claimDownload({ url: 'https://files.test/large' }, { tabId: 7, frameId: 0 });
+  assert.equal(claimed.headers[0].value, 'Bearer fictional-large');
+});
+
 test('filters transport-owned headers and keeps website identity', () => {
   assert.deepEqual(filterRequestHeaders([
     { name: 'Host', value: 'files.example.test' },
@@ -47,11 +62,32 @@ test('claims the exact redirect chain for a Firefox DownloadItem', () => {
     sourcePageUrl: 'https://example.test/page',
     initialUrl: 'https://example.test/start',
     finalUrl: 'https://cdn.test/file.zip',
+    headersUrl: 'https://cdn.test/file.zip',
     tabId: 4,
     incognito: false,
     cookieStoreId: 'firefox-default',
     capturedUnixMs: 1_000
   });
+});
+
+test('tracks the URL whose request headers were observed separately from the final redirect URL', () => {
+  const tracker = createRequestContextTracker({ now: () => 1_500 });
+  tracker.observeSendHeaders({
+    requestId: 'redirect-without-final-headers', method: 'GET',
+    url: 'https://origin.test/file', tabId: 4,
+    requestHeaders: [{ name: 'Authorization', value: 'Bearer origin-only' }]
+  });
+  tracker.observeRedirect({
+    requestId: 'redirect-without-final-headers',
+    url: 'https://origin.test/file', redirectUrl: 'https://cdn.test/file'
+  });
+
+  const claimed = tracker.claimDownload({
+    id: 10, url: 'https://origin.test/file', referrer: 'https://app.test/page',
+    tabId: 4, incognito: false, cookieStoreId: 'firefox-default'
+  });
+  assert.equal(claimed.finalUrl, 'https://cdn.test/file');
+  assert.equal(claimed.headersUrl, 'https://origin.test/file');
 });
 
 test('does not swap same-url credentials between tabs and consumes claims once', () => {
@@ -164,6 +200,7 @@ test('reauthorization captures one fresh same-tab resource request only', () => 
     sourcePageUrl: 'https://app.test/chat?view=1',
     initialUrl: 'https://files.test/download?sig=new',
     finalUrl: 'https://files.test/download?sig=new',
+    headersUrl: 'https://files.test/download?sig=new',
     tabId: 7,
     incognito: true,
     cookieStoreId: 'firefox-container-1',

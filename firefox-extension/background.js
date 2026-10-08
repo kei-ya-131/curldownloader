@@ -50,6 +50,7 @@
   }
 
   const pendingDownloads = new Map();
+  let nextPageDownloadId = -1;
   const settingsTabs = new Map();
   const reauthorizationInFlight = new Map();
   const taskBindings = new Map();
@@ -77,12 +78,79 @@
     return { enabled: false, protocol: 'http', host: '', port: 8080, username: '' };
   }
 
+  function sameOrigin(left, right) {
+    try {
+      const a = new URL(String(left));
+      const b = new URL(String(right));
+      return a.protocol === b.protocol
+        && a.hostname.toLowerCase() === b.hostname.toLowerCase()
+        && (a.port || (a.protocol === 'https:' ? '443' : '80'))
+          === (b.port || (b.protocol === 'https:' ? '443' : '80'));
+    } catch (_error) {
+      return false;
+    }
+  }
+
+  async function requestContextForEnqueue(pending) {
+    const context = pending.requestContext;
+    if (!context) return null;
+    const headers = Array.isArray(context.headers)
+      ? context.headers.map((header) => ({ name: header.name, value: header.value }))
+      : [];
+    const capturedOriginMatches = sameOrigin(context.headersUrl || context.finalUrl, pending.url);
+    const safeRedirectHeaders = new Set(['accept', 'accept-language', 'referer', 'user-agent']);
+    const filteredHeaders = capturedOriginMatches
+      ? headers
+      : headers.filter((header) => safeRedirectHeaders.has(String(header.name || '').toLowerCase()));
+    const cookiesApi = browserApi && browserApi.cookies;
+    const cookieStoreId = context.cookieStoreId || pending.cookieStoreId;
+    if (cookiesApi && typeof cookiesApi.getAll === 'function' && cookieStoreId) {
+      try {
+        if (!core.isSupportedDownloadUrl(pending.url)) return { ...context, headers: filteredHeaders };
+        const cookies = await cookiesApi.getAll({
+          url: pending.url,
+          storeId: String(cookieStoreId),
+          firstPartyDomain: ''
+        });
+        const cookiePairs = (Array.isArray(cookies) ? cookies : [])
+          .filter((cookie) => cookie
+            && cookie.storeId === String(cookieStoreId)
+            && cookie.firstPartyDomain === ''
+            && !cookie.partitionKey
+            && /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(String(cookie.name || ''))
+            && !/[;\r\n\0]/.test(String(cookie.value === undefined ? '' : cookie.value)))
+          .map((cookie) => `${String(cookie.name)}=${String(cookie.value || '')}`);
+        const hasCapturedCookie = filteredHeaders.some(
+          (header) => String(header.name || '').toLowerCase() === 'cookie'
+        );
+        if (cookiePairs.length > 0 && !hasCapturedCookie) {
+          const originalCookieIndex = filteredHeaders.findIndex(
+            (header) => String(header.name || '').toLowerCase() === 'cookie'
+          );
+          const withoutCookie = filteredHeaders.filter(
+            (header) => String(header.name || '').toLowerCase() !== 'cookie'
+          );
+          const cookieHeader = { name: 'Cookie', value: cookiePairs.join('; ') };
+          const insertAt = originalCookieIndex < 0
+            ? withoutCookie.length
+            : Math.min(originalCookieIndex, withoutCookie.length);
+          withoutCookie.splice(insertAt, 0, cookieHeader);
+          return { ...context, headers: withoutCookie };
+        }
+      } catch (_error) {
+        // Keep the captured request context when this exact store query fails.
+      }
+    }
+    return { ...context, headers: filteredHeaders };
+  }
+
   function clonePending(pending) {
     return {
       downloadId: pending.downloadId,
       url: pending.url,
       filename: pending.filename,
       targetDir: pending.targetDir || '',
+      externalSupported: pending.externalSupported !== false,
       forceRecreate: Boolean(pending.forceRecreate),
       firefoxDownloadRemoved: Boolean(pending.firefoxDownloadRemoved),
       proxy: {
@@ -296,6 +364,7 @@
   }
 
   async function restoreFirefoxDownload(pending) {
+    if (pending.pageDownload) return sendPageDownloadAction(pending, 'restore-page-download');
     if (pending.firefoxDownloadRemoved === false && pending.forceRecreate) {
       const removed = await cancelAndEraseDownload(pending);
       if (!removed) {
@@ -428,6 +497,11 @@
   }
 
   async function cancelFirefoxDownload(pending) {
+    if (pending.pageDownload) {
+      const result = await sendPageDownloadAction(pending, 'release-page-download');
+      if (result.ok) pendingDownloads.delete(pending.downloadId);
+      return result;
+    }
     if (pending.firefoxDownloadRemoved) {
       pendingDownloads.delete(pending.downloadId);
       return { ok: true };
@@ -502,6 +576,11 @@
     }
   }
 
+  function nativeErrorCode(error) {
+    const code = error && error.code;
+    return typeof code === 'string' && /^[A-Za-z0-9_]{1,64}$/.test(code) ? code : null;
+  }
+
   async function focusFirefoxSource(binding) {
     if (!binding) return null;
     const matchesContainer = (tab) => {
@@ -560,7 +639,12 @@
           ? requestTracker.claimReauthorization(sessionId)
           : null;
         if (requestContext) {
-          const wireContext = core.serializeRequestContext(requestContext, {
+          const refreshedContext = await requestContextForEnqueue({
+            url: requestContext.finalUrl,
+            cookieStoreId: requestContext.cookieStoreId,
+            requestContext
+          });
+          const wireContext = core.serializeRequestContext(refreshedContext, {
             url: requestContext.finalUrl,
             referrer: requestContext.sourcePageUrl
           });
@@ -718,7 +802,81 @@
     }
   }
 
+  async function sendPageDownloadAction(pending, type) {
+    try {
+      const response = await browserApi.tabs.sendMessage(pending.pageDownload.tabId,
+        { type, fallbackToken: pending.pageDownload.fallbackToken },
+        { frameId: pending.pageDownload.frameId });
+      return response && response.ok ? { ok: true } : {
+        ok: false, error: '來源分頁未能恢復下載；請保留原 ChatGPT 分頁後重試。'
+      };
+    } catch (_error) {
+      return { ok: false, error: '來源分頁已關閉或重新整理；請回到 ChatGPT 重新按下載。' };
+    }
+  }
+
+  async function interceptPageDownload(message, sender) {
+    // Firefox supplies identity; the webpage cannot select a tab/container or headers.
+    let source;
+    try { source = new URL(sender && sender.url); } catch (_error) { return { ok: false }; }
+    if (source.protocol !== 'https:' || source.hostname !== 'chatgpt.com'
+        || !sender.tab || !Number.isInteger(sender.tab.id)
+        || !Number.isInteger(sender.frameId)
+        || typeof message.fallbackToken !== 'string'
+        || !message.fallbackToken || message.fallbackToken.length > 128
+        || (message.url !== null && (!core.isSupportedDownloadUrl(message.url)
+          || String(message.url).length > 48 * 1024))) return { ok: false };
+    for (const existing of pendingDownloads.values()) {
+      if (existing.pageDownload && existing.pageDownload.tabId === sender.tab.id
+          && existing.pageDownload.frameId === sender.frameId
+          && existing.pageDownload.fallbackToken === message.fallbackToken) {
+        return { ok: true, downloadId: existing.downloadId };
+      }
+    }
+    if (Array.from(pendingDownloads.values()).filter((p) => p.pageDownload).length >= 128) {
+      return { ok: false };
+    }
+    const claim = () => message.url && requestTracker ? requestTracker.claimDownload({
+      url: message.url, referrer: sender.url, tabId: sender.tab.id,
+      frameId: sender.frameId, incognito: sender.tab.incognito,
+      cookieStoreId: sender.tab.cookieStoreId
+    }, { tabId: sender.tab.id, frameId: sender.frameId }) : null;
+    let context = claim();
+    // Firefox can deliver the content-script message before its onSendHeaders
+    // event, even though Response.blob() has already resolved in the page.
+    const captureWaitMs = Number.isFinite(runtimeOptions.pageCaptureWaitMs)
+      ? Math.max(0, Math.min(1000, runtimeOptions.pageCaptureWaitMs)) : 1000;
+    for (let elapsed = 0; message.url && !context && elapsed < captureWaitMs; elapsed += 25) {
+      await new Promise((resolve) => setTimeout(resolve, Math.min(25, captureWaitMs - elapsed)));
+      context = claim();
+    }
+    let defaults = { targetDir: '', proxy: defaultProxy() };
+    try { defaults = await storage.loadDefaults(); } catch (_error) { /* usable defaults */ }
+    const pending = {
+      downloadId: nextPageDownloadId--, url: context ? context.finalUrl : '',
+      filename: core.fallbackFilename(message.filename), targetDir: defaults.targetDir || '',
+      proxy: defaults.proxy || defaultProxy(), requestContext: context,
+      externalSupported: Boolean(context), firefoxDownloadRemoved: true,
+      pageDownload: { tabId: sender.tab.id, frameId: sender.frameId, fallbackToken: message.fallbackToken },
+      operation: 'intercept'
+    };
+    pendingDownloads.set(pending.downloadId, pending);
+    try {
+      await openSettingsTab(pending.downloadId);
+      pending.operation = null;
+      await processCloseRequest(pending);
+      return { ok: true, downloadId: pending.downloadId };
+    } catch (_error) {
+      pendingDownloads.delete(pending.downloadId);
+      return { ok: false };
+    }
+  }
+
   async function submitExternalDownload(downloadId, form, startIntentUnixMs) {
+    const pagePending = pendingDownloads.get(Number(downloadId));
+    if (pagePending && pagePending.externalSupported === false) return {
+      ok: false, error: '此檔案只存在於網頁記憶體，未能確認原始 HTTP 請求；請選擇「使用 Firefox」。'
+    };
     const pending = pendingDownloads.get(Number(downloadId));
     if (!pending) return { ok: false, error: '找不到暫停中的下載。' };
     if (pending.operation) return { ok: false, error: '此下載仍在處理中，請稍候再試。' };
@@ -729,19 +887,30 @@
     if (!pending.externalRequestId) {
       pending.externalRequestId = `enqueue-${pending.downloadId}-${now()}-${Math.random().toString(36).slice(2)}`;
     }
+    const capturedFinalUrl = pending.requestContext && pending.requestContext.finalUrl;
+    const transferUrl = core.isSupportedDownloadUrl(capturedFinalUrl)
+      ? String(capturedFinalUrl)
+      : pending.url;
+    const transferPending = transferUrl === pending.url
+      ? pending
+      : { ...pending, url: transferUrl };
+    const requestContext = await requestContextForEnqueue(transferPending);
     const request = {
       ...core.buildEnqueueMessage(
-        pending,
+        transferPending,
         form,
         pending.externalRequestId,
-        pending.requestContext
+        requestContext
       ),
       ...startupFields(true, startIntentUnixMs)
     };
     let accepted = false;
+    let nativeFailureCode = null;
+    let firefoxRestored = false;
     try {
       const response = await sendNativeWithRetry(request);
       if (!response || response.type !== 'enqueue_result' || !response.ok) {
+        nativeFailureCode = nativeErrorCode(response && response.error);
         if (response && response.type === 'enqueue_result'
             && response.error && response.error.code === 'engine_timeout') {
           // The engine may still persist the task after the IPC wait expires.
@@ -796,18 +965,8 @@
       }
       pendingDownloads.delete(pending.downloadId);
       restartDelayMs = 500;
+      if (pending.pageDownload) await sendPageDownloadAction(pending, 'release-page-download');
       restartCooldownUntil = 0;
-      if (!awaitingFileDecision && response.task_id !== undefined) {
-        try {
-          await sendNativeWithRetry({
-            type: 'show_task',
-            task_id: Number(response.task_id),
-            ...passiveStartupFields()
-          });
-        } catch (_error) {
-          // The task is already accepted; showing its page is best effort.
-        }
-      }
       void refreshTaskStatus();
       try {
         await storage.saveDefaults(form);
@@ -829,19 +988,25 @@
             error: 'Curl Downloader 任務狀態仍未確認；請保留設定頁並稍後重試。'
           };
         }
-        await notifyFailure('Native host 未能接收下載，已恢復 Firefox。');
+        const failureCode = nativeFailureCode || nativeErrorCode(_error);
+        const diagnosis = failureCode ? `（${failureCode}）` : '';
         // Try resuming first for compatibility with a Firefox item that was
         // cancelled too late; restoreFirefoxDownload falls back to a fresh
         // Firefox item if resume is rejected after erase.
         pending.forceRecreate = false;
         const restored = await restoreAndReport(pending);
+        firefoxRestored = restored.ok;
+        await notifyFailure(`Native host 未能接收下載${diagnosis}，${restored.ok ? '已恢復 Firefox。' : 'Firefox 備援未能恢復。'}`);
         if (restored.ok) pendingDownloads.delete(pending.downloadId);
         else await notifyFailure(restored.error);
+        nativeFailureCode = failureCode;
       }
       return {
         ok: false,
-        code: 'native_unavailable',
-        error: 'Native host 未能接收下載；請保留此設定頁並稍後重試。'
+        code: nativeFailureCode || 'native_unavailable',
+        nativeErrorCode: nativeFailureCode || undefined,
+        firefoxRestored,
+        error: `Native host 未能接收下載${nativeFailureCode ? `（${nativeFailureCode}）` : ''}；請在來源頁再次按下載以重新開啟設定。`
       };
     } finally {
       if (pendingDownloads.get(pending.downloadId) === pending && pending.operation === 'submit') {
@@ -913,8 +1078,9 @@
     }
   }
 
-  async function handleRuntimeMessage(message) {
+  async function handleRuntimeMessage(message, sender) {
     if (!message || typeof message !== 'object') return { ok: false, error: '訊息無效' };
+    if (message.type === 'intercept-page-download') return interceptPageDownload(message, sender);
     const id = Number(message.downloadId);
     if (message.type === 'get-pending') {
       const pending = pendingDownloads.get(id);

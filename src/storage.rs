@@ -55,7 +55,37 @@ pub fn save_state(path: &Path, state: &PersistedState) -> io::Result<()> {
 
     let temporary = path.with_extension("json.tmp");
     let backup = path.with_extension("json.bak");
-    let bytes = serde_json::to_vec_pretty(state).map_err(io::Error::other)?;
+    let mut persisted = state.clone();
+    for task in &mut persisted.tasks {
+        if task.request_context.was_protected
+            || task.request_context.encrypted.is_some()
+            || matches!(
+                task.authorization,
+                crate::request_context::SourceAuthorization::Encrypted
+                    | crate::request_context::SourceAuthorization::NeedsFirefox
+                    | crate::request_context::SourceAuthorization::DecryptionFailed
+                    | crate::request_context::SourceAuthorization::ProtectedCleared
+            )
+        {
+            if let Some(error) = &mut task.last_error {
+                for value in
+                    std::iter::once(task.original_url.as_str()).chain(task.effective_url.as_deref())
+                {
+                    if !value.is_empty() {
+                        error.diagnostic = error
+                            .diagnostic
+                            .replace(value, &crate::request_context::redacted_task_url(value));
+                    }
+                }
+            }
+            task.original_url = crate::request_context::redacted_task_url(&task.original_url);
+            task.effective_url = task
+                .effective_url
+                .as_deref()
+                .map(crate::request_context::redacted_task_url);
+        }
+    }
+    let bytes = serde_json::to_vec_pretty(&persisted).map_err(io::Error::other)?;
     let mut file = fs::File::create(&temporary)?;
     file.write_all(&bytes)?;
     file.sync_all()?;
@@ -81,7 +111,8 @@ pub fn load_state(path: &Path) -> io::Result<PersistedState> {
         fs::rename(&backup, path)?;
     }
     let bytes = fs::read(path)?;
-    serde_json::from_slice(&bytes).map_err(io::Error::other)
+    serde_json::from_slice(&bytes)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
 pub fn quarantine_corrupt(path: &Path) -> io::Result<PathBuf> {
@@ -245,6 +276,44 @@ mod tests {
     }
 
     #[test]
+    fn protected_task_urls_have_no_plaintext_credentials_in_state() {
+        let dir = test_dir("signed-url");
+        let path = dir.join("state.json");
+        let url = "https://files.test/file?sig=never-write-signature#never-write-fragment";
+        let mut task = DownloadTask::new(1, url, "file.bin".into(), dir.clone());
+        task.effective_url = Some(url.into());
+        task.request_context.was_protected = true;
+        task.last_error = Some(TaskError {
+            kind: ErrorKind::Network,
+            summary: "下載失敗".into(),
+            code: None,
+            diagnostic: format!("request failed: {url}"),
+            action: "重試".into(),
+        });
+        let state = PersistedState {
+            schema_version: CURRENT_SCHEMA_VERSION,
+            settings: GlobalSettings {
+                last_download_dir: dir.clone(),
+                max_curl_processes: 4,
+                next_task_id: 2,
+            },
+            tasks: vec![task],
+        };
+        save_state(&path, &state).unwrap();
+        let json = fs::read_to_string(&path).unwrap();
+        assert!(!json.contains("never-write"));
+        assert_eq!(
+            state.tasks[0].original_url, url,
+            "runtime URL must remain usable"
+        );
+        assert_eq!(
+            load_state(&path).unwrap().tasks[0].original_url,
+            "https://files.test/file"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn saves_state_without_proxy_password() {
         let dir = test_dir("secret");
         let path = dir.join("state.json");
@@ -357,6 +426,19 @@ mod tests {
                 .to_string_lossy()
                 .starts_with("state.json.corrupt-")
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn malformed_state_is_invalid_data_instead_of_an_io_failure() {
+        let dir = test_dir("parse-error-kind");
+        let path = dir.join("state.json");
+        std::fs::write(&path, b"{not-json").unwrap();
+        assert_eq!(
+            load_state(&path).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"{not-json");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

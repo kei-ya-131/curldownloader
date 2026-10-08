@@ -30,6 +30,8 @@ try {
     }
 
     $required = @($manifest.icons.PSObject.Properties.Value) +
+        @($manifest.background.scripts) +
+        @($manifest.content_scripts | ForEach-Object { $_.js }) +
         @($manifest.browser_action.default_icon.PSObject.Properties.Value) +
         @(0..10 | ForEach-Object { 'icons/progress-{0:D3}.png' -f ($_ * 10) })
     foreach ($name in $required | Select-Object -Unique) {

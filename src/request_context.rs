@@ -352,7 +352,7 @@ fn validate_header_name(name: &str) -> Result<(), RequestContextError> {
     Ok(())
 }
 
-fn sensitive_header(name: &str, value: &str) -> bool {
+pub(crate) fn sensitive_header(name: &str, value: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     if matches!(
         lower.as_str(),
@@ -525,6 +525,18 @@ pub fn restore(
 pub fn clear_secret_material(stored: &mut StoredRequestContext) {
     stored.public = None;
     stored.encrypted = None;
+}
+
+/// Only the encrypted request context retains replayable credentials.
+pub(crate) fn redacted_task_url(value: &str) -> String {
+    let Ok(mut url) = Url::parse(value) else {
+        return String::new();
+    };
+    url.set_query(None);
+    url.set_fragment(None);
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.to_string()
 }
 
 #[cfg(test)]

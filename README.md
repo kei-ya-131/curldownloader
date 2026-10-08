@@ -4,6 +4,21 @@
 
 Curl Downloader is a portable download manager for Windows. It uses either the bundled curl or a usable curl found on `PATH`, with support for segmented downloads, resuming, per-task proxy settings, and task status management. The release directory contains only one `CurlDownloader.exe`; the same executable runs as the Firefox Native Messaging host in stdio mode, with no separate helper executable.
 
+## Version 0.4.0
+
+Changes from 0.3.0:
+
+- Firefox can hand off supported ChatGPT Blob downloads with the exact captured HTTP request and authorization, while unsupported Blobs retain Firefox fallback.
+- Cookie lookup respects the download URL and Firefox container. Native handoff errors remain visible, and repeated downloads and fallback recovery keep their task state.
+- Segment merging and Explorer operations run in the background. Resuming validates the requested byte range, and changes to the source or segment count discard incompatible partial files.
+- Protected URL query credentials remain encrypted across restart and are cleared after completion or cancellation. Task details preserve segment timing and support copying complete paths and URLs.
+- Creating a task in Firefox preserves the main window's hidden state. The folder picker belongs to the initiating foreground window, so it opens above Firefox without restoring Curl Downloader.
+- Explorer location actions select the task's file and preserve the existing window layout. Startup prefers a compatible integrated GPU and preserves unreadable state files.
+
+### Upgrade from 0.3.0
+
+Close Curl Downloader from its tray menu, replace `CurlDownloader.exe` in the same directory, and update `curl-downloader.xpi` to 0.4.0. Keep the existing `data` directory, state file, and partial downloads. Launch the updated executable once to refresh Native Messaging registration, then reload ChatGPT tabs to activate the new Blob interceptor. Existing task records remain readable; timing absent from older records is shown as **Not recorded**.
+
 ## Build
 
 Build the MSVC version with Rust 1.97.1:
@@ -26,6 +41,12 @@ Enter an HTTP/HTTPS URL to create a task. Before starting the download, confirm 
 
 On Windows, downloads start only hidden curl child processes in the background and do not display CMD windows.
 
+Segment merging and folder opening run in the background so other tasks remain usable. Changing the source, destination, or segment count discards incompatible partial files before restarting; partial data is never reused for a different byte range. The selected task is revealed once when it moves into the completed section.
+
+On Windows, DirectX 12 explicitly prefers a compatible integrated GPU; other devices are used when no compatible integrated GPU is available. An unreadable state file prevents startup and displays an error, preserving the existing task history.
+
+Protected URL query credentials are retained only in encrypted authorization data. Task history stores URLs without query parameters, restores the complete URL from encrypted data on restart, and clears authorization data after completion or cancellation.
+
 ### Task details and segment history
 
 Task details contain only two actual tabs: **Task overview** and **Segment settings**. URLs, file names, and complete save paths wrap automatically and can be selected and copied directly instead of being truncated with ellipses. Completed tasks still show each segment's byte range, size, downloaded bytes, status, start and completion times, active download duration, and average speed. This information remains available after restarting the application. Timing data missing from records created by older versions is shown as **Not recorded** and is never estimated.
@@ -34,13 +55,23 @@ When **Open file** or **Open folder** is selected from the extension or the main
 
 All these features run inside the same `CurlDownloader.exe`. They do not use PowerShell, CMD, helper executables, process injection, or remote threads. Proxy passwords exist only in memory and pipes for the current workflow; they are never written to `state.json` or extension storage.
 
+Open location opens the containing folder and selects that task's file, even if the folder is already open. If the file is unfinished or has been removed, it opens the folder alone. Opening a location preserves the existing Explorer window size, position, and internal keyboard focus. Only minimized windows are restored; a previously maximized window returns maximized. Activation uses the normal foreground request without joining Explorer's input queue or forcing focus onto its window frame.
+
 ## Firefox extension
 
 The Firefox extension intercepts HTTP/HTTPS downloads, cancels and erases the native Firefox item to keep its download panel out of the way, and opens a configuration page. The page can change the download name, absolute Windows directory, proxy type, host, port, account, and password for the current request. **Use Firefox** recreates the native download, while **Cancel** cancels the intercepted request.
 
+ChatGPT `blob:` downloads are intercepted in the page before Firefox starts saving. When a successful `Response.blob()` can be linked to its exact HTTP GET request in the same tab and frame, Curl Downloader receives that URL and captured authorization. Locally generated blobs or unconfirmed requests still show the choice page, with Curl submission disabled and **Use Firefox** available. Keep the original ChatGPT tab open until deciding. After updating the XPI, reload the ChatGPT page so the new page interceptor runs.
+
+Run `python scripts/test-firefox-blob-download.py` for an isolated headless Firefox smoke test of the choice page and byte-for-byte Firefox fallback. It requires Firefox and OpenSSL; its local TLS fixture and test-only Native Messaging stub do not use your browser profile or launch the desktop application.
+
+Failed Native handoffs keep their error code visible on the settings page. Firefox fallback is reported as restored only after acknowledgement, and a restored download cannot be submitted again from that page. Close it and click download again on the source page. Run the smoke test with --reject-native to verify rejection followed by repeated downloads, or --probe-native to read the registered host status without starting the GUI or enqueuing tasks.
+
 ### Application lifecycle
 
-GUI 啟動時會自動在 `HKCU\Software\Mozilla\NativeMessagingHosts\curl_downloader` 建立或更新 Native host；設定頁無法連線時可按「重試 Curl Downloader」。
+Authenticated downloads reuse authorization headers actually sent by Firefox. When a Cookie header is missing, the extension queries only unpartitioned cookies for the download URL and original container. Updating the extension requires granting the added cookies permission. Partitioned cookies and first-party isolation rely on the actual captured Firefox request; expired authorization can be refreshed in Firefox. Sites requiring browser-specific verification may still need Firefox to complete the download.
+
+Starting the GUI automatically creates or updates the Native host registration in `HKCU\Software\Mozilla\NativeMessagingHosts\curl_downloader`. If the settings page cannot connect, select **Retry Curl Downloader**.
 
 The first time the extension needs the main application, it starts the same `CurlDownloader.exe` minimized and resident in the system tray. The entire system keeps only one Curl Downloader main process.
 

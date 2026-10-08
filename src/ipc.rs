@@ -485,14 +485,22 @@ pub fn spawn_server(
     }
 }
 pub fn call_pipe(request: &IpcRequest, timeout: Duration) -> io::Result<IpcResponse> {
+    call_pipe_with_timeouts(request, timeout, timeout)
+}
+
+pub fn call_pipe_with_timeouts(
+    request: &IpcRequest,
+    connection_timeout: Duration,
+    response_timeout: Duration,
+) -> io::Result<IpcResponse> {
     #[cfg(windows)]
     {
-        call_windows_pipe(request, timeout)
+        call_windows_pipe(request, connection_timeout, response_timeout)
     }
 
     #[cfg(not(windows))]
     {
-        let _ = (request, timeout);
+        let _ = (request, connection_timeout, response_timeout);
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "Named Pipe 只支援 Windows",
@@ -512,6 +520,25 @@ pub fn call_pipe_with_retry(
 pub fn call_pipe_with_retry_until<F>(
     request: &IpcRequest,
     timeout: Duration,
+    retry_delay: Duration,
+    attempts: usize,
+    should_continue: F,
+) -> io::Result<IpcResponse>
+where
+    F: FnMut() -> bool,
+{
+    call_pipe_with_retry_until_timeouts(
+        request,
+        (timeout, timeout),
+        retry_delay,
+        attempts,
+        should_continue,
+    )
+}
+
+pub fn call_pipe_with_retry_until_timeouts<F>(
+    request: &IpcRequest,
+    timeouts: (Duration, Duration),
     retry_delay: Duration,
     attempts: usize,
     mut should_continue: F,
@@ -534,7 +561,7 @@ where
                 "Curl Downloader 已由使用者關閉",
             ));
         }
-        match call_pipe(request, timeout) {
+        match call_pipe_with_timeouts(request, timeouts.0, timeouts.1) {
             Ok(response) => return Ok(response),
             Err(error) if is_pipe_connection_error(&error) && attempt + 1 < attempts => {
                 last_error = Some(error);
@@ -750,9 +777,7 @@ fn dispatch_request(
                 .lock()
                 .map(|path| path.clone())
                 .unwrap_or_default();
-            let folder = rfd::FileDialog::new()
-                .set_directory(current_dir)
-                .pick_folder();
+            let folder = crate::window_control::pick_download_folder(&current_dir);
             IpcResponse::Folder {
                 request_id,
                 ok: folder.is_some(),
@@ -1059,7 +1084,7 @@ fn open_task_folder(
     }
     action_from_open_outcome(
         request_id,
-        shell_foreground::open_folder_foreground(&task.target_dir),
+        shell_foreground::reveal_file_foreground(&task.target_dir.join(&task.filename)),
         "open_folder_failed",
         "無法開啟目標下載資料夾。",
     )
@@ -1097,7 +1122,11 @@ fn enqueue_error(request_id: String, code: &str, message: &str) -> IpcResponse {
 }
 
 #[cfg(windows)]
-fn call_windows_pipe(request: &IpcRequest, timeout: Duration) -> io::Result<IpcResponse> {
+fn call_windows_pipe(
+    request: &IpcRequest,
+    connection_timeout: Duration,
+    response_timeout: Duration,
+) -> io::Result<IpcResponse> {
     use std::{
         fs::File,
         os::windows::io::{FromRawHandle, RawHandle},
@@ -1109,7 +1138,7 @@ fn call_windows_pipe(request: &IpcRequest, timeout: Duration) -> io::Result<IpcR
     };
 
     let name = pipe_name_wide();
-    let open_deadline = Instant::now() + timeout;
+    let open_deadline = Instant::now() + connection_timeout;
     let handle = loop {
         let handle = unsafe {
             CreateFileW(
@@ -1132,6 +1161,7 @@ fn call_windows_pipe(request: &IpcRequest, timeout: Duration) -> io::Result<IpcR
         thread::sleep(Duration::from_millis(10));
     };
 
+    let mut stream = unsafe { File::from_raw_handle(handle as RawHandle) };
     if !named_pipe_server_is_trusted(handle) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -1139,12 +1169,11 @@ fn call_windows_pipe(request: &IpcRequest, timeout: Duration) -> io::Result<IpcR
         ));
     }
 
-    let mut stream = unsafe { File::from_raw_handle(handle as RawHandle) };
     let body = serde_json::to_vec(request)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
     write_frame(&mut stream, &body)?;
 
-    let body = read_frame(&mut stream, MAX_FRAME_BYTES)?;
+    let body = read_named_pipe_frame(&mut stream, handle, MAX_FRAME_BYTES, response_timeout)?;
     let response = serde_json::from_slice::<IpcResponse>(&body)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
     if response.request_id() != request.request_id() {
@@ -1782,6 +1811,157 @@ mod tests {
     }
 
     use crate::request_context::WireRequestHeader;
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "opens a native folder picker; run on an interactive Windows desktop"]
+    fn folder_picker_is_foreground_and_cancellation_preserves_hidden_state() {
+        use windows_sys::Win32::{
+            Foundation::{HWND, LPARAM},
+            System::Threading::GetCurrentThreadId,
+            UI::WindowsAndMessaging::{
+                CreateWindowExW, DestroyWindow, DispatchMessageW, EnumThreadWindows, GW_HWNDPREV,
+                GW_OWNER, GetClassNameW, GetForegroundWindow, GetWindow, MSG, PM_REMOVE,
+                PeekMessageW, PostMessageW, SetForegroundWindow, TranslateMessage, WM_CLOSE,
+                WS_EX_TOPMOST, WS_VISIBLE,
+            },
+        };
+        unsafe extern "system" fn find_dialog(hwnd: HWND, data: LPARAM) -> windows_sys::core::BOOL {
+            let mut class = [0u16; 32];
+            let len = unsafe { GetClassNameW(hwnd, class.as_mut_ptr(), 32) };
+            if String::from_utf16_lossy(&class[..len as usize]) == "#32770" {
+                unsafe { *(data as *mut HWND) = hwnd };
+                return 0;
+            }
+            1
+        }
+        // Model a browser/tool window that would otherwise cover an unowned picker.
+        let class: Vec<u16> = "STATIC\0".encode_utf16().collect();
+        let browser = unsafe {
+            CreateWindowExW(
+                WS_EX_TOPMOST,
+                class.as_ptr(),
+                class.as_ptr(),
+                WS_VISIBLE,
+                0,
+                0,
+                640,
+                480,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            )
+        };
+        assert!(!browser.is_null());
+        unsafe { SetForegroundWindow(browser) };
+        assert_eq!(
+            unsafe { GetForegroundWindow() },
+            browser,
+            "fixture must own the foreground before the request"
+        );
+        let state = SharedControllerState::new(LifecycleState::RunningHidden);
+        let picker_state = state.clone();
+        let (thread_tx, thread_rx) = std::sync::mpsc::channel();
+        let picker = std::thread::spawn(move || {
+            thread_tx.send(unsafe { GetCurrentThreadId() }).unwrap();
+            let (commands, _rx) = std::sync::mpsc::channel();
+            let (controller, _rx) = std::sync::mpsc::channel();
+            dispatch_request(
+                IpcRequest::PickFolder {
+                    request_id: "picker-regression".into(),
+                },
+                &commands,
+                &Arc::new(Mutex::new(std::env::temp_dir())),
+                &picker_state,
+                &controller,
+                true,
+            )
+        });
+        let thread_id = thread_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let stable_after = Instant::now() + Duration::from_secs(2);
+        let mut dialog: HWND = std::ptr::null_mut();
+        let mut foreground = false;
+        while Instant::now() < deadline {
+            let mut message: MSG = unsafe { std::mem::zeroed() };
+            while unsafe { PeekMessageW(&mut message, std::ptr::null_mut(), 0, 0, PM_REMOVE) } != 0
+            {
+                unsafe {
+                    TranslateMessage(&message);
+                    DispatchMessageW(&message);
+                }
+            }
+            unsafe {
+                EnumThreadWindows(
+                    thread_id,
+                    Some(find_dialog),
+                    (&mut dialog as *mut HWND) as LPARAM,
+                )
+            };
+            if !dialog.is_null() {
+                foreground = unsafe { GetForegroundWindow() } == dialog;
+                let mut previous = unsafe { GetWindow(dialog, GW_HWNDPREV) };
+                let mut covered = false;
+                while !previous.is_null() {
+                    covered |= previous == browser;
+                    previous = unsafe { GetWindow(previous, GW_HWNDPREV) };
+                }
+                if foreground && !covered && Instant::now() >= stable_after {
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!dialog.is_null(), "native picker did not appear");
+        let mut previous = unsafe { GetWindow(dialog, GW_HWNDPREV) };
+        let mut covered = false;
+        while !previous.is_null() {
+            covered |= previous == browser;
+            previous = unsafe { GetWindow(previous, GW_HWNDPREV) };
+        }
+        let owner = unsafe { GetWindow(dialog, GW_OWNER) };
+        unsafe { PostMessageW(dialog, WM_CLOSE, 0, 0) };
+        let close_deadline = Instant::now() + Duration::from_secs(5);
+        while !picker.is_finished() && Instant::now() < close_deadline {
+            let mut message: MSG = unsafe { std::mem::zeroed() };
+            while unsafe { PeekMessageW(&mut message, std::ptr::null_mut(), 0, 0, PM_REMOVE) } != 0
+            {
+                unsafe {
+                    TranslateMessage(&message);
+                    DispatchMessageW(&message);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        unsafe { DestroyWindow(browser) };
+        assert!(
+            picker.is_finished(),
+            "picker did not close after cancellation"
+        );
+        let response = picker.join().unwrap();
+        assert_eq!(
+            owner, browser,
+            "picker must be owned by the window that initiated it"
+        );
+        assert!(
+            !covered,
+            "native picker was covered by the browser/tool window"
+        );
+        assert!(
+            foreground,
+            "native picker stayed behind the foreground window"
+        );
+        assert!(matches!(
+            response,
+            IpcResponse::Folder {
+                ok: false,
+                target_dir: None,
+                ..
+            }
+        ));
+        assert_eq!(state.lifecycle(), LifecycleState::RunningHidden);
+    }
+
     use crate::{
         controller::{ControllerCommand, LifecycleState, SharedControllerState},
         model::{
@@ -1806,6 +1986,78 @@ mod tests {
         assert_eq!(
             read_frame(&mut reader, MAX_FRAME_BYTES).unwrap_err().kind(),
             std::io::ErrorKind::InvalidData
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn connected_pipe_without_a_response_obeys_the_deadline() {
+        use std::os::windows::io::{FromRawHandle, RawHandle};
+        use windows_sys::Win32::{
+            Foundation::{ERROR_PIPE_CONNECTED, GetLastError, INVALID_HANDLE_VALUE},
+            Storage::FileSystem::PIPE_ACCESS_DUPLEX,
+            System::Pipes::{ConnectNamedPipe, CreateNamedPipeW, PIPE_TYPE_BYTE, PIPE_WAIT},
+        };
+        let suffix = format!("test-response-deadline-{}", std::process::id());
+        unsafe { std::env::set_var("CURL_DOWNLOADER_PIPE_SUFFIX", &suffix) };
+        let name = pipe_name_wide();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let handle = unsafe {
+                CreateNamedPipeW(
+                    name.as_ptr(),
+                    PIPE_ACCESS_DUPLEX,
+                    PIPE_TYPE_BYTE | PIPE_WAIT,
+                    1,
+                    MAX_FRAME_BYTES as u32,
+                    MAX_FRAME_BYTES as u32,
+                    1000,
+                    std::ptr::null(),
+                )
+            };
+            assert_ne!(handle, INVALID_HANDLE_VALUE);
+            let mut stream = unsafe { std::fs::File::from_raw_handle(handle as RawHandle) };
+            ready_tx.send(()).unwrap();
+            let connected = unsafe { ConnectNamedPipe(handle, std::ptr::null_mut()) };
+            assert!(connected != 0 || unsafe { GetLastError() } == ERROR_PIPE_CONNECTED);
+            if read_named_pipe_frame(&mut stream, handle, MAX_FRAME_BYTES, Duration::from_secs(2))
+                .is_err()
+            {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+            let body = serde_json::to_vec(&IpcResponse::Pong {
+                request_id: "deadline".into(),
+                ok: true,
+            })
+            .unwrap();
+            let _ = write_frame(&mut stream, &body);
+        });
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let started = Instant::now();
+        let result = call_pipe(
+            &IpcRequest::Ping {
+                request_id: "deadline".into(),
+            },
+            Duration::from_millis(100),
+        );
+        let elapsed = started.elapsed();
+        unsafe { std::env::remove_var("CURL_DOWNLOADER_PIPE_SUFFIX") };
+        if result
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.kind() != io::ErrorKind::TimedOut)
+        {
+            // A denied connection leaves the fixture waiting for its client.
+            // Do not hang the entire suite while reporting that setup error.
+            drop(server);
+            panic!("pipe fixture could not connect: {result:?}");
+        }
+        server.join().unwrap();
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert!(
+            elapsed < Duration::from_millis(400),
+            "request took {elapsed:?}"
         );
     }
 

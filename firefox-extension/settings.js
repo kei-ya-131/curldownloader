@@ -14,6 +14,7 @@
   const cancelTaskButton = document.getElementById('cancel-task');
   let pending;
   let acceptedTaskId = null;
+  let firefoxRestored = false;
 
   function setStatus(message, kind) {
     statusElement.textContent = message;
@@ -91,6 +92,10 @@
   }
 
   async function cancelDownload() {
+    if (firefoxRestored) {
+      await closeSettingsPage();
+      return;
+    }
     cancelButton.disabled = true;
     try {
       const response = await browser.runtime.sendMessage({ type: 'cancel-download', downloadId });
@@ -178,12 +183,16 @@
       const response = await browser.runtime.sendMessage({ type: 'submit-external', downloadId, form, startIntentUnixMs: Date.now() });
       if (!response || !response.ok) {
         const message = response && response.error ? response.error : 'Native host 未能接收任務';
-        if (!message.startsWith('Native host')) {
-          throw new Error(message);
+        if (response && response.firefoxRestored) {
+          firefoxRestored = true;
+          cancelButton.textContent = '關閉';
+          document.getElementById('use-firefox').hidden = true;
+          document.getElementById('browse').disabled = true;
+          retryButton.hidden = true;
+          setStatus(`${message} 已由 Firefox 接手；如要再交給 Curl Downloader，請回到來源頁重新按下載。`, 'error');
+          return;
         }
-        setStatus(`${message} 正在關閉設定頁…`, 'error');
-        setTimeout(() => { void closeSettingsPage(); }, 700);
-        return;
+        throw new Error(message);
       }
       try {
         await CurlExtensionStorage.saveDefaults(form);
@@ -241,6 +250,13 @@
         throw new Error('找不到下載項目。');
       }
       const defaults = await CurlExtensionStorage.loadDefaults();
+      if (pending.download.externalSupported === false) {
+        fillForm(pending.download, defaults);
+        submitButton.disabled = true;
+        retryButton.hidden = true;
+        setStatus('此下載是網頁產生的 blob 檔案，未能確認可供 curl 使用的原始 HTTP 請求。請選擇「使用 Firefox」，或取消後在原 ChatGPT 分頁重試。', 'error');
+        return;
+      }
       const nativeDefaults = await loadNativeDefaults(true);
       fillForm({
         ...pending.download,

@@ -17,6 +17,7 @@ test('manifest declares the fixed Firefox identity and bridge permissions', () =
   assert.ok(manifest.permissions.includes('nativeMessaging'));
   assert.ok(manifest.permissions.includes('storage'));
   assert.ok(manifest.permissions.includes('webRequest'));
+  assert.ok(manifest.permissions.includes('cookies'));
   assert.ok(manifest.permissions.includes('http://*/*'));
   assert.ok(manifest.permissions.includes('https://*/*'));
   assert.equal(manifest.background.persistent, true);
@@ -36,6 +37,13 @@ test('declares cyber add-on and toolbar icons', () => {
   for (const relativePath of Object.values(cyberIcons)) {
     assert.equal(fs.existsSync(path.join(root, relativePath)), true);
   }
+});
+
+test('ChatGPT blob interception starts before page scripts and is packaged', () => {
+  assert.deepEqual(manifest.content_scripts, [{ matches: ['https://chatgpt.com/*'],
+    js: ['blob-download.js'], run_at: 'document_start', all_frames: true }]);
+  const packaging = fs.readFileSync(path.join(root, '..', 'scripts', 'package-firefox-extension.ps1'), 'utf8');
+  assert.match(packaging, /'blob-download\.js'/);
 });
 test('declares cyber toolbar and progress icons', () => {
   assert.deepEqual(manifest.browser_action.default_icon, {
@@ -82,8 +90,8 @@ test('settings exposes native host retry control', () => {
 test('documents GUI startup native host registration', () => {
   const readme = fs.readFileSync(path.join(root, '..', 'README.md'), 'utf8');
   const portableScript = fs.readFileSync(path.join(root, '..', 'scripts', 'package-portable.ps1'), 'utf8');
-  assert.match(readme, /GUI 啟動時會自動在 `HKCU/);
-  assert.match(readme, /重試 Curl Downloader/);
+  assert.match(readme, /Starting the GUI automatically creates or updates the Native host registration in `HKCU/);
+  assert.match(readme, /Retry Curl Downloader/);
   assert.match(portableScript, /GUI 啟動時會自動註冊 Firefox Native host/);
 });
 

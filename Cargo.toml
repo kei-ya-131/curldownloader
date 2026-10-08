@@ -1,6 +1,6 @@
 [package]
 name = "curl-downloader"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.97.1"
 
@@ -18,8 +18,9 @@ url = "2.5"
 zeroize = "1.8"
 
 [target.'cfg(windows)'.dependencies]
+raw-window-handle = "0.6"
 winreg = "0.52"
-windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Globalization", "Win32_System_Com", "Win32_System_Ole", "Win32_System_Threading", "Win32_System_Variant", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Globalization", "Win32_System_Com", "Win32_System_Ole", "Win32_System_Threading", "Win32_System_Variant", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_WindowsAndMessaging"] }
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
