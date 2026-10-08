@@ -15,6 +15,7 @@ $runtimeFiles = @(
     'native-session.js',
     'request-context.js',
     'background.js',
+    'blob-download.js',
     'settings.html',
     'settings.css',
     'settings.js',

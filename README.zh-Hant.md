@@ -4,6 +4,21 @@
 
 Curl Downloader 是一個 Windows portable 下載器，使用內置或 PATH 中可用的 curl，支援多段下載、續傳、Proxy 及任務狀態管理。發行目錄只包含一份 `CurlDownloader.exe`；Firefox Native Messaging host 由同一份 EXE 以 stdio 模式執行，不會另帶 helper EXE。
 
+## 0.4.0 版本
+
+相較 0.3.0 的更新：
+
+- Firefox 可將支援的 ChatGPT Blob 下載連同確切 HTTP 請求及授權交給 Curl Downloader；不支援的 Blob 仍保留 Firefox 備援下載。
+- Cookie 查詢依據下載網址及 Firefox 容器；Native 交接錯誤會保留在設定頁，連續下載及備援恢復亦會保留任務狀態。
+- 分段合併與 Explorer 操作在背景執行；續傳會驗證要求的位元組範圍，來源或分段數變更時清除不相容的部分檔。
+- 受保護網址的查詢憑證會加密保存供重啟恢復，完成或取消後清除；任務詳情保留分段時間，並支援複製完整路徑及網址。
+- 從 Firefox 建立任務後，主視窗維持原本隱藏狀態。資料夾選取視窗隸屬於發起操作時的前景視窗，可顯示在 Firefox 上方，亦不會還原 Curl Downloader。
+- Explorer 位置操作會選取任務檔案並保留既有視窗布局；啟動時優先使用相容核顯，且不覆寫無法讀取的狀態檔。
+
+### 從 0.3.0 升級
+
+先從系統匣選單關閉 Curl Downloader，在原目錄替換 `CurlDownloader.exe`，並將 `curl-downloader.xpi` 更新至 0.4.0。保留既有 `data` 目錄、狀態檔及下載部分檔；啟動新版 EXE 一次以更新 Native Messaging 註冊，再重新整理 ChatGPT 分頁以載入新的 Blob 攔截程式。舊任務紀錄仍可讀取，舊版本缺少的時間資料會顯示「未記錄」。
+
 ## Build
 
 使用 Rust 1.97.1 建立 MSVC 版本：
@@ -26,6 +41,12 @@ powershell -ExecutionPolicy Bypass -File scripts\build-release-gnu.ps1
 
 Windows 下載只會在背景啟動隱藏的 curl 子程序，不會顯示 CMD 視窗。
 
+分段整合與開啟資料夾在背景執行，期間仍可新增或操作其他任務。暫停後更改來源、目的地或分段數時，無法安全沿用的部分檔會清除並重新下載，避免混入舊來源或錯誤範圍的內容。完成的選取任務會在移至完成區後自動捲動顯示一次。
+
+Windows 以 DirectX 12 明確優先選用可呈現視窗的核顯；無相容核顯時才改用其他可用裝置。若狀態檔不可讀，程式會停止啟動並顯示錯誤，保留原有資料。
+
+受保護網址的查詢憑證只保留於加密授權資料；任務紀錄中的網址會遮蔽查詢參數，重啟時再從加密資料還原，完成或取消後清除授權資料。
+
 ### 任務詳情與分段歷史
 
 任務詳情只保留兩個真正頁籤：「任務總覽」及「分段設定」。網址、檔名及完整儲存路徑會自動換行，並可直接選取及複製，不會以省略號截斷。已完成任務仍會顯示每一段的位元組範圍、大小、已下載量、狀態、開始及完成時間、實際下載時間和平均速度；這些資料在重啟程式後仍保留。舊版本紀錄沒有的時間資料會顯示「未記錄」，不會自行估算。
@@ -34,11 +55,21 @@ Windows 下載只會在背景啟動隱藏的 curl 子程序，不會顯示 CMD �
 
 這些功能全部在同一份 CurlDownloader.exe 內執行，不使用 PowerShell、CMD、helper EXE、程序注入或遠端執行緒。Proxy 密碼只存在本次工作流程的記憶體及 pipe，不會寫入 `state.json` 或 extension storage。
 
+「開啟位置」會開啟所在資料夾並選取該任務的檔案；檔案尚未完成或已移除時只開啟資料夾。即使資料夾已經開啟，仍會更新選取的檔案。開啟位置會保留既有檔案總管的大小、位置及內部鍵盤焦點。只還原已最小化的視窗，原本最大化的視窗會以最大化狀態還原；切換前景使用一般啟用要求，不合併 Explorer 的輸入佇列或強制把鍵盤焦點放到視窗框架。
+
 ## Firefox extension
 
 Firefox extension 會攔截 HTTP/HTTPS 下載，先取消並清理原生下載項目（避免原生下載視窗遮擋設定頁），再開啟設定頁。設定頁可調整下載名稱、Windows 絕對目錄、Proxy 類型／主機／連接埠／帳號及本次密碼；同名檔案出現時可直接選擇「覆蓋」或「取消任務」，覆蓋只會在新檔案完整下載並驗證後替換舊檔。「使用 Firefox」會重新建立 Firefox 下載，「取消」會清理該項目。
 
 ### 程式生命週期
+
+ChatGPT 的 `blob:` 下載會在網頁內、Firefox 寫入檔案之前攔截。成功的 `Response.blob()` 若能對應到同一分頁及 frame 的確切 HTTP GET 請求，便可把原網址及捕捉到的授權交給 Curl Downloader。網頁自行產生的 Blob 或無法確認的請求仍會顯示選框，但停用 Curl 提交並保留「使用 Firefox」。作出選擇前，請保留原 ChatGPT 分頁；更新 XPI 後須重新整理 ChatGPT 頁面，讓新的網頁攔截程式載入。
+
+`python scripts/test-firefox-blob-download.py` 使用隔離的無頭 Firefox，驗證選框及 Firefox 回復下載的檔案內容。需要 Firefox 與 OpenSSL；本機 TLS 測試頁及測試專用 Native Messaging 替身不會使用您的瀏覽器設定或啟動桌面程式。
+
+Native 交接失敗時，設定頁會保留錯誤代碼供診斷；確認 Firefox 備援成功後才顯示已恢復，並停用重複提交。關閉此頁後，可在來源頁重新按下載。測試腳本加上 --reject-native 可驗證交接被拒及後續連續下載；--probe-native 則只讀取已註冊 Native host 狀態，不啟動 GUI 或提交任務。
+
+需要登入的下載會沿用 Firefox 實際送出的授權標頭；缺少 Cookie 時，插件只查詢下載網址及原容器的未分割 Cookie。更新插件時須允許新增的 Cookie 權限。分割 Cookie 或第一方隔離依賴 Firefox 捕捉到的實際請求；過期的授權可在 Firefox 重新授權。網站若要求瀏覽器專用驗證，仍可能需要使用 Firefox 完成下載。
 
 插件第一次需要主程式時，會啟動同一份 `CurlDownloader.exe`，以最小化及系統匣常駐方式運行；整個系統只維持一個 Curl Downloader 主程序。
 

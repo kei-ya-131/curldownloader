@@ -13,7 +13,7 @@ use std::{
     process::{Child, Stdio},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{self, Receiver, Sender},
     },
     thread,
@@ -217,24 +217,54 @@ pub fn validate_segment(path: &Path, start: u64, end: u64) -> io::Result<()> {
 }
 
 pub fn merge_segments(parts: &[PathBuf], output: &Path, expected: u64) -> io::Result<()> {
-    let mut writer = BufWriter::new(
-        OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(output)?,
-    );
-    for part in parts {
-        io::copy(&mut BufReader::new(File::open(part)?), &mut writer)?;
+    merge_segments_cancellable(parts, output, expected, None)
+}
+
+fn merge_segments_cancellable(
+    parts: &[PathBuf],
+    output: &Path,
+    expected: u64,
+    cancelled: Option<&Mutex<FinalizationControl>>,
+) -> io::Result<()> {
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(output)?;
+    let result = (|| {
+        let mut writer = BufWriter::new(file);
+        let mut buffer = vec![0; 1024 * 1024];
+        for part in parts {
+            let mut reader = BufReader::new(File::open(part)?);
+            loop {
+                if cancelled.is_some_and(|cancel| {
+                    cancel
+                        .lock()
+                        .map(|control| control.cancelled)
+                        .unwrap_or(true)
+                }) {
+                    return Err(io::Error::new(io::ErrorKind::Interrupted, "整合已取消"));
+                }
+                let count = reader.read(&mut buffer)?;
+                if count == 0 {
+                    break;
+                }
+                writer.write_all(&buffer[..count])?;
+            }
+        }
+        writer.flush()?;
+        writer.get_ref().sync_all()?;
+        if fs::metadata(output)?.len() != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "整合後檔案大小錯誤",
+            ));
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(output);
     }
-    writer.flush()?;
-    writer.get_ref().sync_all()?;
-    if fs::metadata(output)?.len() != expected {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "整合後檔案大小錯誤",
-        ));
-    }
-    Ok(())
+    result
 }
 
 pub fn finalize_file(merged: &Path, target: &Path) -> io::Result<()> {
@@ -287,11 +317,11 @@ pub fn replace_file(merged: &Path, target: &Path) -> io::Result<()> {
     }
 }
 
-fn replace_file_if_unchanged(
-    merged: &Path,
+fn replace_file_if_unchanged_guarded(
     target: &Path,
     expected: &Option<TargetFingerprint>,
-) -> io::Result<()> {
+    mut allow_commit: impl FnMut() -> io::Result<bool>,
+) -> io::Result<bool> {
     let current = storage::target_fingerprint_with_digest(target)?;
     if !fingerprints_match(expected.as_ref(), current.as_ref()) {
         return Err(io::Error::new(
@@ -299,7 +329,7 @@ fn replace_file_if_unchanged(
             "目標檔案在整合期間已變更，拒絕覆蓋",
         ));
     }
-    replace_file(merged, target)
+    allow_commit()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -313,6 +343,7 @@ enum JobKind {
 struct ActiveJob {
     task_id: TaskId,
     segment: Option<u8>,
+    response_range: Option<(u64, u64)>,
     kind: JobKind,
     child: Child,
     header_path: PathBuf,
@@ -320,6 +351,35 @@ struct ActiveJob {
     stop: bool,
     started_at: Instant,
     started_unix_ms: u64,
+}
+
+enum FinalizationOutcome {
+    Completed,
+    AwaitingDecision(Option<TargetFingerprint>),
+    Cancelled,
+    Failed(io::Error),
+}
+
+struct FinalizationComplete {
+    task_id: TaskId,
+    outcome: FinalizationOutcome,
+}
+
+struct FinalizationRequest {
+    work: PathBuf,
+    target: PathBuf,
+    segmented: bool,
+    parts: Vec<PathBuf>,
+    expected_size: Option<u64>,
+    approved_target: Option<TargetFingerprint>,
+    overwrite_approved: bool,
+    cancelled: Arc<Mutex<FinalizationControl>>,
+}
+
+#[derive(Default)]
+struct FinalizationControl {
+    cancelled: bool,
+    committed: bool,
 }
 
 struct Engine {
@@ -332,12 +392,18 @@ struct Engine {
     queue: VecDeque<TaskId>,
     range_probe: HashSet<TaskId>,
     pending_start: HashSet<TaskId>,
+    pending_work_cleanup: HashMap<TaskId, Vec<DownloadTask>>,
+    pending_task_removal: HashSet<TaskId>,
+    finalizations: HashMap<TaskId, Arc<Mutex<FinalizationControl>>>,
+    finalization_events: Receiver<FinalizationComplete>,
+    finalization_sender: Sender<FinalizationComplete>,
     meters: HashMap<TaskId, ProgressMeter>,
     runtime: Option<CurlRuntime>,
     curl_source: CurlSource,
     events: Sender<EngineEvent>,
     metrics: Arc<EngineMetrics>,
     shutting_down: bool,
+    persist_error_reported: AtomicBool,
 }
 
 impl Engine {
@@ -347,6 +413,7 @@ impl Engine {
         events: Sender<EngineEvent>,
         metrics: Arc<EngineMetrics>,
     ) -> Self {
+        let (finalization_sender, finalization_events) = mpsc::channel();
         let mut runtime_contexts = HashMap::new();
         let mut state_dirty = false;
         for task in &mut state.tasks {
@@ -361,7 +428,11 @@ impl Engine {
                 {
                     match request_context::restore(&task.request_context) {
                         Ok(Some(context)) => {
+                            let final_url = context.final_url().to_owned();
                             runtime_contexts.insert(task.id, context);
+                            task.original_url = final_url;
+                            task.effective_url = None;
+                            state_dirty = true;
                             if task.request_context.encrypted.is_some()
                                 && task.authorization == SourceAuthorization::Public
                             {
@@ -391,20 +462,38 @@ impl Engine {
                 continue;
             }
             let _ = storage::cleanup_task_work_dir(task);
-            if task.request_context.public.is_some() || task.request_context.encrypted.is_some() {
-                let protected = task.request_context.was_protected
-                    || task.request_context.encrypted.is_some()
-                    || matches!(
-                        task.authorization,
-                        SourceAuthorization::Encrypted
-                            | SourceAuthorization::NeedsFirefox
-                            | SourceAuthorization::DecryptionFailed
-                    );
+            let has_context =
+                task.request_context.public.is_some() || task.request_context.encrypted.is_some();
+            let protected = task.request_context.was_protected
+                || task.request_context.encrypted.is_some()
+                || matches!(
+                    task.authorization,
+                    SourceAuthorization::Encrypted
+                        | SourceAuthorization::NeedsFirefox
+                        | SourceAuthorization::DecryptionFailed
+                        | SourceAuthorization::ProtectedCleared
+                );
+            if has_context {
                 request_context::clear_secret_material(&mut task.request_context);
-                if protected {
-                    task.authorization = SourceAuthorization::ProtectedCleared;
-                }
                 state_dirty = true;
+            }
+            if protected {
+                let redacted_original = request_context::redacted_task_url(&task.original_url);
+                let redacted_effective = task
+                    .effective_url
+                    .as_deref()
+                    .map(request_context::redacted_task_url);
+                if task.original_url != redacted_original
+                    || task.effective_url != redacted_effective
+                    || !task.request_context.was_protected
+                    || task.authorization != SourceAuthorization::ProtectedCleared
+                {
+                    state_dirty = true;
+                }
+                task.original_url = redacted_original;
+                task.effective_url = redacted_effective;
+                task.request_context.was_protected = true;
+                task.authorization = SourceAuthorization::ProtectedCleared;
             }
         }
         if state_dirty {
@@ -420,12 +509,18 @@ impl Engine {
             queue: VecDeque::new(),
             range_probe: HashSet::new(),
             pending_start: HashSet::new(),
+            pending_work_cleanup: HashMap::new(),
+            pending_task_removal: HashSet::new(),
+            finalizations: HashMap::new(),
+            finalization_events,
+            finalization_sender,
             meters: HashMap::new(),
             runtime: None,
             curl_source: CurlSource::NotStarted,
             events,
             metrics,
             shutting_down: false,
+            persist_error_reported: AtomicBool::new(false),
         }
     }
 
@@ -437,8 +532,12 @@ impl Engine {
                 self.handle_command(command);
             }
             self.poll_jobs();
+            self.poll_finalizations();
+            self.cleanup_stopped_task_work_dirs();
+            self.remove_stopped_tasks();
+            self.resume_pending_starts();
             if self.shutting_down {
-                if self.active.is_empty() {
+                if self.active.is_empty() && self.finalizations.is_empty() {
                     self.refresh_progress();
                     for task in &mut self.tasks {
                         if !matches!(
@@ -740,13 +839,19 @@ impl Engine {
         self.queue.retain(|queued| *queued != id);
         self.pending_start.remove(&id);
         self.range_probe.remove(&id);
+        self.schedule_work_cleanup(id, task.clone());
         if let Some(task) = self.task_mut(id) {
-            task.original_url = new_initial;
+            // Continue from the exact resource that supplied the newly captured
+            // authorization context. Curl must not fetch the redirect origin
+            // and attach these credentials to it again.
+            task.original_url = new_final;
             task.effective_url = None;
             task.total_size = None;
             task.etag = None;
             task.last_modified = None;
             task.range_support = RangeSupport::Unknown;
+            task.segments.clear();
+            task.actual_segments = 1;
             task.request_context = stored;
             task.authorization = authorization;
             task.reauthorization_requested = false;
@@ -801,15 +906,22 @@ impl Engine {
         let destination_changed = self
             .task(id)
             .is_some_and(|task| task.target_dir != target_dir || task.filename != filename_value);
-        if source_changed || destination_changed {
+        let requested_segments = requested_segments.clamp(1, 8);
+        let segment_layout_changed = self.task(id).is_some_and(|task| {
+            task.total_size.is_some()
+                && task.requested_segments != requested_segments
+                && (task.actual_segments > 1 || requested_segments > 1)
+        });
+        if source_changed || destination_changed || segment_layout_changed {
             self.stop_task_jobs(id);
+            if self.finalizations.contains_key(&id) && !self.cancel_pending_finalization(id) {
+                return;
+            }
             self.queue.retain(|queued| *queued != id);
             self.pending_start.remove(&id);
             self.range_probe.remove(&id);
-            if destination_changed {
-                if let Some(previous) = self.task(id).cloned() {
-                    let _ = storage::cleanup_task_work_dir(&previous);
-                }
+            if let Some(previous) = self.task(id).cloned() {
+                self.schedule_work_cleanup(id, previous);
             }
         }
         let needs_password = proxy.enabled && proxy.requires_password && proxy.password.is_none();
@@ -824,7 +936,7 @@ impl Engine {
         task.original_url = url;
         task.filename = safe_filename;
         task.target_dir = target_dir;
-        task.requested_segments = requested_segments.clamp(1, 8);
+        task.requested_segments = requested_segments;
         task.proxy = proxy;
         if source_changed || destination_changed {
             task.effective_url = None;
@@ -841,6 +953,11 @@ impl Engine {
             } else {
                 task.status = TaskStatus::Queued;
             }
+        } else if segment_layout_changed {
+            task.segments.clear();
+            task.actual_segments = 1;
+            task.last_error = None;
+            task.status = TaskStatus::Paused;
         } else if needs_password {
             task.status = TaskStatus::NeedsProxyPassword;
         }
@@ -915,6 +1032,11 @@ impl Engine {
     }
 
     fn request_start(&mut self, id: TaskId) {
+        self.cleanup_stopped_task_work_dirs();
+        if self.pending_work_cleanup.contains_key(&id) || self.finalizations.contains_key(&id) {
+            self.pending_start.insert(id);
+            return;
+        }
         let Some(status) = self.task(id).map(|task| task.status) else {
             return;
         };
@@ -923,6 +1045,10 @@ impl Engine {
                 self.pending_start.insert(id);
             }
             TaskStatus::Queued | TaskStatus::Paused | TaskStatus::Failed => {
+                if self.task_has_active(id) {
+                    self.pending_start.insert(id);
+                    return;
+                }
                 if !self.prepare_target_for_start(id) {
                     return;
                 }
@@ -942,15 +1068,7 @@ impl Engine {
             return false;
         };
         let target = task.target_dir.join(&task.filename);
-        let fingerprint = match if task
-            .pending_target_fingerprint
-            .as_ref()
-            .is_some_and(|value| value.content_digest.is_some())
-        {
-            storage::target_fingerprint_with_digest(&target)
-        } else {
-            storage::target_fingerprint(&target)
-        } {
+        let fingerprint = match storage::target_fingerprint(&target) {
             Ok(fingerprint) => fingerprint,
             Err(error) => {
                 self.fail_task(
@@ -974,7 +1092,7 @@ impl Engine {
         }
         let approved = self.task(id).is_some_and(|task| {
             task.overwrite_approval == Some(FileDecision::Overwrite)
-                && fingerprints_match(
+                && fingerprints_match_preflight(
                     task.pending_target_fingerprint.as_ref(),
                     fingerprint.as_ref(),
                 )
@@ -1014,12 +1132,15 @@ impl Engine {
                 self.pending_start.remove(&id);
                 self.range_probe.remove(&id);
                 self.meters.remove(&id);
+                if let Some(task) = self.task(id).cloned() {
+                    self.schedule_work_cleanup(id, task);
+                }
                 if let Some(task) = self.task_mut(id) {
-                    let _ = storage::cleanup_task_work_dir(task);
                     task.proxy.clear_password();
                     task.external_request_id = None;
                     task.overwrite_approval = None;
                     task.pending_target_fingerprint = None;
+                    task.completed_unix_ms = Some(current_unix_ms());
                     task.status = TaskStatus::Cancelled;
                 }
                 self.clear_task_request_context(id);
@@ -1095,6 +1216,9 @@ impl Engine {
     }
 
     fn pause_task(&mut self, id: TaskId) {
+        if self.finalizations.contains_key(&id) && !self.cancel_pending_finalization(id) {
+            return;
+        }
         self.stop_task_jobs(id);
         self.pending_start.remove(&id);
         self.queue.retain(|queued| *queued != id);
@@ -1118,16 +1242,22 @@ impl Engine {
                 .persist()
                 .map_err(|error| format!("取消任務後無法保存狀態：{error}"));
         }
+        if self.finalizations.contains_key(&id) && !self.cancel_pending_finalization(id) {
+            return Err("檔案已進入提交程序，暫時不能取消。".into());
+        }
         self.stop_task_jobs(id);
         self.queue.retain(|queued| *queued != id);
         self.pending_start.remove(&id);
         if let Some(task) = self.task_mut(id) {
-            let _ = storage::cleanup_task_work_dir(task);
+            task.completed_unix_ms = Some(current_unix_ms());
             task.proxy.clear_password();
             task.external_request_id = None;
             task.overwrite_approval = None;
             task.pending_target_fingerprint = None;
             task.status = TaskStatus::Cancelled;
+        }
+        if let Some(task) = self.task(id).cloned() {
+            self.schedule_work_cleanup(id, task);
         }
         self.clear_task_request_context(id);
         self.persist()
@@ -1138,11 +1268,16 @@ impl Engine {
     fn remove_task(&mut self, id: TaskId) {
         let _ = self.cancel_task(id);
         self.clear_task_request_context(id);
-        let can_remove = self
-            .task(id)
-            .is_some_and(|task| storage::cleanup_task_work_dir(task).is_ok());
+        let can_remove = !self.task_has_active(id)
+            && !self.finalizations.contains_key(&id)
+            && !self.pending_work_cleanup.contains_key(&id)
+            && self
+                .task(id)
+                .is_some_and(|task| storage::cleanup_task_work_dir(task).is_ok());
         if can_remove {
             self.tasks.retain(|task| task.id != id);
+        } else if self.task(id).is_some() {
+            self.pending_task_removal.insert(id);
         }
         let _ = self.persist();
         self.publish_snapshot();
@@ -1157,29 +1292,27 @@ impl Engine {
             .collect::<Vec<_>>();
         for task in &removed {
             self.stop_task_jobs(task.id);
+            self.cancel_pending_finalization(task.id);
             self.queue.retain(|queued| *queued != task.id);
             self.pending_start.remove(&task.id);
             self.range_probe.remove(&task.id);
             self.meters.remove(&task.id);
-            let _ = storage::cleanup_task_work_dir(task);
+            self.schedule_work_cleanup(task.id, task.clone());
+            self.pending_task_removal.insert(task.id);
             self.clear_task_request_context(task.id);
         }
-        self.tasks.retain(|task| {
-            if !matches!(task.status, TaskStatus::Completed | TaskStatus::Cancelled) {
-                return true;
-            }
-            storage::cleanup_task_work_dir(task).is_err()
-        });
+        self.cleanup_stopped_task_work_dirs();
+        self.remove_stopped_tasks();
         let _ = self.persist();
         self.publish_snapshot();
     }
 
     fn retry_terminal_work_dir_cleanup(&self) {
-        for task in self
-            .tasks
-            .iter()
-            .filter(|task| matches!(task.status, TaskStatus::Completed | TaskStatus::Cancelled))
-        {
+        for task in self.tasks.iter().filter(|task| {
+            matches!(task.status, TaskStatus::Completed | TaskStatus::Cancelled)
+                && !self.task_has_active(task.id)
+                && !self.finalizations.contains_key(&task.id)
+        }) {
             let _ = storage::cleanup_task_work_dir(task);
         }
     }
@@ -1206,15 +1339,7 @@ impl Engine {
             return;
         }
         let target = task.target_dir.join(&task.filename);
-        let fingerprint = match if task
-            .pending_target_fingerprint
-            .as_ref()
-            .is_some_and(|value| value.content_digest.is_some())
-        {
-            storage::target_fingerprint_with_digest(&target)
-        } else {
-            storage::target_fingerprint(&target)
-        } {
+        let fingerprint = match storage::target_fingerprint(&target) {
             Ok(fingerprint) => fingerprint,
             Err(error) => {
                 self.fail_task(
@@ -1231,7 +1356,7 @@ impl Engine {
         };
         if fingerprint.is_some()
             && !(task.overwrite_approval == Some(FileDecision::Overwrite)
-                && fingerprints_match(
+                && fingerprints_match_preflight(
                     task.pending_target_fingerprint.as_ref(),
                     fingerprint.as_ref(),
                 ))
@@ -1410,6 +1535,7 @@ impl Engine {
             work.join(format!("headers-{suffix}.txt"))
         };
         let mut metadata_path = None;
+        let mut response_range = None;
         let mut spec: CurlCommandSpec;
         let request_context = self.runtime_contexts.get(&task.id);
         let stdout = match kind {
@@ -1465,6 +1591,16 @@ impl Engine {
                 let existing = fs::metadata(&output)
                     .map(|metadata| metadata.len())
                     .unwrap_or(0);
+                response_range = Some(
+                    resume_offset(segment_state.start, segment_state.end, existing)?.ok_or_else(
+                        || {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "完整分段不應再啟動 Range 要求",
+                            )
+                        },
+                    )?,
+                );
                 spec = curl::build_segment_transfer(
                     &task.proxy,
                     request_context,
@@ -1501,6 +1637,7 @@ impl Engine {
             ActiveJob {
                 task_id: task.id,
                 segment,
+                response_range,
                 kind,
                 child,
                 header_path,
@@ -1566,6 +1703,81 @@ impl Engine {
                     headers,
                 },
             );
+        }
+    }
+
+    fn cleanup_stopped_task_work_dirs(&mut self) {
+        let ready = self
+            .pending_work_cleanup
+            .keys()
+            .copied()
+            .filter(|id| !self.task_has_active(*id) && !self.finalizations.contains_key(id))
+            .collect::<Vec<_>>();
+        for id in ready {
+            if let Some(tasks) = self.pending_work_cleanup.get_mut(&id) {
+                tasks.retain(|task| storage::cleanup_task_work_dir(task).is_err());
+                if tasks.is_empty() {
+                    self.pending_work_cleanup.remove(&id);
+                }
+            }
+        }
+    }
+
+    fn schedule_work_cleanup(&mut self, id: TaskId, task: DownloadTask) {
+        let pending = self.pending_work_cleanup.entry(id).or_default();
+        if !pending
+            .iter()
+            .any(|existing| existing.target_dir == task.target_dir)
+        {
+            pending.push(task);
+        }
+    }
+
+    fn remove_stopped_tasks(&mut self) {
+        let ready = self
+            .pending_task_removal
+            .iter()
+            .copied()
+            .filter(|id| {
+                !self.task_has_active(*id)
+                    && !self.finalizations.contains_key(id)
+                    && !self.pending_work_cleanup.contains_key(id)
+            })
+            .collect::<Vec<_>>();
+        let mut removed = false;
+        for id in ready {
+            let can_remove = self
+                .task(id)
+                .is_some_and(|task| storage::cleanup_task_work_dir(task).is_ok());
+            if can_remove {
+                self.tasks.retain(|task| task.id != id);
+                self.pending_task_removal.remove(&id);
+                removed = true;
+            }
+        }
+        if removed {
+            let _ = self.persist();
+            self.publish_snapshot();
+        }
+    }
+
+    fn resume_pending_starts(&mut self) {
+        let ready = self
+            .pending_start
+            .iter()
+            .copied()
+            .filter(|id| !self.task_has_active(*id) && !self.finalizations.contains_key(id))
+            .collect::<Vec<_>>();
+        for id in ready {
+            if self.task(id).is_some_and(|task| {
+                matches!(
+                    task.status,
+                    TaskStatus::Paused | TaskStatus::Queued | TaskStatus::Failed
+                )
+            }) {
+                self.pending_start.remove(&id);
+                self.request_start(id);
+            }
         }
     }
 
@@ -1733,6 +1945,7 @@ impl Engine {
         };
         let path = storage::task_work_dir(&task).join(format!("segment-{segment_index}.part"));
         if let Err(error) = validate_segment(&path, segment.start, segment.end) {
+            self.discard_task_parts(job.task_id);
             self.fail_task(
                 job.task_id,
                 task_error(
@@ -1744,14 +1957,27 @@ impl Engine {
             );
             return;
         }
-        if !outcome.headers.contains(" 206 ") {
+        let total = task.total_size.unwrap_or(0);
+        if let Err(diagnostic) = validate_segment_response_headers(
+            &outcome.headers,
+            (
+                job.response_range
+                    .map(|(start, _)| start)
+                    .unwrap_or(segment.start),
+                segment.end,
+                total,
+                task.etag.as_deref(),
+                task.last_modified.as_deref(),
+            ),
+        ) {
+            self.discard_task_parts(job.task_id);
             self.fail_task(
                 job.task_id,
                 task_error(
                     ErrorKind::SourceChanged,
-                    "來源未回傳分段內容",
-                    "伺服器忽略 Range 要求",
-                    "改用單流或從零重試",
+                    "分段回應與來源資訊不符",
+                    &diagnostic,
+                    "刪除部分資料並從零重試",
                 ),
             );
             return;
@@ -1810,82 +2036,132 @@ impl Engine {
         true
     }
 
+    fn discard_task_parts(&mut self, id: TaskId) {
+        self.stop_task_jobs(id);
+        if let Some(task) = self.task(id).cloned() {
+            self.schedule_work_cleanup(id, task);
+        }
+        if let Some(task) = self.task_mut(id) {
+            for segment in &mut task.segments {
+                segment.downloaded = 0;
+                segment.started_unix_ms = None;
+                segment.completed_unix_ms = None;
+                segment.active_millis = 0;
+            }
+        }
+    }
+
     fn finalize_task(&mut self, id: TaskId) {
+        if self.finalizations.contains_key(&id) {
+            return;
+        }
         let Some(task) = self.task(id).cloned() else {
             return;
         };
         let work = storage::task_work_dir(&task);
         let target = task.target_dir.join(&task.filename);
-        let current_target = match storage::target_fingerprint_with_digest(&target) {
-            Ok(fingerprint) => fingerprint,
-            Err(error) => {
-                self.fail_task(
-                    id,
-                    task_error(
-                        ErrorKind::Disk,
-                        "無法讀取目標檔案",
-                        &error.to_string(),
-                        "檢查目標檔案權限",
-                    ),
-                );
-                return;
-            }
-        };
-        if current_target.is_some()
-            && (task.overwrite_approval != Some(FileDecision::Overwrite)
-                || !fingerprints_match(
-                    task.pending_target_fingerprint.as_ref(),
-                    current_target.as_ref(),
-                ))
-        {
-            if let Some(task) = self.task_mut(id) {
-                task.pending_target_fingerprint = current_target;
-                task.overwrite_approval = None;
-                task.status = TaskStatus::AwaitingFileDecision;
-            }
-            let _ = self.persist();
-            self.publish_snapshot();
-            return;
-        }
         if let Some(task) = self.task_mut(id) {
             task.status = TaskStatus::Finalizing;
         }
-        let result = if task.actual_segments > 1 {
-            let parts = task
-                .segments
-                .iter()
-                .map(|segment| work.join(format!("segment-{}.part", segment.index)))
-                .collect::<Vec<_>>();
-            let merged = work.join("merged.part");
-            merge_segments(&parts, &merged, task.total_size.unwrap_or(0))
-                .and_then(|_| replace_file_if_unchanged(&merged, &target, &current_target))
-        } else {
-            replace_file_if_unchanged(&work.join("payload.part"), &target, &current_target)
-        };
-        if let Err(error) = result {
+        let cancel = Arc::new(Mutex::new(FinalizationControl::default()));
+        self.finalizations.insert(id, Arc::clone(&cancel));
+        let sender = self.finalization_sender.clone();
+        let parts = task
+            .segments
+            .iter()
+            .map(|segment| work.join(format!("segment-{}.part", segment.index)))
+            .collect::<Vec<_>>();
+        let expected_size = task.total_size;
+        let expected_target = task.pending_target_fingerprint.clone();
+        let approved = task.overwrite_approval == Some(FileDecision::Overwrite);
+        let segmented = task.actual_segments > 1;
+        let spawned = thread::Builder::new()
+            .name(format!("finalize-download-{id}"))
+            .spawn(move || {
+                let outcome = run_finalization(FinalizationRequest {
+                    work,
+                    target,
+                    segmented,
+                    parts,
+                    expected_size,
+                    approved_target: expected_target,
+                    overwrite_approved: approved,
+                    cancelled: cancel,
+                });
+                let _ = sender.send(FinalizationComplete {
+                    task_id: id,
+                    outcome,
+                });
+            });
+        if let Err(error) = spawned {
+            self.finalizations.remove(&id);
             self.fail_task(
                 id,
                 task_error(
-                    ErrorKind::Disk,
-                    "整合檔案失敗",
+                    ErrorKind::Internal,
+                    "無法啟動檔案整合工作",
                     &error.to_string(),
-                    "保留部分資料後重試",
+                    "重試下載",
                 ),
             );
             return;
         }
-        let _ = storage::cleanup_task_work_dir(&task);
-        self.clear_task_request_context(id);
-        if let Some(task) = self.task_mut(id) {
-            task.proxy.clear_password();
-            task.overwrite_approval = None;
-            task.pending_target_fingerprint = None;
-            task.last_error = None;
-            task.completed_unix_ms = Some(current_unix_ms());
-            task.status = TaskStatus::Completed;
-        }
         let _ = self.persist();
         self.publish_snapshot();
+    }
+
+    fn cancel_pending_finalization(&mut self, id: TaskId) -> bool {
+        if let Some(cancel) = self.finalizations.get(&id)
+            && let Ok(mut control) = cancel.lock()
+        {
+            if control.committed {
+                return false;
+            }
+            control.cancelled = true;
+        }
+        true
+    }
+
+    fn poll_finalizations(&mut self) {
+        while let Ok(completion) = self.finalization_events.try_recv() {
+            self.finalizations.remove(&completion.task_id);
+            let id = completion.task_id;
+            match completion.outcome {
+                FinalizationOutcome::Completed => {
+                    if let Some(task) = self.task(id).cloned() {
+                        let _ = storage::cleanup_task_work_dir(&task);
+                    }
+                    self.clear_task_request_context(id);
+                    if let Some(task) = self.task_mut(id) {
+                        task.proxy.clear_password();
+                        task.overwrite_approval = None;
+                        task.pending_target_fingerprint = None;
+                        task.last_error = None;
+                        task.completed_unix_ms = Some(current_unix_ms());
+                        task.status = TaskStatus::Completed;
+                    }
+                }
+                FinalizationOutcome::AwaitingDecision(fingerprint) => {
+                    if let Some(task) = self.task_mut(id) {
+                        task.pending_target_fingerprint = fingerprint;
+                        task.overwrite_approval = None;
+                        task.status = TaskStatus::AwaitingFileDecision;
+                    }
+                }
+                FinalizationOutcome::Cancelled => {}
+                FinalizationOutcome::Failed(error) => self.fail_task(
+                    id,
+                    task_error(
+                        ErrorKind::Disk,
+                        "整合檔案失敗",
+                        &error.to_string(),
+                        "保留部分資料後重試",
+                    ),
+                ),
+            }
+            let _ = self.persist();
+            self.publish_snapshot();
+        }
     }
 
     fn record_job_elapsed(&mut self, job: &ActiveJob) {
@@ -1935,6 +2211,12 @@ impl Engine {
                 request_context::clear_secret_material(&mut task.request_context);
             }
             if protected {
+                task.original_url = request_context::redacted_task_url(&task.original_url);
+                task.effective_url = task
+                    .effective_url
+                    .as_deref()
+                    .map(request_context::redacted_task_url);
+                task.request_context.was_protected = true;
                 task.authorization = SourceAuthorization::ProtectedCleared;
             }
         }
@@ -2068,14 +2350,25 @@ impl Engine {
     }
 
     fn persist(&self) -> io::Result<()> {
-        storage::save_state(
+        let result = storage::save_state(
             &self.state_path,
             &PersistedState {
                 schema_version: CURRENT_SCHEMA_VERSION,
                 settings: self.settings.clone(),
                 tasks: self.tasks.clone(),
             },
-        )
+        );
+        match &result {
+            Ok(()) => self.persist_error_reported.store(false, Ordering::Release),
+            Err(error) => {
+                if !self.persist_error_reported.swap(true, Ordering::AcqRel) {
+                    let _ = self
+                        .events
+                        .send(EngineEvent::Fatal(format!("無法保存下載狀態：{error}")));
+                }
+            }
+        }
+        result
     }
 
     fn clear_passwords(&mut self) {
@@ -2083,6 +2376,110 @@ impl Engine {
             task.proxy.clear_password();
         }
     }
+}
+
+fn run_finalization(request: FinalizationRequest) -> FinalizationOutcome {
+    let FinalizationRequest {
+        work,
+        target,
+        segmented,
+        parts,
+        expected_size,
+        approved_target,
+        overwrite_approved,
+        cancelled,
+    } = request;
+    let current_target = match storage::target_fingerprint_with_digest(&target) {
+        Ok(fingerprint) => fingerprint,
+        Err(error) => return FinalizationOutcome::Failed(error),
+    };
+    if is_finalization_cancelled(&cancelled) {
+        return FinalizationOutcome::Cancelled;
+    }
+    if current_target.is_some()
+        && !(overwrite_approved
+            && fingerprints_match(approved_target.as_ref(), current_target.as_ref()))
+    {
+        return FinalizationOutcome::AwaitingDecision(current_target);
+    }
+    let merged = if segmented {
+        static NEXT_MERGE_ID: AtomicUsize = AtomicUsize::new(1);
+        let merge_id = NEXT_MERGE_ID.fetch_add(1, Ordering::Relaxed);
+        let merged = work.join(format!("merged-{}-{merge_id}.part", std::process::id()));
+        let Some(expected_size) = expected_size else {
+            return FinalizationOutcome::Failed(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "分段下載缺少來源總大小",
+            ));
+        };
+        if let Err(error) =
+            merge_segments_cancellable(&parts, &merged, expected_size, Some(&cancelled))
+        {
+            if error.kind() == io::ErrorKind::Interrupted && is_finalization_cancelled(&cancelled) {
+                return FinalizationOutcome::Cancelled;
+            }
+            return FinalizationOutcome::Failed(error);
+        }
+        merged
+    } else {
+        let payload = work.join("payload.part");
+        match fs::metadata(&payload) {
+            Ok(metadata) if expected_size.is_none_or(|expected| metadata.len() == expected) => {
+                payload
+            }
+            Ok(metadata) => {
+                return FinalizationOutcome::Failed(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "下載大小錯誤：預期 {expected_size:?}，實際 {}",
+                        metadata.len()
+                    ),
+                ));
+            }
+            Err(error) => return FinalizationOutcome::Failed(error),
+        }
+    };
+
+    let commit_result = replace_file_if_unchanged_guarded(&target, &current_target, || {
+        let mut control = cancelled
+            .lock()
+            .map_err(|_| io::Error::other("finalization cancellation lock poisoned"))?;
+        if control.cancelled {
+            return Ok(false);
+        }
+        replace_file(&merged, &target)?;
+        control.committed = true;
+        Ok(true)
+    });
+    match commit_result {
+        Ok(true) => FinalizationOutcome::Completed,
+        Ok(false) => {
+            if segmented {
+                let _ = fs::remove_file(&merged);
+            }
+            FinalizationOutcome::Cancelled
+        }
+        Err(error) => {
+            if segmented {
+                let _ = fs::remove_file(&merged);
+            }
+            if error.kind() == io::ErrorKind::AlreadyExists {
+                match storage::target_fingerprint_with_digest(&target) {
+                    Ok(fingerprint) => FinalizationOutcome::AwaitingDecision(fingerprint),
+                    Err(error) => FinalizationOutcome::Failed(error),
+                }
+            } else {
+                FinalizationOutcome::Failed(error)
+            }
+        }
+    }
+}
+
+fn is_finalization_cancelled(cancelled: &Mutex<FinalizationControl>) -> bool {
+    cancelled
+        .lock()
+        .map(|control| control.cancelled)
+        .unwrap_or(true)
 }
 
 fn current_unix_ms() -> u64 {
@@ -2107,6 +2504,23 @@ fn fingerprints_match(
                 && expected
                     .content_digest
                     .is_none_or(|digest| current.content_digest == Some(digest))
+        }
+        _ => false,
+    }
+}
+
+fn fingerprints_match_preflight(
+    expected: Option<&TargetFingerprint>,
+    current: Option<&TargetFingerprint>,
+) -> bool {
+    match (expected, current) {
+        (None, None) => true,
+        (Some(expected), Some(current)) => {
+            expected.length == current.length
+                && expected.modified_unix_nanos == current.modified_unix_nanos
+                && expected
+                    .file_identity
+                    .is_none_or(|identity| current.file_identity == Some(identity))
         }
         _ => false,
     }
@@ -2239,6 +2653,54 @@ fn transfer_error_kind(task: &DownloadTask, exit_code: i32, headers: &str) -> Er
         return ErrorKind::Http;
     }
     ErrorKind::Network
+}
+
+fn validate_segment_response_headers(
+    headers: &str,
+    expected: (u64, u64, u64, Option<&str>, Option<&str>),
+) -> Result<(), String> {
+    let normalized = headers.replace("\r\n", "\n");
+    let block = normalized
+        .rsplit("\n\n")
+        .find(|block| block.trim_start().starts_with("HTTP/"))
+        .ok_or_else(|| "找不到分段 HTTP 回應標頭".to_owned())?;
+    let mut lines = block.lines();
+    let status = lines
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|status| status.parse::<u16>().ok());
+    if status != Some(206) {
+        return Err(format!("最後一個 HTTP 回應狀態不是 206：{status:?}"));
+    }
+    let mut content_range = None;
+    let mut etag = None;
+    let mut last_modified = None;
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        match name.trim().to_ascii_lowercase().as_str() {
+            "content-range" => content_range = Some(value.trim()),
+            "etag" => etag = Some(value.trim()),
+            "last-modified" => last_modified = Some(value.trim()),
+            _ => {}
+        }
+    }
+    let (start, end, total, expected_etag, expected_modified) = expected;
+    let expected_range = format!("bytes {start}-{end}/{total}");
+    if content_range != Some(expected_range.as_str()) {
+        return Err(format!(
+            "Content-Range 不符：預期 {expected_range}，實際 {}",
+            content_range.unwrap_or("缺少")
+        ));
+    }
+    if expected_etag.is_some_and(|expected| etag != Some(expected)) {
+        return Err("回應 ETag 與探測時的來源版本不符".into());
+    }
+    if expected_modified.is_some_and(|expected| last_modified != Some(expected)) {
+        return Err("回應 Last-Modified 與探測時的來源版本不符".into());
+    }
+    Ok(())
 }
 
 fn task_error(kind: ErrorKind, summary: &str, diagnostic: &str, action: &str) -> TaskError {
@@ -2408,6 +2870,61 @@ mod tests {
 
         assert!(!can_finalize_task(&task, true));
         assert!(can_finalize_task(&task, false));
+    }
+
+    #[test]
+    fn segment_response_validation_uses_last_status_exact_range_total_and_validators() {
+        let expected = (
+            10,
+            19,
+            100,
+            Some("\"v1\""),
+            Some("Wed, 21 Oct 2015 07:28:00 GMT"),
+        );
+        let valid = "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 10-19/100\r\nETag: \"v1\"\r\nLast-Modified: Wed, 21 Oct 2015 07:28:00 GMT\r\n\r\n";
+        assert!(validate_segment_response_headers(valid, expected).is_ok());
+        assert!(validate_segment_response_headers(
+            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 10-19/100\r\n\r\nHTTP/1.1 200 OK\r\n\r\n",
+            expected,
+        )
+        .is_err());
+        assert!(validate_segment_response_headers(
+            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 9-19/100\r\nETag: \"v1\"\r\nLast-Modified: Wed, 21 Oct 2015 07:28:00 GMT\r\n\r\n",
+            expected,
+        )
+        .is_err());
+        assert!(validate_segment_response_headers(
+            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 10-19/101\r\nETag: \"v1\"\r\nLast-Modified: Wed, 21 Oct 2015 07:28:00 GMT\r\n\r\n",
+            expected,
+        )
+        .is_err());
+        assert!(validate_segment_response_headers(
+            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 10-19/100\r\nETag: \"v2\"\r\nLast-Modified: Wed, 21 Oct 2015 07:28:00 GMT\r\n\r\n",
+            expected,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn preflight_uses_metadata_while_final_commit_still_requires_digest() {
+        let expected = TargetFingerprint {
+            length: 10,
+            modified_unix_nanos: Some(20),
+            file_identity: Some([1, 2]),
+            content_digest: Some([3; 32]),
+        };
+        let current_metadata = TargetFingerprint {
+            content_digest: None,
+            ..expected.clone()
+        };
+        assert!(fingerprints_match_preflight(
+            Some(&expected),
+            Some(&current_metadata)
+        ));
+        assert!(!fingerprints_match(
+            Some(&expected),
+            Some(&current_metadata)
+        ));
     }
 
     #[test]

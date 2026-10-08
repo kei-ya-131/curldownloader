@@ -4,3 +4,4 @@
 /dist/
 /.superpowers/
 /docs/superpowers/
+__pycache__/

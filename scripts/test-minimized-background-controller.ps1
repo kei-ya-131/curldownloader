@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$ExecutablePath,
     [switch]$SkipNativeMessaging
@@ -230,7 +230,7 @@ public static class CurlDownloaderSmokeFakeShell
         PostThreadMessage(threadId, WM_QUIT, IntPtr.Zero, IntPtr.Zero);
         thread.Join(3000);
         thread = null;
-        ready?.Dispose();
+        if (ready != null) ready.Dispose();
         ready = null;
     }
 }
@@ -244,6 +244,7 @@ $probeProcess = $null
 $nativeSession = $null
 $oldTestEnvironment = [Environment]::GetEnvironmentVariable('CURL_DOWNLOADER_TEST_SHUTDOWN_MANUAL', 'Process')
 $oldNativeClientEnvironment = [Environment]::GetEnvironmentVariable('CURL_DOWNLOADER_TEST_NATIVE_CLIENT', 'Process')
+$oldGpuDiagnosticEnvironment = [Environment]::GetEnvironmentVariable('CURL_DOWNLOADER_TEST_GPU_DIAGNOSTIC', 'Process')
 $fakeShellStarted = $false
 
 function Read-Exact {
@@ -282,6 +283,7 @@ function Send-NativeRequest {
     )
 
     if ($Session.HasExited) { throw "Native host 已退出：$($Session.ExitCode)" }
+    Write-Verbose "Native smoke request: $($Request.type)"
     $json = $Request | ConvertTo-Json -Compress
     $body = [Text.Encoding]::UTF8.GetBytes($json)
     $frame = [byte[]]::new(4 + $body.Length)
@@ -291,7 +293,15 @@ function Send-NativeRequest {
     $Session.StandardInput.BaseStream.Flush()
 
     $lengthBytes = [byte[]]::new(4)
-    Read-Exact -Stream $Session.StandardOutput.BaseStream -Buffer $lengthBytes
+    try {
+        Read-Exact -Stream $Session.StandardOutput.BaseStream -Buffer $lengthBytes
+    } catch {
+        if ($Session.WaitForExit(1000)) {
+            $nativeError = $Session.StandardError.ReadToEnd()
+            throw "Native request $($Request.type) failed (exit $($Session.ExitCode)): $nativeError"
+        }
+        throw
+    }
     $length = [BitConverter]::ToUInt32($lengthBytes, 0)
     if ($length -gt 4MB) { throw 'Native host 回覆超過測試上限。' }
     $responseBytes = [byte[]]::new($length)
@@ -382,7 +392,10 @@ try {
 
     $env:CURL_DOWNLOADER_TEST_SHUTDOWN_MANUAL = '1'
     $env:CURL_DOWNLOADER_TEST_NATIVE_CLIENT = '1'
-    $probeProcess = Start-Process -FilePath $probeExecutable -ArgumentList @('--minimized', '--skip-native-registration') -WorkingDirectory $temporaryDirectory -WindowStyle Hidden -PassThru
+    $gpuDiagnosticPath = Join-Path $temporaryDirectory 'gpu-diagnostic.log'
+    $gpuAdapterPath = Join-Path $temporaryDirectory 'gpu-adapter.txt'
+    if (-not $SkipNativeMessaging) { $env:CURL_DOWNLOADER_TEST_GPU_DIAGNOSTIC = $gpuAdapterPath }
+    $probeProcess = Start-Process -FilePath $probeExecutable -ArgumentList @('--minimized', '--skip-native-registration') -WorkingDirectory $temporaryDirectory -WindowStyle Hidden -RedirectStandardError $gpuDiagnosticPath -PassThru
     Wait-For -FailureMessage '最小化 CurlDownloader 未能在 5 秒內啟動。' -Condition {
         -not $probeProcess.HasExited
     }
@@ -392,6 +405,7 @@ try {
             $main = Get-ProcessWindow -ProcessId $probeProcess.Id
             $main -ne [IntPtr]::Zero -and -not [CurlDownloaderSmokeWin32]::IsWindowVisible($main)
         }
+        Get-Content -LiteralPath $gpuDiagnosticPath | Where-Object { $_ -like 'Curl Downloader GPU:*' } | Write-Output
         Write-Output '最小化背景控制器 smoke test 通過：release EXE 已啟動並維持隱藏。Native Messaging 驗證由受控 smoke probe 執行。'
         return
     }
@@ -462,6 +476,8 @@ try {
         $main = Get-ProcessWindow -ProcessId $probeProcess.Id
         $main -ne [IntPtr]::Zero -and [CurlDownloaderSmokeWin32]::IsWindowVisible($main)
     }
+    Wait-For -FailureMessage 'Smoke probe 沒有記錄實際 GPU。' -Condition { Test-Path -LiteralPath $gpuAdapterPath }
+    Write-Output "GPU adapter: $([IO.File]::ReadAllText($gpuAdapterPath))"
     if ($trayAvailable -and -not $fakeShellStarted) {
         Wait-For -FailureMessage 'show_window 沒有把同一 GUI 帶到最前面。' -Condition {
             $main = Get-ProcessWindow -ProcessId $probeProcess.Id
@@ -581,6 +597,11 @@ try {
         Remove-Item Env:CURL_DOWNLOADER_TEST_NATIVE_CLIENT -ErrorAction SilentlyContinue
     } else {
         $env:CURL_DOWNLOADER_TEST_NATIVE_CLIENT = $oldNativeClientEnvironment
+    }
+    if ($null -eq $oldGpuDiagnosticEnvironment) {
+        Remove-Item Env:CURL_DOWNLOADER_TEST_GPU_DIAGNOSTIC -ErrorAction SilentlyContinue
+    } else {
+        $env:CURL_DOWNLOADER_TEST_GPU_DIAGNOSTIC = $oldGpuDiagnosticEnvironment
     }
     if (Test-Path -LiteralPath $temporaryDirectory) {
         $resolvedTemporaryDirectory = [IO.Path]::GetFullPath($temporaryDirectory)

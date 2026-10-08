@@ -7,6 +7,7 @@ use std::{
     io::{self, Read, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -100,9 +101,19 @@ pub fn launch_gui(executable: &Path, minimized: bool) -> io::Result<Child> {
 pub fn run_native_host() -> Result<(), String> {
     let stdin = io::stdin();
     let stdout = io::stdout();
-    run_native_host_io_with_hook(stdin.lock(), stdout.lock(), |_| {
-        let _ = session_shutdown::spawn_native_exit_monitor();
-    })
+    let response_gate = Arc::new(Mutex::new(()));
+    let monitor_gate = Arc::clone(&response_gate);
+    run_native_host_io_with_processor_and_gate(
+        stdin.lock(),
+        stdout.lock(),
+        process_message,
+        move |_| {
+            let _ = session_shutdown::spawn_native_exit_monitor_with_gate(Some(Arc::clone(
+                &monitor_gate,
+            )));
+        },
+        Some(response_gate),
+    )
     .map_err(|error| error.to_string())
 }
 
@@ -111,6 +122,7 @@ fn run_native_host_io<R: Read, W: Write>(input: R, output: W) -> io::Result<()> 
     run_native_host_io_with_hook(input, output, |_| {})
 }
 
+#[cfg(test)]
 fn run_native_host_io_with_hook<R: Read, W: Write, F: FnMut(&IpcResponse)>(
     input: R,
     output: W,
@@ -119,7 +131,22 @@ fn run_native_host_io_with_hook<R: Read, W: Write, F: FnMut(&IpcResponse)>(
     run_native_host_io_with_processor(input, output, process_message, after_response)
 }
 
+#[cfg(test)]
 fn run_native_host_io_with_processor<
+    R: Read,
+    W: Write,
+    P: FnMut(&[u8]) -> IpcResponse,
+    F: FnMut(&IpcResponse),
+>(
+    input: R,
+    output: W,
+    process: P,
+    after_response: F,
+) -> io::Result<()> {
+    run_native_host_io_with_processor_and_gate(input, output, process, after_response, None)
+}
+
+fn run_native_host_io_with_processor_and_gate<
     R: Read,
     W: Write,
     P: FnMut(&[u8]) -> IpcResponse,
@@ -129,6 +156,7 @@ fn run_native_host_io_with_processor<
     mut output: W,
     mut process: P,
     mut after_response: F,
+    response_gate: Option<Arc<Mutex<()>>>,
 ) -> io::Result<()> {
     let mut hook_called = false;
     loop {
@@ -136,6 +164,10 @@ fn run_native_host_io_with_processor<
             Ok(body) => body,
             Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(_error) => {
+                let _response_guard = response_gate.as_ref().map(|gate| {
+                    gate.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                });
                 let response = error_response(
                     "native-host",
                     "invalid_frame",
@@ -145,6 +177,12 @@ fn run_native_host_io_with_processor<
                 return Ok(());
             }
         };
+        // Never hold this gate while waiting for the next input frame. The
+        // shutdown monitor uses it only to drain a response already in flight.
+        let _response_guard = response_gate.as_ref().map(|gate| {
+            gate.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        });
         // Idempotency is owned by the GUI engine, which persists the request
         // id with the task.  Keeping a host-local replay cache would replay a
         // stale success after the task had been cancelled.
@@ -204,7 +242,11 @@ fn forward_request(
     policy: startup_policy::NativeStartPolicy,
 ) -> io::Result<IpcResponse> {
     let timeout = Duration::from_millis(500);
-    match ipc::call_pipe(request, timeout) {
+    let response_timeout = match request {
+        IpcRequest::PickFolder { .. } => Duration::from_secs(120),
+        _ => Duration::from_secs(10),
+    };
+    match ipc::call_pipe_with_timeouts(request, timeout, response_timeout) {
         Ok(response) => Ok(response),
         Err(error) if should_start_gui(&error) => {
             let state_path = crate::storage::state_path()?;
@@ -228,9 +270,9 @@ fn forward_request(
             } else {
                 None
             };
-            ipc::call_pipe_with_retry_until(
+            ipc::call_pipe_with_retry_until_timeouts(
                 request,
-                Duration::from_millis(100),
+                (Duration::from_millis(100), response_timeout),
                 Duration::from_millis(100),
                 50,
                 || match startup_policy::read_manual_stop(&stop_path) {
@@ -289,7 +331,34 @@ mod tests {
     use std::{
         io,
         path::{Path, PathBuf},
+        sync::mpsc,
+        time::Duration,
     };
+
+    struct FlushBlockingWriter {
+        flush_started: mpsc::Sender<()>,
+        release_flush: mpsc::Receiver<()>,
+        order: Arc<Mutex<Vec<&'static str>>>,
+        bytes: Vec<u8>,
+    }
+
+    impl Write for FlushBlockingWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flush_started
+                .send(())
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            self.release_flush
+                .recv()
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            self.order.lock().unwrap().push("flush");
+            Ok(())
+        }
+    }
 
     #[test]
     fn native_host_starts_gui_only_for_pipe_connection_failure() {
@@ -418,6 +487,78 @@ mod tests {
         )
         .unwrap();
         assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn manual_shutdown_waits_until_in_flight_response_is_flushed_and_hook_finishes() {
+        let mut input = Vec::new();
+        crate::ipc::write_frame(&mut input, br#"{"type":"ping","request_id":"gate-test"}"#)
+            .unwrap();
+        let response_gate = Arc::new(Mutex::new(()));
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let (manual_shutdown_tx, manual_shutdown_rx) = mpsc::channel();
+        let (monitor_attempt_tx, monitor_attempt_rx) = mpsc::channel();
+        let (exit_tx, exit_rx) = mpsc::channel();
+        let monitor_gate = Arc::clone(&response_gate);
+        let monitor_order = Arc::clone(&order);
+        let monitor = std::thread::spawn(move || {
+            manual_shutdown_rx.recv().unwrap();
+            monitor_attempt_tx.send(()).unwrap();
+            let _response_guard = monitor_gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            monitor_order.lock().unwrap().push("exit");
+            exit_tx.send(()).unwrap();
+        });
+
+        let (flush_started_tx, flush_started_rx) = mpsc::channel();
+        let (release_flush_tx, release_flush_rx) = mpsc::channel();
+        let mut output = FlushBlockingWriter {
+            flush_started: flush_started_tx,
+            release_flush: release_flush_rx,
+            order: Arc::clone(&order),
+            bytes: Vec::new(),
+        };
+        let process_signal = manual_shutdown_tx.clone();
+        let response_order = Arc::clone(&order);
+        let runner_gate = Some(Arc::clone(&response_gate));
+        let runner = std::thread::spawn(move || {
+            run_native_host_io_with_processor_and_gate(
+                input.as_slice(),
+                &mut output,
+                move |_| {
+                    process_signal.send(()).unwrap();
+                    IpcResponse::Pong {
+                        request_id: "gate-test".into(),
+                        ok: true,
+                    }
+                },
+                move |_| response_order.lock().unwrap().push("hook"),
+                runner_gate,
+            )
+        });
+
+        flush_started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("response writer did not reach flush");
+        monitor_attempt_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("shutdown monitor did not attempt to acquire the response gate");
+        let shutdown_passed_before_flush =
+            matches!(exit_rx.recv_timeout(Duration::from_millis(50)), Ok(()));
+        release_flush_tx.send(()).unwrap();
+        runner.join().unwrap().unwrap();
+        if !shutdown_passed_before_flush {
+            exit_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("shutdown monitor did not continue after response flush");
+        }
+        monitor.join().unwrap();
+        assert!(
+            !shutdown_passed_before_flush,
+            "shutdown must wait while the response is not flushed"
+        );
+        assert_eq!(*order.lock().unwrap(), ["flush", "hook", "exit"]);
     }
 
     #[test]

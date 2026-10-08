@@ -1,5 +1,6 @@
 use eframe::egui;
 use std::{
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -7,6 +8,51 @@ use std::{
     thread,
     time::Duration,
 };
+
+pub fn pick_download_folder(directory: &Path) -> Option<PathBuf> {
+    let dialog = rfd::FileDialog::new().set_directory(directory);
+    #[cfg(windows)]
+    let dialog = match folder_picker_owner::ForegroundOwner::capture() {
+        Some(owner) => dialog.set_parent(&owner),
+        None => dialog,
+    };
+    dialog.pick_folder()
+}
+
+#[cfg(windows)]
+mod folder_picker_owner {
+    use raw_window_handle::{
+        DisplayHandle, HandleError, HasDisplayHandle, HasWindowHandle, RawWindowHandle,
+        Win32WindowHandle, WindowHandle,
+    };
+    use std::num::NonZeroIsize;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, IsWindowVisible};
+
+    pub(super) struct ForegroundOwner(NonZeroIsize);
+
+    impl ForegroundOwner {
+        pub(super) fn capture() -> Option<Self> {
+            let hwnd = unsafe { GetForegroundWindow() };
+            let hwnd_value = NonZeroIsize::new(hwnd as isize)?;
+            // Use the initiating browser/GUI window, never the hidden main window.
+            (unsafe { IsWindowVisible(hwnd) } != 0).then_some(Self(hwnd_value))
+        }
+    }
+
+    impl HasWindowHandle for ForegroundOwner {
+        fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
+            let handle = RawWindowHandle::Win32(Win32WindowHandle::new(self.0));
+            // rfd copies this HWND into IFileDialog::Show's owner parameter.
+            Ok(unsafe { WindowHandle::borrow_raw(handle) })
+        }
+    }
+
+    impl HasDisplayHandle for ForegroundOwner {
+        fn display_handle(&self) -> Result<DisplayHandle<'_>, HandleError> {
+            Ok(DisplayHandle::windows())
+        }
+    }
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WindowDirective {
     Visible(bool),

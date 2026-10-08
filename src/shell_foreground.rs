@@ -54,9 +54,27 @@ pub fn open_folder_foreground(_path: &Path) -> io::Result<OpenTargetOutcome> {
     ))
 }
 
+/// Reveal an existing file in Explorer; unfinished or removed files open their folder.
+pub fn reveal_file_foreground(path: &Path) -> io::Result<OpenTargetOutcome> {
+    if !path.is_file() {
+        return open_folder_foreground(path.parent().unwrap_or(path));
+    }
+    #[cfg(windows)]
+    {
+        let path = path.to_owned();
+        windows_impl::run_sta(move || windows_impl::reveal_file(&path))
+    }
+    #[cfg(not(windows))]
+    {
+        open_folder_foreground(path.parent().unwrap_or(path))
+    }
+}
+
 fn normalize_windows_path(path: &Path) -> String {
     let mut normalized = path.to_string_lossy().replace('/', "\\");
-    if let Some(stripped) = normalized.strip_prefix(r"\\?\") {
+    if let Some(stripped) = normalized.strip_prefix(r"\\?\UNC\") {
+        normalized = format!(r"\\{stripped}");
+    } else if let Some(stripped) = normalized.strip_prefix(r"\\?\") {
         normalized = stripped.to_owned();
     }
     let is_drive_root = normalized.len() == 3
@@ -105,68 +123,21 @@ fn select_file_window(
 }
 
 trait ForegroundApi {
-    fn current_thread_id(&self) -> u32;
     fn foreground_window(&self) -> Option<WindowId>;
-    fn window_thread_id(&self, hwnd: WindowId) -> u32;
+    fn is_minimized(&self, hwnd: WindowId) -> bool;
     fn show_restore(&self, hwnd: WindowId) -> bool;
-    fn attach_thread_input(&self, from: u32, to: u32, attach: bool) -> bool;
-    fn bring_to_top(&self, hwnd: WindowId) -> bool;
-    fn set_top(&self, hwnd: WindowId) -> bool;
     fn set_foreground(&self, hwnd: WindowId) -> bool;
-    fn set_focus(&self, hwnd: WindowId) -> bool;
     fn flash(&self, hwnd: WindowId);
 }
 
-struct AttachedThreadInputs<'a, A: ForegroundApi> {
-    api: &'a A,
-    attached: Vec<(u32, u32)>,
-}
-
-impl<'a, A: ForegroundApi> AttachedThreadInputs<'a, A> {
-    fn new(api: &'a A) -> Self {
-        Self {
-            api,
-            attached: Vec::new(),
-        }
-    }
-
-    fn attach(&mut self, from: u32, to: u32) {
-        if from == 0 || to == 0 || from == to {
-            return;
-        }
-        if self.api.attach_thread_input(from, to, true) {
-            self.attached.push((from, to));
-        }
-    }
-}
-
-impl<A: ForegroundApi> Drop for AttachedThreadInputs<'_, A> {
-    fn drop(&mut self) {
-        for &(from, to) in self.attached.iter().rev() {
-            let _ = self.api.attach_thread_input(from, to, false);
-        }
-    }
-}
-
 fn focus_window_with<A: ForegroundApi>(api: &A, hwnd: WindowId) -> bool {
-    let success = {
-        let mut attached = AttachedThreadInputs::new(api);
-        let mut success = api.show_restore(hwnd);
-        let caller_thread = api.current_thread_id();
-        let foreground_thread = api
-            .foreground_window()
-            .map(|foreground| api.window_thread_id(foreground));
-        let target_thread = api.window_thread_id(hwnd);
-        if let Some(foreground_thread) = foreground_thread {
-            attached.attach(caller_thread, foreground_thread);
-        }
-        attached.attach(caller_thread, target_thread);
-        success &= api.bring_to_top(hwnd);
-        success &= api.set_top(hwnd);
-        success &= api.set_foreground(hwnd);
-        success &= api.set_focus(hwnd);
-        success && api.foreground_window() == Some(hwnd)
-    };
+    // Keep normal/maximized/snapped windows and their child focus untouched.
+    // Joining Explorer's input queue or setting focus on its frame can disturb
+    // its own UI activation; let the owning process handle activation instead.
+    let restored = !api.is_minimized(hwnd) || api.show_restore(hwnd);
+    let success = restored
+        && (api.foreground_window() == Some(hwnd) || api.set_foreground(hwnd))
+        && api.foreground_window() == Some(hwnd);
     if !success {
         api.flash(hwnd);
     }
@@ -193,28 +164,31 @@ mod windows_impl {
             System::{
                 Com::{
                     CLSCTX_LOCAL_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance,
-                    CoInitializeEx, CoUninitialize, DISPATCH_PROPERTYGET, DISPPARAMS, IDispatch,
+                    CoInitializeEx, CoTaskMemFree, CoUninitialize, DISPATCH_PROPERTYGET,
+                    DISPPARAMS, IDispatch,
                 },
                 Variant::{VARIANT, VT_BSTR, VT_I4, VT_I8},
             },
-            UI::Shell::{IShellWindows, ShellWindows},
+            UI::Shell::{
+                Common::ITEMIDLIST, IShellWindows, SHOpenFolderAndSelectItems, SHParseDisplayName,
+                ShellWindows,
+            },
         },
         core::{BSTR, GUID, PCWSTR},
     };
     use windows_sys::Win32::{
         Foundation::{CloseHandle, HWND as RawHwnd, LPARAM},
-        System::Threading::{AttachThreadInput, GetCurrentThreadId, GetProcessId},
+        System::Threading::GetProcessId,
         UI::{
-            Input::KeyboardAndMouse::SetFocus,
             Shell::{
                 SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SEE_MASK_UNICODE, SHELLEXECUTEINFOW,
                 ShellExecuteExW,
             },
             WindowsAndMessaging::{
-                BringWindowToTop, EnumWindows, FlashWindow, GW_OWNER, GetForegroundWindow,
-                GetWindow, GetWindowThreadProcessId, HWND_TOP, IsWindowVisible, SW_RESTORE,
-                SW_SHOWNORMAL, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetForegroundWindow,
-                SetWindowPos, ShowWindowAsync,
+                EnumWindows, FlashWindow, GW_OWNER, GetForegroundWindow, GetWindow,
+                GetWindowPlacement, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
+                SW_RESTORE, SW_SHOWMAXIMIZED, SW_SHOWNORMAL, SetForegroundWindow, ShowWindowAsync,
+                WINDOWPLACEMENT, WPF_RESTORETOMAXIMIZED,
             },
         },
     };
@@ -314,6 +288,39 @@ mod windows_impl {
         }
 
         Ok(super::OpenTargetOutcome::OpenedButNotFocused)
+    }
+
+    pub(super) fn reveal_file(path: &Path) -> io::Result<super::OpenTargetOutcome> {
+        struct ItemIdList(*mut ITEMIDLIST);
+        impl Drop for ItemIdList {
+            fn drop(&mut self) {
+                unsafe { CoTaskMemFree(Some(self.0.cast())) };
+            }
+        }
+        let path = std::fs::canonicalize(path)?;
+        let wide_path = to_wide(&super::normalize_windows_path(&path));
+        let mut item = ItemIdList(null_mut());
+        unsafe {
+            SHParseDisplayName(PCWSTR(wide_path.as_ptr()), None, &mut item.0, 0, None)
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            // With no child array, this absolute PIDL opens the parent and
+            // selects the file, even when that folder is already open.
+            SHOpenFolderAndSelectItems(item.0, None, 0)
+                .map_err(|error| io::Error::other(error.to_string()))?;
+        }
+        let folder = path.parent().unwrap_or(&path);
+        let deadline = Instant::now() + POLL_TIMEOUT;
+        loop {
+            if let Ok(windows) = enumerate_explorer_windows() {
+                if let Some(hwnd) = select_explorer_window(&windows, folder) {
+                    return Ok(focus_outcome(hwnd));
+                }
+            }
+            if Instant::now() >= deadline {
+                return Ok(super::OpenTargetOutcome::OpenedButNotFocused);
+            }
+            thread::sleep(POLL_INTERVAL);
+        }
     }
 
     fn focus_outcome(hwnd: WindowId) -> super::OpenTargetOutcome {
@@ -519,56 +526,31 @@ mod windows_impl {
     struct Win32ForegroundApi;
 
     impl super::ForegroundApi for Win32ForegroundApi {
-        fn current_thread_id(&self) -> u32 {
-            unsafe { GetCurrentThreadId() }
-        }
-
         fn foreground_window(&self) -> Option<WindowId> {
             current_foreground_window()
         }
 
-        fn window_thread_id(&self, hwnd: WindowId) -> u32 {
-            unsafe { GetWindowThreadProcessId(win32_handle(hwnd), null_mut()) }
+        fn is_minimized(&self, hwnd: WindowId) -> bool {
+            unsafe { IsIconic(win32_handle(hwnd)) != 0 }
         }
 
         fn show_restore(&self, hwnd: WindowId) -> bool {
-            unsafe {
-                ShowWindowAsync(win32_handle(hwnd), SW_RESTORE);
-            }
-            true
-        }
-
-        fn attach_thread_input(&self, from: u32, to: u32, attach: bool) -> bool {
-            unsafe { AttachThreadInput(from, to, if attach { 1 } else { 0 }) != 0 }
-        }
-
-        fn bring_to_top(&self, hwnd: WindowId) -> bool {
-            unsafe { BringWindowToTop(win32_handle(hwnd)) != 0 }
-        }
-
-        fn set_top(&self, hwnd: WindowId) -> bool {
-            unsafe {
-                SetWindowPos(
-                    win32_handle(hwnd),
-                    HWND_TOP,
-                    0,
-                    0,
-                    0,
-                    0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
-                ) != 0
-            }
+            let mut placement: WINDOWPLACEMENT = unsafe { std::mem::zeroed() };
+            placement.length = size_of::<WINDOWPLACEMENT>() as u32;
+            let restore_to_maximized = unsafe {
+                GetWindowPlacement(win32_handle(hwnd), &mut placement) != 0
+                    && placement.flags & WPF_RESTORETOMAXIMIZED != 0
+            };
+            let command = if restore_to_maximized {
+                SW_SHOWMAXIMIZED
+            } else {
+                SW_RESTORE
+            };
+            unsafe { ShowWindowAsync(win32_handle(hwnd), command) != 0 }
         }
 
         fn set_foreground(&self, hwnd: WindowId) -> bool {
             unsafe { SetForegroundWindow(win32_handle(hwnd)) != 0 }
-        }
-
-        fn set_focus(&self, hwnd: WindowId) -> bool {
-            unsafe {
-                SetFocus(win32_handle(hwnd));
-            }
-            true
         }
 
         fn flash(&self, hwnd: WindowId) {
@@ -577,10 +559,129 @@ mod windows_impl {
             }
         }
     }
+
+    #[cfg(test)]
+    mod desktop_tests {
+        use super::*;
+        use windows_sys::Win32::{
+            Foundation::RECT,
+            UI::WindowsAndMessaging::{
+                CreateWindowExW, DestroyWindow, DispatchMessageW, GetWindowRect, IsZoomed, MSG,
+                PM_REMOVE, PeekMessageW, SW_MINIMIZE, SW_SHOWMAXIMIZED, ShowWindow,
+                TranslateMessage, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+            },
+        };
+
+        #[test]
+        #[ignore = "requires an interactive Windows desktop and an explicit fixture file"]
+        fn reveal_selects_fixture_in_explorer() {
+            let path = PathBuf::from(
+                std::env::var_os("CURL_DOWNLOADER_REVEAL_TEST_FILE")
+                    .expect("set CURL_DOWNLOADER_REVEAL_TEST_FILE to an existing fixture"),
+            );
+            assert!(path.is_file());
+            super::super::reveal_file_foreground(&path).unwrap();
+        }
+
+        struct TestWindow(RawHwnd);
+
+        impl Drop for TestWindow {
+            fn drop(&mut self) {
+                unsafe { DestroyWindow(self.0) };
+            }
+        }
+
+        fn rectangle(hwnd: RawHwnd) -> (i32, i32, i32, i32) {
+            let mut rect: RECT = unsafe { std::mem::zeroed() };
+            assert_ne!(unsafe { GetWindowRect(hwnd, &mut rect) }, 0);
+            (rect.left, rect.top, rect.right, rect.bottom)
+        }
+
+        #[test]
+        #[ignore = "requires an interactive Windows desktop; creates only a disposable test window"]
+        fn activation_preserves_real_window_geometry_and_maximized_restore_state() {
+            let class = to_wide("STATIC");
+            let title = to_wide("Curl Downloader shell activation regression test");
+            let hwnd = unsafe {
+                CreateWindowExW(
+                    0,
+                    class.as_ptr(),
+                    title.as_ptr(),
+                    WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                    100,
+                    100,
+                    500,
+                    300,
+                    null_mut(),
+                    null_mut(),
+                    null_mut(),
+                    null_mut(),
+                )
+            };
+            assert!(!hwnd.is_null());
+            let window = TestWindow(hwnd);
+            let api = Win32ForegroundApi;
+            let normal = rectangle(hwnd);
+            let _ = focus_window_with(&api, hwnd as WindowId);
+            assert_eq!(
+                rectangle(hwnd),
+                normal,
+                "visible window was resized or moved"
+            );
+
+            unsafe { ShowWindow(hwnd, SW_SHOWMAXIMIZED) };
+            assert_ne!(unsafe { IsZoomed(hwnd) }, 0);
+            let maximized = rectangle(hwnd);
+            let _ = focus_window_with(&api, hwnd as WindowId);
+            assert_ne!(
+                unsafe { IsZoomed(hwnd) },
+                0,
+                "activation restored a maximized window"
+            );
+            assert_eq!(rectangle(hwnd), maximized);
+
+            unsafe { ShowWindow(hwnd, SW_MINIMIZE) };
+            assert_ne!(unsafe { IsIconic(hwnd) }, 0);
+            let _ = focus_window_with(&api, hwnd as WindowId);
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let mut message: MSG = unsafe { std::mem::zeroed() };
+                while unsafe { PeekMessageW(&mut message, null_mut(), 0, 0, PM_REMOVE) } != 0 {
+                    unsafe {
+                        TranslateMessage(&message);
+                        DispatchMessageW(&message);
+                    }
+                }
+                if unsafe { IsIconic(hwnd) } == 0 {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "minimized window did not restore"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert_ne!(
+                unsafe { IsZoomed(hwnd) },
+                0,
+                "minimized maximized state was lost"
+            );
+            assert_eq!(rectangle(hwnd), maximized);
+            drop(window);
+        }
+    }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_unc_paths_keep_their_network_root() {
+        assert_eq!(
+            normalize_windows_path(Path::new(r"\\?\UNC\server\share\file.bin")),
+            r"\\server\share\file.bin"
+        );
+    }
 
     #[test]
     fn explorer_matching_is_case_insensitive_and_ignores_trailing_separator() {
@@ -664,37 +765,40 @@ mod tests {
         assert_eq!(select_file_window(&before, &after, None, Some(10)), None);
     }
     #[test]
-    fn focus_sequence_detaches_every_successful_thread_attachment() {
+    fn focusing_visible_window_does_not_restore_or_reassign_child_focus() {
         let api = RecordingForegroundApi::success();
         assert!(focus_window_with(&api, 42));
-        assert_eq!(
-            api.calls(),
-            vec![
-                "restore:42",
-                "attach:caller:foreground",
-                "attach:caller:target",
-                "bring:42",
-                "top:42",
-                "foreground:42",
-                "focus:42",
-                "detach:caller:target",
-                "detach:caller:foreground",
-            ]
-        );
+        assert_eq!(api.calls(), vec!["foreground:42"]);
     }
 
     #[test]
-    fn failed_focus_still_detaches_and_flashes() {
+    fn minimized_window_is_restored_before_activation() {
+        let mut api = RecordingForegroundApi::success();
+        api.minimized = true;
+        assert!(focus_window_with(&api, 42));
+        assert_eq!(api.calls(), vec!["restore:42", "foreground:42"]);
+    }
+
+    #[test]
+    fn already_foreground_window_keeps_its_existing_child_focus() {
+        let api = RecordingForegroundApi::success();
+        *api.foreground.lock().unwrap() = 42;
+        assert!(focus_window_with(&api, 42));
+        assert!(api.calls().is_empty());
+    }
+
+    #[test]
+    fn failed_activation_only_flashes_without_changing_window_layout() {
         let api = RecordingForegroundApi::foreground_failure();
         assert!(!focus_window_with(&api, 42));
-        assert!(api.calls().contains(&"detach:caller:target".into()));
-        assert_eq!(api.calls().last().unwrap(), "flash:42");
+        assert_eq!(api.calls(), vec!["foreground:42", "flash:42"]);
     }
 
     struct RecordingForegroundApi {
         calls: std::sync::Mutex<Vec<String>>,
         foreground: std::sync::Mutex<WindowId>,
         foreground_result: bool,
+        minimized: bool,
     }
 
     impl RecordingForegroundApi {
@@ -703,6 +807,7 @@ mod tests {
                 calls: std::sync::Mutex::new(Vec::new()),
                 foreground: std::sync::Mutex::new(9),
                 foreground_result: true,
+                minimized: false,
             }
         }
 
@@ -711,6 +816,7 @@ mod tests {
                 calls: std::sync::Mutex::new(Vec::new()),
                 foreground: std::sync::Mutex::new(9),
                 foreground_result: false,
+                minimized: false,
             }
         }
 
@@ -720,45 +826,16 @@ mod tests {
     }
 
     impl ForegroundApi for RecordingForegroundApi {
-        fn current_thread_id(&self) -> u32 {
-            1
-        }
-
         fn foreground_window(&self) -> Option<WindowId> {
             Some(*self.foreground.lock().unwrap())
         }
 
-        fn window_thread_id(&self, hwnd: WindowId) -> u32 {
-            if hwnd == 9 { 2 } else { 3 }
+        fn is_minimized(&self, _hwnd: WindowId) -> bool {
+            self.minimized
         }
 
         fn show_restore(&self, hwnd: WindowId) -> bool {
             self.calls.lock().unwrap().push(format!("restore:{hwnd}"));
-            true
-        }
-
-        fn attach_thread_input(&self, _from: u32, to: u32, attach: bool) -> bool {
-            self.calls.lock().unwrap().push(if attach {
-                if to == 2 {
-                    "attach:caller:foreground".into()
-                } else {
-                    "attach:caller:target".into()
-                }
-            } else if to == 2 {
-                "detach:caller:foreground".into()
-            } else {
-                "detach:caller:target".into()
-            });
-            true
-        }
-
-        fn bring_to_top(&self, hwnd: WindowId) -> bool {
-            self.calls.lock().unwrap().push(format!("bring:{hwnd}"));
-            true
-        }
-
-        fn set_top(&self, hwnd: WindowId) -> bool {
-            self.calls.lock().unwrap().push(format!("top:{hwnd}"));
             true
         }
 
@@ -771,11 +848,6 @@ mod tests {
                 *self.foreground.lock().unwrap() = hwnd;
             }
             self.foreground_result
-        }
-
-        fn set_focus(&self, hwnd: WindowId) -> bool {
-            self.calls.lock().unwrap().push(format!("focus:{hwnd}"));
-            true
         }
 
         fn flash(&self, hwnd: WindowId) {

@@ -8,12 +8,14 @@ use crate::{
         PersistedState, ProxyProtocol, ProxySettings, SegmentSnapshot, TaskId, TaskSnapshot,
         TaskStatus,
     },
-    shell_foreground, storage, tray,
+    shell_dispatcher::{ShellDispatcher, ShellResult},
+    storage, tray,
     window_control::{EguiMainWindow, MainWindowControl},
 };
 use eframe::egui;
 use std::{
     collections::HashSet,
+    io,
     path::PathBuf,
     sync::{
         Arc, Mutex,
@@ -282,6 +284,7 @@ pub struct CurlDownloaderApp {
     window_control: Arc<dyn MainWindowControl>,
     tasks: Vec<TaskSnapshot>,
     selected: Option<TaskId>,
+    reveal_task: Option<TaskId>,
     checked_tasks: HashSet<TaskId>,
     url_input: String,
     queue_search: String,
@@ -293,6 +296,8 @@ pub struct CurlDownloaderApp {
     batch_proxy: Option<BatchProxyDraft>,
     batch_proxy_message: Option<String>,
     fatal: Option<String>,
+    shell_dispatcher: ShellDispatcher,
+    shell_message: Option<String>,
     draft: Option<TaskDraft>,
     last_download_dir: PathBuf,
     max_processes: u8,
@@ -325,12 +330,8 @@ struct BatchProxyDraft {
 }
 
 impl CurlDownloaderApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, start_minimized: bool) -> Self {
-        let state_path = storage::state_path().unwrap_or_else(|_| {
-            std::env::temp_dir()
-                .join("CurlDownloader")
-                .join("state.json")
-        });
+    pub fn new(cc: &eframe::CreationContext<'_>, start_minimized: bool) -> io::Result<Self> {
+        let state_path = storage::state_path()?;
         let manual_stop_path = storage::manual_stop_path(&state_path);
         let default_dir = storage::default_download_dir()
             .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default());
@@ -343,38 +344,12 @@ impl CurlDownloaderApp {
                 };
                 (state, None)
             }
-            Err(error) if state_path.exists() => {
-                let _ = storage::quarantine_corrupt(&state_path);
-                (
-                    PersistedState {
-                        schema_version: CURRENT_SCHEMA_VERSION,
-                        settings: GlobalSettings {
-                            last_download_dir: default_dir.clone(),
-                            max_curl_processes: 4,
-                            next_task_id: 1,
-                        },
-                        tasks: Vec::new(),
-                    },
-                    Some(format!("狀態檔已隔離：{error}")),
-                )
-            }
-            Err(_) => (
-                PersistedState {
-                    schema_version: CURRENT_SCHEMA_VERSION,
-                    settings: GlobalSettings {
-                        last_download_dir: default_dir.clone(),
-                        max_curl_processes: 4,
-                        next_task_id: 1,
-                    },
-                    tasks: Vec::new(),
-                },
-                None,
-            ),
+            Err(error) => state_after_load_error(error, &state_path, &default_dir)?,
         };
         let max_processes = state.settings.max_curl_processes;
         let last_download_dir = state.settings.last_download_dir.clone();
-        let engine = spawn_engine(state_path, state)
-            .unwrap_or_else(|error| panic!("無法啟動下載引擎：{error}"));
+        let shell_dispatcher = ShellDispatcher::new()?;
+        let engine = spawn_engine(state_path, state).map_err(io::Error::other)?;
         let (engine_commands, engine_events) = engine.into_channels();
         let ipc_stop = Arc::new(AtomicBool::new(false));
         let ipc_default_dir = Arc::new(Mutex::new(last_download_dir.clone()));
@@ -407,7 +382,7 @@ impl CurlDownloaderApp {
             manual_stop_path.clone(),
             Arc::clone(&ipc_stop),
         )
-        .unwrap_or_else(|error| panic!("無法啟動背景控制器：{error}"));
+        .map_err(io::Error::other)?;
         let controller_state = controller.state();
         let controller_events = controller.take_app_events();
         let ipc_thread = Some(ipc::spawn_server(
@@ -423,7 +398,7 @@ impl CurlDownloaderApp {
         cc.egui_ctx.set_fonts(chinese_font_definitions());
         cc.egui_ctx.set_theme(egui::ThemePreference::System);
         let tasks = controller_state.tasks();
-        Self {
+        Ok(Self {
             engine_commands,
             controller,
             controller_state,
@@ -434,6 +409,7 @@ impl CurlDownloaderApp {
                 .iter()
                 .max_by_key(|task| (task.created_unix_ms, task.id))
                 .map(|task| task.id),
+            reveal_task: None,
             checked_tasks: HashSet::new(),
             url_input: String::new(),
             queue_search: String::new(),
@@ -445,6 +421,8 @@ impl CurlDownloaderApp {
             batch_proxy: None,
             batch_proxy_message: None,
             fatal,
+            shell_dispatcher,
+            shell_message: None,
             draft: None,
             last_download_dir,
             max_processes,
@@ -455,7 +433,7 @@ impl CurlDownloaderApp {
             inspector_tab: InspectorTab::Overview,
             expanded_url: None,
             ipc_thread,
-        }
+        })
     }
 
     fn apply_controller_events(&mut self, ctx: &egui::Context) -> bool {
@@ -470,6 +448,7 @@ impl CurlDownloaderApp {
                     self.apply_tasks(self.controller_state.tasks());
                     if let Some(selected) = resolve_show_task(&self.tasks, task_id) {
                         self.selected = Some(selected);
+                        self.reveal_task = Some(selected);
                         self.draft = None;
                     }
                     restored = self.restore_window(ctx) || restored;
@@ -484,8 +463,8 @@ impl CurlDownloaderApp {
     }
 
     fn apply_tasks(&mut self, tasks: Vec<TaskSnapshot>) {
-        let previous_ids = self
-            .tasks
+        let previous_tasks = std::mem::take(&mut self.tasks);
+        let previous_ids = previous_tasks
             .iter()
             .map(|task| task.id)
             .collect::<HashSet<_>>();
@@ -494,27 +473,34 @@ impl CurlDownloaderApp {
             .filter(|task| !previous_ids.contains(&task.id))
             .max_by_key(|task| (task.created_unix_ms, task.id))
             .map(|task| task.id);
-        self.tasks = tasks;
-        let draft_proxy_is_stale = self
-            .draft
-            .as_ref()
-            .and_then(|draft| {
-                self.tasks
-                    .iter()
-                    .find(|task| task.id == draft.id)
-                    .map(|task| !draft_proxy_matches_snapshot(draft, task))
-            })
-            .unwrap_or(false);
-        if draft_proxy_is_stale {
-            self.draft = None;
+        let previously_selected_status = self
+            .selected
+            .and_then(|id| previous_tasks.iter().find(|task| task.id == id))
+            .map(|task| task.status);
+        if let Some(draft) = self.draft.as_mut() {
+            if let Some(previous) = previous_tasks.iter().find(|task| task.id == draft.id) {
+                if let Some(incoming) = tasks.iter().find(|task| task.id == draft.id) {
+                    reconcile_draft_proxy(draft, previous, incoming);
+                }
+            }
         }
+        self.tasks = tasks;
         if let Some(newest_added) = newest_added {
             self.selected = Some(newest_added);
+            self.reveal_task = Some(newest_added);
             self.draft = None;
         } else if self.selected.is_none() {
             self.selected = self.tasks.first().map(|task| task.id);
         }
         if let Some(selected) = self.selected {
+            let current_status = self
+                .tasks
+                .iter()
+                .find(|task| task.id == selected)
+                .map(|task| task.status);
+            if selected_task_needs_reveal(previously_selected_status, current_status) {
+                self.reveal_task = Some(selected);
+            }
             if !self.tasks.iter().any(|task| task.id == selected) {
                 self.selected = self.tasks.first().map(|task| task.id);
                 self.draft = None;
@@ -545,6 +531,27 @@ impl CurlDownloaderApp {
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         true
+    }
+
+    fn collect_shell_results(&mut self) {
+        while let Some(ShellResult { path, result }) = self.shell_dispatcher.try_result() {
+            match result {
+                Ok(_) => self.shell_message = None,
+                Err(error) => {
+                    self.shell_message = Some(format!("無法開啟位置 {}：{error}", path.display()))
+                }
+            }
+        }
+    }
+
+    fn open_location(&mut self, path: PathBuf) {
+        match self.shell_dispatcher.open_location(path.clone()) {
+            Ok(_) => self.shell_message = None,
+            Err(error) => {
+                self.shell_message =
+                    Some(format!("無法排入檔案總管工作 {}：{error}", path.display()))
+            }
+        }
     }
     fn selected_task(&self) -> Option<TaskSnapshot> {
         self.selected
@@ -779,6 +786,9 @@ impl CurlDownloaderApp {
                 if let Some(message) = &self.fatal {
                     ui.colored_label(ui.visuals().warn_fg_color, message);
                 }
+                if let Some(message) = &self.shell_message {
+                    ui.colored_label(ui.visuals().error_fg_color, message);
+                }
                 if self.controller_state.lifecycle() == LifecycleState::ShuttingDown {
                     ui.colored_label(ui.visuals().hyperlink_color, "正在安全停止下載…");
                 }
@@ -911,13 +921,16 @@ impl CurlDownloaderApp {
                                 .filter(|task| matches_search(task))
                                 .cloned()
                                 .collect::<Vec<_>>();
-                            let completed = self
+                            let mut completed = self
                                 .tasks
                                 .iter()
                                 .filter(|task| queue_group(task.status) == QueueGroup::Completed)
                                 .filter(|task| matches_search(task))
                                 .cloned()
                                 .collect::<Vec<_>>();
+                            completed.sort_by_key(|task| {
+                                std::cmp::Reverse(completed_queue_timestamp(task))
+                            });
                             self.show_queue_section(ui, "下載佇列", &active);
                             ui.add_space(8.0);
                             self.show_queue_section(
@@ -949,9 +962,10 @@ impl CurlDownloaderApp {
 
     fn show_task_card(&mut self, ui: &mut egui::Ui, task: &TaskSnapshot) {
         let selected = self.selected == Some(task.id);
+        let reveal = self.reveal_task == Some(task.id);
         let mut checked = self.checked_tasks.contains(&task.id);
         let mut open_task = false;
-        task_card_frame(ui, selected).show(ui, |ui| {
+        let card = task_card_frame(ui, selected).show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             ui.horizontal(|ui| {
                 if ui
@@ -1037,7 +1051,7 @@ impl CurlDownloaderApp {
                         .on_hover_text("在檔案總管開啟下載檔案所在位置")
                         .clicked()
                 {
-                    open_location(task.target_dir.join(&task.filename));
+                    self.open_location(task.target_dir.join(&task.filename));
                 }
                 if matches!(task.status, TaskStatus::Completed | TaskStatus::Cancelled)
                     && ui.button("清除記錄").clicked()
@@ -1048,7 +1062,12 @@ impl CurlDownloaderApp {
         });
         if open_task {
             self.selected = Some(task.id);
+            self.reveal_task = Some(task.id);
             self.draft = None;
+        }
+        if reveal || open_task {
+            ui.scroll_to_rect(card.response.rect, Some(egui::Align::Center));
+            self.reveal_task = None;
         }
     }
 
@@ -1280,6 +1299,7 @@ fn window_close_action(shutting_down: bool, tray_close_requested: bool) -> Windo
 impl eframe::App for CurlDownloaderApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.collect_shell_results();
         if self.start_minimized {
             self.window_control.hide();
             self.start_minimized = false;
@@ -1396,6 +1416,8 @@ struct StorageCardOutcome {
 struct ProxyCardOutcome {
     changed: bool,
     password: Option<(TaskId, String)>,
+    #[cfg(test)]
+    enabled_rect: Option<egui::Rect>,
 }
 
 #[derive(Default)]
@@ -1495,10 +1517,7 @@ fn show_storage_card(
                 .add_enabled(can_edit, egui::Button::new("瀏覽…"))
                 .clicked()
             {
-                if let Some(path) = rfd::FileDialog::new()
-                    .set_directory(&draft.target_dir)
-                    .pick_folder()
-                {
+                if let Some(path) = crate::window_control::pick_download_folder(&draft.target_dir) {
                     draft.target_dir_input = path.display().to_string();
                     draft.target_dir = path.clone();
                     last_download_dir = Some(path);
@@ -1523,15 +1542,22 @@ fn show_proxy_card(
 ) -> ProxyCardOutcome {
     let mut changed = false;
     let mut password = None;
+    #[cfg(test)]
+    let mut enabled_rect = None;
     card_frame(ui).show(ui, |ui| {
         ui.horizontal(|ui| {
             ui.heading("Proxy 設定");
             ui.weak("只套用於此任務的下載連線");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.add_enabled(
+                let response = ui.add_enabled(
                     can_edit,
                     egui::Checkbox::new(&mut draft.proxy.enabled, "啟用 Proxy"),
                 );
+                #[cfg(test)]
+                {
+                    enabled_rect = Some(response.rect);
+                }
+                changed |= response.changed();
             });
         });
         ui.add_enabled_ui(can_edit, |ui| {
@@ -1593,7 +1619,12 @@ fn show_proxy_card(
             }
         }
     });
-    ProxyCardOutcome { changed, password }
+    ProxyCardOutcome {
+        changed,
+        password,
+        #[cfg(test)]
+        enabled_rect,
+    }
 }
 
 fn show_segment_history(ui: &mut egui::Ui, task: &TaskSnapshot) {
@@ -1899,13 +1930,73 @@ fn proxy_from_snapshot(task: &TaskSnapshot) -> ProxySettings {
     }
 }
 
-fn draft_proxy_matches_snapshot(draft: &TaskDraft, task: &TaskSnapshot) -> bool {
-    draft.proxy.enabled == task.proxy.enabled
-        && draft.proxy.protocol == task.proxy.protocol
-        && draft.proxy.host == task.proxy.host
-        && draft.proxy.port == task.proxy.port
-        && draft.proxy.username == task.proxy.username
-        && draft.proxy.requires_password == task.proxy.requires_password
+fn reconcile_draft_proxy(draft: &mut TaskDraft, previous: &TaskSnapshot, incoming: &TaskSnapshot) {
+    if previous.proxy.enabled != incoming.proxy.enabled
+        && draft.proxy.enabled == previous.proxy.enabled
+    {
+        draft.proxy.enabled = incoming.proxy.enabled;
+    }
+    if previous.proxy.protocol != incoming.proxy.protocol
+        && draft.proxy.protocol == previous.proxy.protocol
+    {
+        draft.proxy.protocol = incoming.proxy.protocol;
+    }
+    if previous.proxy.host != incoming.proxy.host && draft.proxy.host == previous.proxy.host {
+        draft.proxy.host.clone_from(&incoming.proxy.host);
+    }
+    if previous.proxy.port != incoming.proxy.port && draft.proxy.port == previous.proxy.port {
+        draft.proxy.port = incoming.proxy.port;
+    }
+    if previous.proxy.username != incoming.proxy.username
+        && draft.proxy.username == previous.proxy.username
+    {
+        draft.proxy.username.clone_from(&incoming.proxy.username);
+    }
+    if previous.proxy.requires_password != incoming.proxy.requires_password
+        && draft.proxy.requires_password == previous.proxy.requires_password
+    {
+        draft.proxy.requires_password = incoming.proxy.requires_password;
+    }
+}
+
+fn completed_queue_timestamp(task: &TaskSnapshot) -> u64 {
+    task.completed_unix_ms.unwrap_or(task.created_unix_ms)
+}
+
+fn is_terminal_status(status: TaskStatus) -> bool {
+    matches!(status, TaskStatus::Completed | TaskStatus::Cancelled)
+}
+
+fn selected_task_needs_reveal(previous: Option<TaskStatus>, incoming: Option<TaskStatus>) -> bool {
+    previous.is_some_and(|status| !is_terminal_status(status))
+        && incoming.is_some_and(is_terminal_status)
+}
+
+fn state_after_load_error(
+    error: io::Error,
+    state_path: &std::path::Path,
+    default_dir: &std::path::Path,
+) -> io::Result<(PersistedState, Option<String>)> {
+    let fatal = match error.kind() {
+        io::ErrorKind::NotFound => None,
+        io::ErrorKind::InvalidData => {
+            storage::quarantine_corrupt(state_path)?;
+            Some(format!("狀態檔已隔離：{error}"))
+        }
+        _ => return Err(error),
+    };
+    Ok((
+        PersistedState {
+            schema_version: CURRENT_SCHEMA_VERSION,
+            settings: GlobalSettings {
+                last_download_dir: default_dir.to_owned(),
+                max_curl_processes: 4,
+                next_task_id: 1,
+            },
+            tasks: Vec::new(),
+        },
+        fatal,
+    ))
 }
 
 fn curl_source_label(source: CurlSource) -> &'static str {
@@ -1986,18 +2077,6 @@ fn parse_batch_urls(input: &str) -> Result<Vec<String>, String> {
     Ok(urls)
 }
 
-fn location_directory(path: &std::path::Path) -> &std::path::Path {
-    path.parent().unwrap_or(path)
-}
-
-#[cfg(target_os = "windows")]
-fn open_location(path: PathBuf) {
-    let _ = shell_foreground::open_folder_foreground(location_directory(&path));
-}
-
-#[cfg(not(target_os = "windows"))]
-fn open_location(_path: PathBuf) {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2007,6 +2086,132 @@ mod tests {
     fn formats_bytes_and_speed() {
         assert_eq!(format_bytes(1_572_864), "1.50 MiB");
         assert_eq!(format_speed(1_048_576.0), "1.00 MiB/s");
+    }
+
+    #[test]
+    fn local_proxy_edits_survive_stale_snapshots_while_external_bulk_edits_merge() {
+        let previous = test_snapshot(7, TaskStatus::Queued);
+        let mut incoming = previous.clone();
+        incoming.proxy.host = "bulk.proxy.test".into();
+        incoming.proxy.port = 9000;
+        let mut draft = test_draft(&previous);
+        draft.proxy.enabled = true;
+        draft.proxy.port = 8081;
+
+        reconcile_draft_proxy(&mut draft, &previous, &incoming);
+
+        assert!(draft.proxy.enabled, "unsent local toggle must survive");
+        assert_eq!(draft.proxy.host, "bulk.proxy.test");
+        assert_eq!(draft.proxy.port, 8081, "locally edited field must win");
+
+        let stale = previous.clone();
+        reconcile_draft_proxy(&mut draft, &previous, &stale);
+        assert_eq!(
+            draft.proxy.host, "bulk.proxy.test",
+            "stale snapshot must not revert bulk update"
+        );
+        assert_eq!(draft.proxy.port, 8081);
+    }
+
+    #[test]
+    fn enabling_proxy_checkbox_marks_the_overview_draft_changed() {
+        let context = egui::Context::default();
+        let task = test_snapshot(7, TaskStatus::Queued);
+        let mut draft = test_draft(&task);
+        let render = |input, draft: &mut TaskDraft| {
+            let mut outcome = None;
+            let _ = context.run_ui(input, |ui| {
+                outcome = Some(show_proxy_card(ui, draft, true, false));
+            });
+            outcome.expect("proxy card rendered")
+        };
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            ..Default::default()
+        };
+        let initial = render(input.clone(), &mut draft);
+        let pos = initial
+            .enabled_rect
+            .expect("checkbox response rectangle")
+            .center();
+        let mut press = input.clone();
+        press.events.extend([
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+            },
+        ]);
+        let _ = render(press, &mut draft);
+        let mut release = input;
+        release.events.extend([
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            },
+        ]);
+
+        let outcome = render(release, &mut draft);
+
+        assert!(draft.proxy.enabled);
+        assert!(outcome.changed);
+    }
+
+    #[test]
+    fn startup_state_errors_only_quarantine_invalid_data() {
+        let default_dir = PathBuf::from("C:\\Downloads");
+        let path = PathBuf::from("C:\\state.json");
+        let error = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+
+        let result = state_after_load_error(error, &path, &default_dir);
+
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn completed_queue_sort_key_prefers_latest_completion_timestamp() {
+        let mut older = test_snapshot(1, TaskStatus::Completed);
+        older.created_unix_ms = 900;
+        older.completed_unix_ms = Some(1000);
+        let mut newer = test_snapshot(2, TaskStatus::Completed);
+        newer.created_unix_ms = 100;
+        newer.completed_unix_ms = Some(2000);
+
+        let mut tasks = [older, newer];
+        tasks.sort_by_key(|task| std::cmp::Reverse(completed_queue_timestamp(task)));
+
+        assert_eq!(tasks.map(|task| task.id), [2, 1]);
+    }
+
+    #[test]
+    fn selected_task_reveal_is_requested_only_when_it_becomes_terminal() {
+        assert!(selected_task_needs_reveal(
+            Some(TaskStatus::Downloading),
+            Some(TaskStatus::Completed)
+        ));
+        assert!(selected_task_needs_reveal(
+            Some(TaskStatus::Queued),
+            Some(TaskStatus::Cancelled)
+        ));
+        assert!(!selected_task_needs_reveal(
+            Some(TaskStatus::Completed),
+            Some(TaskStatus::Completed)
+        ));
+        assert!(!selected_task_needs_reveal(
+            Some(TaskStatus::Queued),
+            Some(TaskStatus::Downloading)
+        ));
     }
 
     #[test]
@@ -2048,15 +2253,6 @@ mod tests {
         assert_eq!(
             parse_batch_urls("https://example.test/a.bin\nftp://example.test/b.bin").unwrap_err(),
             "只支援 HTTP 或 HTTPS 網址：ftp://example.test/b.bin"
-        );
-    }
-
-    #[test]
-    fn opens_the_parent_directory_for_a_completed_file() {
-        let file = PathBuf::from("C:\\Downloads\\completed.bin");
-        assert_eq!(
-            location_directory(&file),
-            PathBuf::from("C:\\Downloads").as_path()
         );
     }
 
@@ -2319,6 +2515,20 @@ mod tests {
             },
             error: None,
             curl_source: CurlSource::NotStarted,
+        }
+    }
+
+    fn test_draft(task: &TaskSnapshot) -> TaskDraft {
+        TaskDraft {
+            id: task.id,
+            url: task.original_url.clone(),
+            filename: task.filename.clone(),
+            target_dir: task.target_dir.clone(),
+            target_dir_input: task.target_dir.display().to_string(),
+            segments: task.requested_segments,
+            proxy: proxy_from_snapshot(task),
+            password_input: String::new(),
+            show_password: false,
         }
     }
 }

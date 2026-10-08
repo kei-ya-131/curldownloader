@@ -87,10 +87,28 @@ fn escape_config(value: &str) -> Result<String, String> {
 fn add_request_context(
     spec: &mut CurlCommandSpec,
     request_context: Option<&RequestContext>,
+    request_url: &str,
 ) -> Result<(), String> {
     let Some(request_context) = request_context else {
         return Ok(());
     };
+    let actual = url::Url::parse(request_url).map_err(|_| "下載網址無效".to_owned())?;
+    let captured = url::Url::parse(request_context.final_url())
+        .map_err(|_| "Firefox 授權網址無效".to_owned())?;
+    if actual.origin() != captured.origin() {
+        return Err("下載來源與 Firefox 授權來源不同，請在 Firefox 重新授權".into());
+    }
+    // curl scopes Cookie/Authorization across redirects, but forwards custom
+    // headers. Never forward an unknown secret to an uncaptured destination.
+    if request_context.iter_headers().any(|(name, value)| {
+        crate::request_context::sensitive_header(name, value)
+            && !matches!(
+                name.to_ascii_lowercase().as_str(),
+                "cookie" | "authorization"
+            )
+    }) {
+        spec.args.extend(["--max-redirs".into(), "0".into()]);
+    }
     let config = spec
         .stdin_config
         .get_or_insert_with(|| Zeroizing::new(String::new()));
@@ -264,7 +282,7 @@ pub fn build_head_probe(
     headers: &Path,
 ) -> Result<CurlCommandSpec, String> {
     let mut spec = CurlCommandSpec::base(proxy)?;
-    add_request_context(&mut spec, request_context)?;
+    add_request_context(&mut spec, request_context, url)?;
     add_transfer_defaults(&mut spec);
     spec.args.extend([
         "--head".into(),
@@ -286,7 +304,7 @@ pub fn build_range_probe(
     headers: &Path,
 ) -> Result<CurlCommandSpec, String> {
     let mut spec = CurlCommandSpec::base(proxy)?;
-    add_request_context(&mut spec, request_context)?;
+    add_request_context(&mut spec, request_context, url)?;
     add_transfer_defaults(&mut spec);
     spec.args.extend([
         "--range".into(),
@@ -323,7 +341,7 @@ pub fn build_single_transfer(
     headers: &Path,
 ) -> Result<CurlCommandSpec, String> {
     let mut spec = CurlCommandSpec::base(proxy)?;
-    add_request_context(&mut spec, request_context)?;
+    add_request_context(&mut spec, request_context, url)?;
     add_transfer_defaults(&mut spec);
     spec.args.extend([
         "--dump-header".into(),
@@ -362,7 +380,7 @@ pub fn build_segment_transfer(
         .ok_or_else(|| "分段續傳偏移無效".to_owned())?;
     let remaining = length - existing;
     let mut spec = CurlCommandSpec::base(proxy)?;
-    add_request_context(&mut spec, request_context)?;
+    add_request_context(&mut spec, request_context, url)?;
     add_transfer_defaults(&mut spec);
     add_if_range(&mut spec, if_range)?;
     spec.args.extend([
@@ -564,6 +582,64 @@ mod tests {
         assert!(args.contains("--range 125-199"));
         assert!(!args.contains("--continue-at"));
         assert!(args.contains("If-Range: \"v1\""));
+    }
+
+    #[test]
+    fn authorization_headers_are_scoped_to_the_captured_origin() {
+        let context = prepare(WireRequestContext {
+            headers: vec![WireRequestHeader::new("Cookie", "session=secret")],
+            source_page_url: None,
+            initial_url: "https://origin.test/start".into(),
+            final_url: "https://cdn.test/file".into(),
+            incognito: false,
+            cookie_store_id: None,
+        })
+        .unwrap();
+        for target in [
+            "https://origin.test/start",
+            "https://cdn.test:8443/file",
+            "http://cdn.test/file",
+        ] {
+            assert!(
+                build_head_probe(
+                    &ProxySettings::default(),
+                    Some(&context.runtime),
+                    target,
+                    Path::new("headers.txt")
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            build_head_probe(
+                &ProxySettings::default(),
+                Some(&context.runtime),
+                "https://cdn.test/file",
+                Path::new("headers.txt")
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn custom_secrets_cannot_follow_a_new_redirect() {
+        let context = prepare(WireRequestContext {
+            headers: vec![WireRequestHeader::new("X-Session-Token", "secret")],
+            source_page_url: None,
+            initial_url: "https://files.test/file".into(),
+            final_url: "https://files.test/file".into(),
+            incognito: false,
+            cookie_store_id: None,
+        })
+        .unwrap();
+        let spec = build_head_probe(
+            &ProxySettings::default(),
+            Some(&context.runtime),
+            "https://files.test/file",
+            Path::new("headers.txt"),
+        )
+        .unwrap();
+        assert!(spec.arguments_text().contains("--max-redirs 0"));
     }
 
     #[test]

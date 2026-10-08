@@ -551,6 +551,9 @@ mod runtime_tests {
 
     impl ControllerFixture {
         fn hidden() -> Self {
+            // Parallel fixtures can start in the same millisecond. Give each
+            // marker its own identity so another fixture cannot delete it.
+            static NEXT_FIXTURE_ID: AtomicUsize = AtomicUsize::new(0);
             let (engine_commands, engine_commands_receiver) = mpsc::channel();
             let (engine_events_sender, engine_events_receiver) = mpsc::channel();
             let (tray, _tray_events_receiver) = TrayController::disabled();
@@ -558,9 +561,10 @@ mod runtime_tests {
             let window = Arc::new(RecordingWindow::default());
             let ipc_stop = Arc::new(AtomicBool::new(false));
             let manual_stop_path = std::env::temp_dir().join(format!(
-                "curl-downloader-controller-test-{}-{}.json",
+                "curl-downloader-controller-test-{}-{}-{}.json",
                 std::process::id(),
-                startup_policy::unix_time_ms()
+                startup_policy::unix_time_ms(),
+                NEXT_FIXTURE_ID.fetch_add(1, Ordering::Relaxed)
             ));
             let handle = spawn_controller(
                 LifecycleState::RunningHidden,

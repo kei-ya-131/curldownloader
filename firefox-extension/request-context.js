@@ -112,6 +112,7 @@
       sourcePageUrl: safeUrl(download.referrer) || entry.sourcePageUrl || null,
       initialUrl: entry.initialUrl,
       finalUrl: entry.finalUrl,
+      headersUrl: entry.headersUrl,
       tabId: Number.isInteger(entry.tabId) ? entry.tabId : null,
       incognito: Boolean(download.incognito),
       cookieStoreId: download.cookieStoreId === undefined || download.cookieStoreId === null
@@ -131,7 +132,13 @@
 
     function prune(current = now()) {
       for (const [requestId, entry] of entries) {
-        if (current - entry.capturedUnixMs > ttlMs) entries.delete(requestId);
+        // A fetch must finish before its Blob can become a download. Keep its
+        // bounded, in-memory context while transferring, then apply the short
+        // normal TTL after completion. Do not refresh the original capture time
+        // used to exclude old requests from reauthorization sessions.
+        const retention = entry.longTransfer && !entry.completed
+          ? Math.max(ttlMs, 30 * 60 * 1000) : ttlMs;
+        if (current - (entry.lastActivityUnixMs || entry.capturedUnixMs) > retention) entries.delete(requestId);
       }
       for (const [sessionId, session] of reauthorizationSessions) {
         if (current - session.startedUnixMs > session.ttlMs) {
@@ -167,18 +174,24 @@
         entry = {
           initialUrl: String(details.url),
           finalUrl: String(details.url),
+          headersUrl: String(details.url),
           tabId: Number.isInteger(details.tabId) ? details.tabId : null,
+          frameId: Number.isInteger(details.frameId) ? details.frameId : null,
           sourcePageUrl: safeUrl(details.documentUrl)
             || safeUrl(details.originUrl)
             || safeUrl(details.initiator)
             || null,
           headers: [],
           capturedUnixMs: current,
+          lastActivityUnixMs: current,
+          longTransfer: details.type === 'xmlhttprequest',
           completed: false
         };
         entries.set(requestId, entry);
       } else {
         entry.finalUrl = String(details.url);
+        entry.headersUrl = String(details.url);
+        entry.lastActivityUnixMs = current;
         if (Number.isInteger(details.tabId)) entry.tabId = details.tabId;
         entry.sourcePageUrl = entry.sourcePageUrl
           || safeUrl(details.documentUrl)
@@ -209,16 +222,19 @@
       const entry = entries.get(requestId);
       if (!entry) return false;
       entry.completed = true;
+      entry.lastActivityUnixMs = now();
       return true;
     }
 
-    function claimDownload(download = {}) {
+    function claimDownload(download = {}, scope = {}) {
       const url = String(download.url || '');
       if (!supportedUrl(url)) return null;
       const current = now();
       prune(current);
       const candidates = [];
       for (const entry of entries.values()) {
+        if (Number.isInteger(scope.tabId) && entry.tabId !== scope.tabId) continue;
+        if (Number.isInteger(scope.frameId) && entry.frameId !== scope.frameId) continue;
         if (entry.initialUrl !== url && entry.finalUrl !== url) continue;
         candidates.push(entry);
       }
