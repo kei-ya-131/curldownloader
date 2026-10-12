@@ -4,6 +4,14 @@
 
 Curl Downloader 是一個 Windows portable 下載器，使用內置或 PATH 中可用的 curl，支援多段下載、續傳、Proxy 及任務狀態管理。發行目錄只包含一份 `CurlDownloader.exe`；Firefox Native Messaging host 由同一份 EXE 以 stdio 模式執行，不會另帶 helper EXE。
 
+## 0.4.1 版本
+
+- 修正 Cookie 或授權標頭超過 8 KiB 時，Firefox 重複下載被 `invalid_request_context` 拒絕的問題。保留完整標頭，仍維持請求資料總額 48 KiB 限制。
+- 缺少 Firefox 容器 ID 時保留 `null`；交接失敗會顯示固定的驗證原因，不包含憑證內容。
+- 新增本機 HTTP Proxy 連續下載測試，驗證最高 40 KiB Cookie 完整傳送及加密授權恢復。
+
+主程式及 `curl-downloader.xpi` 均需更新至 0.4.1。先從系統匣關閉舊程式，再於原目錄替換 EXE，保留既有資料及下載部分檔。啟動新版一次以更新 Native Messaging 註冊，再重新整理 ChatGPT 分頁。狀態格式及 Native Messaging 欄位名稱維持與 0.4.0 相容。
+
 ## 0.4.0 版本
 
 相較 0.3.0 的更新：

@@ -2,6 +2,45 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const core = require('../core.js');
 
+test('native preflight accepts a large cookie without truncation and rejects excessive totals', () => {
+  const cookie = `session=${'x'.repeat(40 * 1024)}`;
+  const wire = core.serializeRequestContext({ headers: [{ name: 'Cookie', value: cookie }] },
+    { url: 'https://files.test/file' });
+  assert.equal(core.requestContextDiagnostic(wire), null);
+  assert.equal(wire.headers[0].value, cookie);
+  wire.headers.push({ name: 'Authorization', value: 'x'.repeat(10 * 1024) });
+  assert.equal(core.requestContextDiagnostic(wire), 'request context is too large');
+});
+
+test('request context diagnostics identify limits without returning credentials', () => {
+  const wire = core.serializeRequestContext({ headers: [] }, { url: 'https://files.test/file' });
+  assert.equal(core.requestContextDiagnostic(wire), null);
+  wire.headers = [{ name: 'Cookie', value: 'x'.repeat(48 * 1024 + 1) }];
+  assert.equal(core.requestContextDiagnostic(wire), 'header value is too large');
+  wire.headers = [{ name: 'Authorization', value: 'fictional-secret\r\n' }];
+  assert.equal(core.requestContextDiagnostic(wire), 'header value contains invalid characters');
+  wire.headers = [];
+  wire.source_page_url = 'blob:https://files.test/fictional';
+  assert.equal(core.requestContextDiagnostic(wire), 'source page URL must be an HTTP or HTTPS URL');
+  assert.equal(core.nativeContextDiagnostic({ code: 'invalid_request_context',
+    message: 'fictional-secret; header value is too large' }), 'header value is too large');
+  assert.equal(core.nativeContextDiagnostic({ code: 'invalid_request_context',
+    message: 'fictional-secret' }), null);
+  assert.equal(core.nativeContextDiagnostic({ code: 'invalid_proxy',
+    message: 'header value is too large' }), null);
+});
+
+test('missing cookie store stays null across the native messaging boundary', () => {
+  for (const cookieStoreId of [undefined, null, '']) {
+    const wire = core.serializeRequestContext({
+      headers: [{ name: 'Authorization', value: 'Bearer fictional' }],
+      cookieStoreId
+    }, { url: 'https://files.test/file' });
+    assert.equal(wire.cookie_store_id, null);
+    assert.equal(wire.headers[0].value, 'Bearer fictional');
+  }
+});
+
 test('only http and https downloads enter Curl Downloader flow', () => {
   assert.equal(core.isSupportedDownloadUrl('https://example.test/a.zip'), true);
   assert.equal(core.isSupportedDownloadUrl('http://example.test/a.zip'), true);

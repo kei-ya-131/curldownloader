@@ -5,6 +5,17 @@ const {
   filterRequestHeaders
 } = require('../request-context.js');
 
+test('keeps large browser cookies intact while enforcing the total context limit', () => {
+  const cookie = `session=${'x'.repeat(40 * 1024)}`;
+  assert.deepEqual(filterRequestHeaders([{ name: 'Cookie', value: cookie }]), [
+    { name: 'Cookie', value: cookie }
+  ]);
+  assert.throws(() => filterRequestHeaders([
+    { name: 'Cookie', value: 'x'.repeat(25 * 1024) },
+    { name: 'Authorization', value: 'x'.repeat(25 * 1024) }
+  ]), /context is too large/i);
+});
+
 test('long fetch retains exact credentials through completion without making old reauthorization fresh', () => {
   let now = 1000;
   const tracker = createRequestContextTracker({ now: () => now });
@@ -158,7 +169,7 @@ test('discards non-GET observations and carries private/container metadata', () 
 
 test('rejects overlarge values and caps the number of retained entries', () => {
   assert.throws(
-    () => filterRequestHeaders([{ name: 'X-Test', value: 'x'.repeat(8 * 1024 + 1) }]),
+    () => filterRequestHeaders([{ name: 'X-Test', value: 'x'.repeat(48 * 1024 + 1) }]),
     /too large/i
   );
   const tracker = createRequestContextTracker({ now: () => 5_000, maxEntries: 2 });

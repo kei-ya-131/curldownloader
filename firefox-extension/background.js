@@ -906,11 +906,18 @@
     };
     let accepted = false;
     let nativeFailureCode = null;
+    let nativeFailureDetail = null;
     let firefoxRestored = false;
     try {
+      nativeFailureDetail = core.requestContextDiagnostic(request.request_context);
+      if (nativeFailureDetail) {
+        nativeFailureCode = 'invalid_request_context';
+        throw new Error('Request context validation failed');
+      }
       const response = await sendNativeWithRetry(request);
       if (!response || response.type !== 'enqueue_result' || !response.ok) {
         nativeFailureCode = nativeErrorCode(response && response.error);
+        nativeFailureDetail = core.nativeContextDiagnostic(response && response.error);
         if (response && response.type === 'enqueue_result'
             && response.error && response.error.code === 'engine_timeout') {
           // The engine may still persist the task after the IPC wait expires.
@@ -1006,7 +1013,7 @@
         code: nativeFailureCode || 'native_unavailable',
         nativeErrorCode: nativeFailureCode || undefined,
         firefoxRestored,
-        error: `Native host 未能接收下載${nativeFailureCode ? `（${nativeFailureCode}）` : ''}；請在來源頁再次按下載以重新開啟設定。`
+        error: `Native host 未能接收下載${nativeFailureCode ? `（${nativeFailureCode}）` : ''}${nativeFailureDetail ? `；原因：${nativeFailureDetail}` : ''}；請在來源頁再次按下載以重新開啟設定。`
       };
     } finally {
       if (pendingDownloads.get(pending.downloadId) === pending && pending.operation === 'submit') {

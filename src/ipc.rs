@@ -862,11 +862,11 @@ fn dispatch_request(
         } => {
             let prepared = match request_context::prepare(request_context) {
                 Ok(prepared) => prepared,
-                Err(_) => {
+                Err(error) => {
                     return action_error(
                         request_id,
                         "invalid_request_context",
-                        "Firefox 授權資料無效或超出安全限制。",
+                        &format!("Firefox 授權資料無效（{error}）。"),
                     );
                 }
             };
@@ -951,11 +951,11 @@ fn dispatch_request(
             };
             let request_context = match request_context.map(request_context::prepare).transpose() {
                 Ok(context) => context,
-                Err(_) => {
+                Err(error) => {
                     return enqueue_error(
                         request_id,
                         "invalid_request_context",
-                        "Firefox 授權資料無效或超出安全限制。",
+                        &format!("Firefox 授權資料無效（{error}）。"),
                     );
                 }
             };
@@ -1755,6 +1755,7 @@ mod tests {
                 error: Some(WireError { code, message }),
                 ..
             } if code == "invalid_request_context" && !message.contains("bad")
+                && message.contains("header value contains invalid characters")
         ));
     }
 

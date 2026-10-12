@@ -27,8 +27,9 @@
   ]);
   const TOKEN_PATTERN = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
   const MAX_HEADER_COUNT = 64;
-  const MAX_HEADER_VALUE_BYTES = 8 * 1024;
   const MAX_CONTEXT_BYTES = 48 * 1024;
+  // Keep large browser cookies intact within the existing total context budget.
+  const MAX_HEADER_VALUE_BYTES = MAX_CONTEXT_BYTES;
 
   function byteLength(value) {
     return new TextEncoder().encode(String(value)).length;
