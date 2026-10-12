@@ -221,6 +221,13 @@ browser.runtime.getBackgroundPage().then(bg=>done(bg.blobSmokeTrace));""")['valu
                         time.sleep(.05)
                 # Explicit fallback and closing the choice both preserve the Blob after site revocation.
                 if decision == 'reject-curl':
+                    # get-pending can finish before settings.js fills the form.
+                    # Wait so initialization cannot overwrite our target path.
+                    deadline = time.monotonic() + 5
+                    while not client.script("return document.getElementById('filename').value === 'fixture.bin';"):
+                        if time.monotonic() >= deadline:
+                            raise AssertionError('Settings form did not initialize')
+                        time.sleep(.05)
                     client.script("document.getElementById('target-dir').value=" + json.dumps(str(work)) + ";")
                     client.script("document.getElementById('submit-external').click();")
                     deadline = time.monotonic() + 10

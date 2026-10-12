@@ -25,6 +25,51 @@
     return basename;
   }
 
+  // Only return fixed validation labels, never a native message or header value.
+  const CONTEXT_DIAGNOSTICS = [
+    'too many request headers', 'cookie store id is invalid',
+    'header name is empty or padded', 'header name is not an HTTP token',
+    'header value contains invalid characters', 'header value is too large',
+    'request context is too large', 'request context protection failed',
+    'request context serialization failed',
+    ...['initial URL', 'final URL', 'source page URL'].flatMap((field) =>
+      ['contains invalid characters', 'is too large', 'is not a URL',
+        'must be an HTTP or HTTPS URL'].map((reason) => `${field} ${reason}`))
+  ];
+
+  function nativeContextDiagnostic(error) {
+    if (!error || error.code !== 'invalid_request_context' || typeof error.message !== 'string') return null;
+    return CONTEXT_DIAGNOSTICS.find((reason) => error.message.includes(reason)) || null;
+  }
+
+  function requestContextDiagnostic(context) {
+    if (!context) return null;
+    const bytes = (value) => new TextEncoder().encode(value).length;
+    if (context.headers.length > 64) return 'too many request headers';
+    let total = 0;
+    for (const [field, value] of [['initial URL', context.initial_url],
+      ['final URL', context.final_url], ['source page URL', context.source_page_url]]) {
+      if (field === 'source page URL' && value === null) continue;
+      if (!value || /[\0\r\n]/.test(value)) return `${field} contains invalid characters`;
+      if (bytes(value) > 48 * 1024) return `${field} is too large`;
+      let url;
+      try { url = new URL(value); } catch (_error) { return `${field} is not a URL`; }
+      if (!['http:', 'https:'].includes(url.protocol) || !url.hostname) return `${field} must be an HTTP or HTTPS URL`;
+      total += bytes(value);
+    }
+    const store = context.cookie_store_id;
+    if (store !== null && (!store || /[\0\r\n]/.test(store) || bytes(store) > 256)) return 'cookie store id is invalid';
+    for (const { name, value } of context.headers) {
+      if (!name || name !== name.trim()) return 'header name is empty or padded';
+      if (!/^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/.test(name)) return 'header name is not an HTTP token';
+      if (/[\0\r\n]/.test(value)) return 'header value contains invalid characters';
+      if (bytes(value) > 48 * 1024) return 'header value is too large';
+      total += bytes(name) + bytes(value);
+      if (total > 48 * 1024) return 'request context is too large';
+    }
+    return null;
+  }
+
   function serializeRequestContext(requestContext, download) {
     if (!requestContext || typeof requestContext !== 'object') return null;
     const headers = Array.isArray(requestContext.headers)
@@ -41,9 +86,12 @@
       initial_url: String(requestContext.initialUrl || download.url),
       final_url: String(requestContext.finalUrl || download.url),
       incognito: Boolean(requestContext.incognito),
+      // Firefox may omit container identity. Keep it absent: the native host
+      // accepts null, but rejects an empty container ID.
       cookie_store_id: requestContext.cookieStoreId === undefined
+        || requestContext.cookieStoreId === null || requestContext.cookieStoreId === ''
         ? null
-        : String(requestContext.cookieStoreId || '')
+        : String(requestContext.cookieStoreId)
     };
   }
 
@@ -75,6 +123,8 @@
     isSupportedDownloadUrl,
     fallbackFilename,
     buildEnqueueMessage,
-    serializeRequestContext
+    serializeRequestContext,
+    requestContextDiagnostic,
+    nativeContextDiagnostic
   };
 });

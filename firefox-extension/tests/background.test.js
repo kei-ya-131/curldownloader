@@ -5,6 +5,69 @@ const createBackground = require('../background.js');
 const pageSender = { url: 'https://chatgpt.com/c/example', frameId: 0,
   tab: { id: 7, incognito: false, cookieStoreId: 'firefox-default' } };
 
+test('proxy downloads keep growing synthesized cookies intact on repeated submissions', async () => {
+  let cookieValue = 'small';
+  const fake = makeFakeBrowser({
+    cookieResults: () => [{ name: 'session', value: cookieValue,
+      storeId: 'firefox-default', firstPartyDomain: '' }],
+    nativeResponse: (message) => message.type === 'enqueue'
+      ? { type: 'enqueue_result', ok: true, request_id: message.request_id, task_id: 42 }
+      : { type: 'task_list', tasks: [] }
+  });
+  const background = createBackground(fake.browser, { timers: false });
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    cookieValue = 'x'.repeat(attempt === 1 ? 128 : attempt === 2 ? 12 * 1024 : 40 * 1024);
+    const url = 'https://chatgpt.com/backend-api/estuary/content?id=file_fictional';
+    fake.events.sendHeaders({ requestId: `large-cookie-${attempt}`, method: 'GET',
+      url, documentUrl: pageSender.url, tabId: 7, frameId: 0,
+      requestHeaders: [{ name: 'Authorization', value: 'Bearer fictional' }] });
+    await background.handleCreatedDownload({ id: attempt, url, referrer: pageSender.url,
+      filename: 'report.pdf', incognito: false, cookieStoreId: 'firefox-default' });
+    const result = await background.submitExternalDownload(attempt, {
+      filename: 'report.pdf', targetDir: 'C:\\Downloads', segments: 4,
+      proxy: { enabled: true, protocol: 'http', host: '127.0.0.1', port: 8080 }
+    });
+    assert.equal(result.ok, true, `download ${attempt} should be accepted`);
+    const enqueue = fake.calls.nativeMessages.filter((message) => message.type === 'enqueue').at(-1);
+    assert.equal(enqueue.request_context.headers.find((header) => header.name === 'Cookie').value,
+      `session=${cookieValue}`);
+    assert.equal(enqueue.proxy.enabled, true);
+  }
+  assert.deepEqual(fake.calls.resume, []);
+});
+
+test('repeated downloads with proxy and no cookie store send valid optional native context', async () => {
+  const fake = makeFakeBrowser({ nativeResponse: (message) => {
+    if (message.type !== 'enqueue') return { type: 'task_list', tasks: [] };
+    // Native validation rejects Some("") but accepts None for cookie_store_id.
+    if (message.request_context.cookie_store_id === '') {
+      return { type: 'error', error: { code: 'invalid_request_context', message: 'invalid store' } };
+    }
+    return { type: 'enqueue_result', ok: true, request_id: message.request_id, task_id: 42 };
+  } });
+  const background = createBackground(fake.browser, { timers: false });
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    fake.events.sendHeaders({ requestId: `repeat-${attempt}`, method: 'GET',
+      url: 'https://chatgpt.com/backend-api/estuary/content?id=file_fictional',
+      documentUrl: pageSender.url, tabId: 7, frameId: 0,
+      requestHeaders: [{ name: 'Authorization', value: `Bearer fictional-${attempt}` }] });
+    await background.handleCreatedDownload({ id: attempt,
+      url: 'https://chatgpt.com/backend-api/estuary/content?id=file_fictional',
+      referrer: pageSender.url, filename: 'report.pdf', incognito: false,
+      ...(attempt === 1 ? { cookieStoreId: 'firefox-default' } : {}) });
+    const submitted = await background.submitExternalDownload(attempt, {
+      filename: 'report.pdf', targetDir: 'C:\\Downloads', segments: 4,
+      proxy: { enabled: true, protocol: 'http', host: '127.0.0.1', port: 8080 }
+    });
+    assert.equal(submitted.ok, true, `download ${attempt} should be accepted`);
+    const enqueue = fake.calls.nativeMessages.filter((message) => message.type === 'enqueue').at(-1);
+    assert.equal(enqueue.request_context.cookie_store_id, attempt === 1 ? 'firefox-default' : null);
+    assert.equal(enqueue.request_context.headers[0].value, `Bearer fictional-${attempt}`);
+    assert.equal(enqueue.proxy.enabled, true);
+  }
+  assert.deepEqual(fake.calls.resume, []);
+});
+
 test('page blob download opens settings before Firefox writes and keeps exact GET credentials', async () => {
   const fake = makeFakeBrowser({ nativeResponse: (m) => ({
     type: m.type === 'enqueue' ? 'enqueue_result' : 'task_list', ok: true,
@@ -893,7 +956,7 @@ test('a rejected blob enqueue preserves its error code and the next page click o
       if (message.type === 'enqueue') {
         enqueueCount += 1;
         return enqueueCount === 1
-          ? { type: 'error', error: { code: 'invalid_request_context', message: 'redacted test cause' } }
+          ? { type: 'error', error: { code: 'invalid_request_context', message: 'Firefox 授權資料無效（invalid request context: header value is too large）。' } }
           : { type: 'enqueue_result', ok: true, task_id: 92, awaiting_file_decision: false };
       }
       return { type: 'task_list', tasks: [] };
@@ -918,6 +981,7 @@ test('a rejected blob enqueue preserves its error code and the next page click o
   assert.equal(rejected.nativeErrorCode, 'invalid_request_context');
   assert.equal(rejected.firefoxRestored, true);
   assert.match(rejected.error, /invalid_request_context/);
+  assert.match(rejected.error, /header value is too large/);
   assert.equal(rejected.error.startsWith('Native host'), true);
   assert.match(fake.calls.notifications[0].message, /invalid_request_context/);
   assert.equal((await background.handleRuntimeMessage({ type: 'get-pending', downloadId: created.downloadId })).ok, false);

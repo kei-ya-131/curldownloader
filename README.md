@@ -4,6 +4,14 @@
 
 Curl Downloader is a portable download manager for Windows. It uses either the bundled curl or a usable curl found on `PATH`, with support for segmented downloads, resuming, per-task proxy settings, and task status management. The release directory contains only one `CurlDownloader.exe`; the same executable runs as the Firefox Native Messaging host in stdio mode, with no separate helper executable.
 
+## Version 0.4.1
+
+- Fix repeated Firefox downloads failing with `invalid_request_context` when a Cookie or authorization header exceeds 8 KiB. Headers remain intact within the existing 48 KiB total request-context budget.
+- Preserve missing Firefox container IDs as `null` and show fixed, credential-free validation reasons when handoff fails.
+- Verify repeated downloads through a local HTTP proxy with cookies up to 40 KiB, including encrypted context restoration.
+
+Update both `CurlDownloader.exe` and `curl-downloader.xpi` to 0.4.1. Close the old application from its tray menu before replacing the EXE in the same directory; retain existing data and partial downloads. Launch the new EXE once to refresh Native Messaging registration, then reload ChatGPT tabs. The state format and Native Messaging field names remain compatible with 0.4.0.
+
 ## Version 0.4.0
 
 Changes from 0.3.0:

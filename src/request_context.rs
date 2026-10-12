@@ -5,8 +5,10 @@ use url::Url;
 use zeroize::Zeroizing;
 
 pub const MAX_HEADERS: usize = 64;
-pub const MAX_HEADER_VALUE_BYTES: usize = 8 * 1024;
 pub const MAX_CONTEXT_BYTES: usize = 48 * 1024;
+// Browser cookies can exceed 8 KiB. Bound each header by the existing total
+// budget instead; validate_wire still limits all URLs and headers together.
+pub const MAX_HEADER_VALUE_BYTES: usize = MAX_CONTEXT_BYTES;
 
 const BLOCKED_HEADERS: &[&str] = &[
     "host",
@@ -582,6 +584,23 @@ mod tests {
     }
 
     #[test]
+    fn absent_cookie_store_is_valid_but_empty_store_is_rejected() {
+        let mut wire = context_with_headers(vec![("Authorization", "Bearer fictional")]);
+        wire.cookie_store_id = None;
+        let prepared = prepare(wire.clone()).unwrap();
+        assert_eq!(prepared.runtime.cookie_store_id(), None);
+        let restored = restore(&prepared.stored).unwrap().unwrap();
+        assert_eq!(restored.cookie_store_id(), None);
+        assert_eq!(restored.headers(), prepared.runtime.headers());
+
+        wire.cookie_store_id = Some(String::new());
+        assert!(matches!(
+            prepare(wire),
+            Err(RequestContextError::Invalid(_))
+        ));
+    }
+
+    #[test]
     fn safe_allowlist_context_stays_public() {
         let prepared = prepare(context_with_headers(vec![("Accept", "application/pdf")])).unwrap();
         assert!(prepared.stored.public.is_some());
@@ -620,9 +639,32 @@ mod tests {
     }
 
     #[test]
+    fn large_cookie_is_preserved_encrypted_and_restored_with_total_limit() {
+        let cookie = format!("session={}", "x".repeat(40 * 1024));
+        let wire = context_with_headers(vec![("Cookie", &cookie)]);
+        let prepared = prepare(wire).unwrap();
+        assert!(prepared.stored.public.is_none());
+        assert!(prepared.stored.encrypted.is_some());
+        assert_eq!(
+            prepared.runtime.headers(),
+            vec![("Cookie".into(), cookie.clone())]
+        );
+        let restored = restore(&prepared.stored).unwrap().unwrap();
+        assert_eq!(restored.headers(), prepared.runtime.headers());
+        let other = "x".repeat(10 * 1024);
+        assert!(
+            prepare(context_with_headers(vec![
+                ("Cookie", &cookie),
+                ("Authorization", &other)
+            ]))
+            .is_err()
+        );
+    }
+
+    #[test]
     fn invalid_header_and_size_limits_fail_closed() {
         assert!(prepare(context_with_headers(vec![("X-Test", "bad\r\nvalue")])).is_err());
-        let oversized = "x".repeat(8 * 1024 + 1);
+        let oversized = "x".repeat(MAX_HEADER_VALUE_BYTES + 1);
         assert!(prepare(context_with_headers(vec![("X-Test", &oversized)])).is_err());
         let pairs = (0..65)
             .map(|index| (format!("X-{index}"), "v".to_owned()))

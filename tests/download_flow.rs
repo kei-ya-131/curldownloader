@@ -26,6 +26,65 @@ fn protected_context() -> WireRequestContext {
 }
 
 #[test]
+fn repeated_proxy_downloads_preserve_large_firefox_cookies() {
+    use curl_downloader::model::{ConfiguredTask, TaskOrigin};
+    use std::time::Duration;
+
+    let proxy_server = support::TestProxy::http(b"protected proxy payload", None);
+    let proxy_url = url::Url::parse(&proxy_server.address).unwrap();
+    let mut harness = support::EngineHarness::new(1);
+    for (attempt, size) in [128, 12 * 1024, 40 * 1024].into_iter().enumerate() {
+        let cookie = format!("session={}", "x".repeat(size));
+        let wire = protected_context_with_cookie(&cookie);
+        let url = wire.final_url.clone();
+        let context = curl_downloader::request_context::prepare(wire).unwrap();
+        let proxy = ProxySettings {
+            enabled: true,
+            host: proxy_url.host_str().unwrap().to_owned(),
+            port: proxy_url.port().unwrap(),
+            ..Default::default()
+        };
+        let filename = format!("proxy-{attempt}.pdf");
+        let (response_tx, response_rx) = std::sync::mpsc::channel();
+        harness
+            .engine
+            .commands
+            .send(EngineCommand::AddConfiguredWithOrigin {
+                task: ConfiguredTask {
+                    url,
+                    filename: filename.clone(),
+                    target_dir: harness.download_dir().to_path_buf(),
+                    requested_segments: 1,
+                    proxy,
+                    request_id: None,
+                    request_context: Some(context),
+                },
+                origin: TaskOrigin::Firefox,
+                response: response_tx,
+            })
+            .unwrap();
+        let id = response_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap()
+            .task_id;
+        let completed = harness.wait_for(id, TaskStatus::Completed, Duration::from_secs(60));
+        assert_eq!(
+            std::fs::read(completed.target_dir.join(filename)).unwrap(),
+            b"protected proxy payload"
+        );
+        assert!(
+            proxy_server.requests.lock().unwrap().iter().any(|request| {
+                request
+                    .lines()
+                    .any(|line| line == format!("Cookie: {cookie}"))
+            }),
+            "proxy must receive the complete cookie"
+        );
+    }
+}
+
+#[test]
 fn firefox_cookie_and_referer_complete_a_protected_download() {
     let server = support::TestHttpServer::start(vec![support::Route {
         path: "/private.pdf",
